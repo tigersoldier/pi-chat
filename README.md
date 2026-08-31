@@ -16,7 +16,7 @@ proving the round-trip before anything else is built.
 ## Quick start (phase 0)
 
 ```bash
-./scripts/setup-gcp.sh jihanzi   # topic, subscription, service account, config
+./scripts/setup-gcp.sh pi-gchat   # topic, subscription, service account, config
 # …create the Chat app in the console (see docs/phase0.md)…
 make probe                       # or: go run ./cmd/probe
 # DM the bot in Google Chat → the probe replies to your message

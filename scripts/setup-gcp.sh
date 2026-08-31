@@ -71,9 +71,12 @@ fi
 
 say "service account key: $KEY_FILE"
 mkdir -p "$CONFIG_DIR"
-if [[ -f "$KEY_FILE" ]]; then
-  echo "  already exists (not regenerated; delete it and re-run to rotate)"
+if [[ -f "$KEY_FILE" ]] && grep -q "\"client_email\": \"$SA_EMAIL\"" "$KEY_FILE" 2>/dev/null; then
+  echo "  already exists and matches $SA_EMAIL (not regenerated)"
 else
+  if [[ -f "$KEY_FILE" ]]; then
+    echo "  existing key does not match $SA_EMAIL — regenerating"
+  fi
   gcloud iam service-accounts keys create "$KEY_FILE" --iam-account="$SA_EMAIL" --project="$PROJECT_ID"
   chmod 600 "$KEY_FILE"
 fi
