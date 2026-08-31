@@ -11,8 +11,11 @@ reply appears in the Chat thread. Nothing else.
 ## Step 1 — provision GCP plumbing (scripted)
 
 ```bash
-./scripts/setup-gcp.sh pi-gchat
+./scripts/setup-gcp.sh <PROJECT_ID>
 ```
+
+(Or export `PROJECT_ID`; if neither is given, the script falls back to `gcloud
+config get-value project`. No project name is hard-coded anywhere in this repo.)
 
 Creates, idempotently:
 
@@ -29,13 +32,13 @@ Creates, idempotently:
 
 There is no gcloud/API equivalent; this is a one-time console step.
 
-1. Google Cloud Console → project `pi-gchat` → **Google Chat API** →
+1. Google Cloud Console → project `<PROJECT_ID>` → **Google Chat API** →
    **Configuration** (the API library page for Chat API has a Configuration tab).
 2. **App name:** `pi-gchat`; add an avatar and description if you like.
 3. **Connection settings:** select **Pub/Sub topic** →
-   `projects/pi-gchat/topics/pi-gchat-events`.
+   `projects/<PROJECT_ID>/topics/pi-gchat-events`.
 4. **App identity:** select **Service account** →
-   `pi-gchat@pi-gchat.iam.gserviceaccount.com`.
+   `pi-gchat@<PROJECT_ID>.iam.gserviceaccount.com`.
 5. **Visibility:** restrict to **specific people/groups** → your own Google
    account. (Defense-in-depth layer 1 from the design; the per-event email
    allowlist comes in phase 1.)
@@ -45,9 +48,9 @@ There is no gcloud/API equivalent; this is a one-time console step.
 
 ```bash
 gcloud pubsub topics publish pi-gchat-events \
-  --message='{"type":"MESSAGE","probe":"self-test"}' --project=pi-gchat
+  --message='{"type":"MESSAGE","probe":"self-test"}' --project=$PROJECT_ID
 gcloud pubsub subscriptions pull pi-gchat-sub \
-  --limit=1 --auto-ack --project=pi-gchat
+  --limit=1 --auto-ack --project=$PROJECT_ID
 ```
 
 You should see the message. This proves topic → subscription before involving
@@ -66,7 +69,7 @@ Expected probe output:
 
 ```
 probe: config: /home/you/.pi/agent/pi-gchat.toml
-probe: spike: pulling 1 event(s) from projects/pi-gchat/subscriptions/pi-gchat-sub (timeout 10m0s)
+probe: spike: pulling 1 event(s) from projects/<PROJECT_ID>/subscriptions/pi-gchat-sub (timeout 10m0s)
 probe: event: type=MESSAGE space=spaces/AAAA... thread=spaces/AAAA.../threads/TTTT user=you@gmail.com
 probe: replied: spaces/AAAA.../messages/MMMM
 probe: done: 1 event(s) round-tripped
@@ -90,9 +93,9 @@ Useful flags: `-count N` (process several events), `-timeout 30s`, `-project`,
 ## Teardown (only if needed)
 
 ```bash
-gcloud pubsub subscriptions delete pi-gchat-sub --project=pi-gchat
-gcloud pubsub topics delete pi-gchat-events --project=pi-gchat
-gcloud iam service-accounts delete pi-gchat@pi-gchat.iam.gserviceaccount.com --project=pi-gchat
+gcloud pubsub subscriptions delete pi-gchat-sub --project=$PROJECT_ID
+gcloud pubsub topics delete pi-gchat-events --project=$PROJECT_ID
+gcloud iam service-accounts delete pi-gchat@<PROJECT_ID>.iam.gserviceaccount.com --project=$PROJECT_ID
 rm ~/.pi/agent/pi-gchat-sa.json
 # Chat app: Console → Google Chat API → Configuration → Delete
 ```

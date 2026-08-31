@@ -1,0 +1,34 @@
+# Reference configuration for the pi-gchat daemon.
+#
+# The live config lives at ~/.pi/agent/pi-gchat.toml — outside the repo, never
+# committed (pi-gchat.toml is gitignored). scripts/setup-gcp.sh writes it for
+# you; this file is only a reference. Copy it and fill in real values:
+#
+#   cp pi-gchat.toml.example ~/.pi/agent/pi-gchat.toml
+#
+# `~` is expanded by the daemon in all path values. Replace every
+# <PLACEHOLDER> below.
+
+[gcp]
+project_id = "<GCP_PROJECT_ID>"
+subscription_name = "pi-gchat-sub"        # created by scripts/setup-gcp.sh
+credentials_file = "~/.pi/agent/pi-gchat-sa.json"
+
+# --- Sections below are phase 1+ (see DESIGN.md); unused in phase 0. ---
+
+[access]
+allowed_emails = ["you@gmail.com"]        # required — feature #3
+allowed_spaces = ["spaces/ABC123..."]     # optional; omit = any space
+
+[paths]
+projects_root = "~/work"                  # new session project dirs
+repos_root = "~/code"                     # git repos
+db_path = "~/.pi/agent/pi-gchat.db"
+
+[behavior]
+idle_timeout_minutes = 15
+max_concurrent_sessions = 10
+progress_update_interval_ms = 1000
+# injected_prompt = """                     # empty = no injection; template
+# Repositories live under {reposRoot} ...   # keys: {reposRoot} {projectsRoot}
+# """                                       # {date} {slug} — see DESIGN.md
