@@ -48,3 +48,8 @@ DESIGN.md               full high-level design
 
 - Go ≥ 1.24
 - `gcloud` CLI, authenticated as owner/editor of the GCP project
+
+## Legal
+
+- [Privacy Policy](PRIVACY.md)
+- [Terms of Service](TERMS.md)

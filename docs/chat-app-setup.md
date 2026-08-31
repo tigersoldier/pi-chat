@@ -78,6 +78,25 @@ DMs work immediately even without publication (apps respond to DMs by
 default); space/group installation needs "Join spaces and group
 conversations", which is gated on publication for consumer accounts.
 
+## Publishing to the Workspace Marketplace (consumer accounts only)
+
+On a non-Workspace account the app will not appear in Google Chat's
+"Find apps" until it has a Marketplace listing. Steps:
+
+1. Console → **Google Workspace Marketplace SDK** → enable it.
+2. **App configuration:** name, icons (reuse `assets/avatar.png`),
+   description, **Privacy Policy URL**
+   (`https://raw.githubusercontent.com/tigersoldier/pi-gchat/main/PRIVACY.md`),
+   **Terms of Service URL**
+   (`https://raw.githubusercontent.com/tigersoldier/pi-gchat/main/TERMS.md`),
+   support/developer contact.
+3. **OAuth consent screen:** External, In production, **no scopes** (the bot
+   uses only the service account; no verification required).
+4. **Publish** → Google review (hours to days).
+
+After publication, immediately set the Chat app **Visibility** to your own
+account, and enable **Join spaces and group conversations**.
+
 ## Verify
 
 1. Run the probe: `make probe` (it waits for an event, 10 min default).
