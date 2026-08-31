@@ -84,12 +84,15 @@ On a non-Workspace account the app will not appear in Google Chat's
 "Find apps" until it has a Marketplace listing. Steps:
 
 1. Console → **Google Workspace Marketplace SDK** → enable it.
-2. **App configuration:** name, icons (reuse `assets/avatar.png`),
+2. **App configuration:** name, icons — `assets/avatar-128.png` (128×128)
+   and `assets/avatar-32.png` (32×32) — **card banner**
+   `assets/banner-220x140.png` (220×140),
    description, **Privacy Policy URL**
    (`https://raw.githubusercontent.com/tigersoldier/pi-gchat/main/PRIVACY.md`),
    **Terms of Service URL**
    (`https://raw.githubusercontent.com/tigersoldier/pi-gchat/main/TERMS.md`),
    support/developer contact.
+   (Re-render after editing any SVG: `scripts/render-assets.sh`.)
 3. **OAuth consent screen:** External, In production, **no scopes** (the bot
    uses only the service account; no verification required).
 4. **Publish** → Google review (hours to days).
