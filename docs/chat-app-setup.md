@@ -40,7 +40,8 @@ phase 1 (the real daemon) reuses this same app unchanged.
 
 2. **App name:** `pi-gchat`
 
-3. **Avatar:** optional — any image; it becomes the bot's icon in Chat.
+3. **Avatar:** upload `assets/avatar.png` (512×512, already rendered; SVG source in
+   `assets/avatar.svg`). It becomes the bot's icon in Chat.
 
 4. **Description** (shown in the app directory): suggested text —
 
