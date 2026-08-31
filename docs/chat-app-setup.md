@@ -62,8 +62,21 @@ phase 1 (the real daemon) reuses this same app unchanged.
    daemon's per-event allowlist (phase 1) is bypassed, nobody else can
    install or message this app.
 
+   ⚠️ **Consumer accounts (no Workspace org):** this section stays disabled
+   until you publish to the Google Workspace Marketplace — Google only
+   offers the "trusted testers" flow within a Workspace organization. Same
+   for **Join spaces and group conversations**: it unlocks with publication.
+   Until then the app's effective visibility is broad, so rely on the
+   per-event email allowlist (phase 1) as the real gate, keep the app in
+   TESTING, and don't promote it anywhere. Publishing to the Marketplace
+   with a restricted audience closes this gap.
+
 8. Leave status at **TESTING** and click **Save/Activate**. Google applies
    the configuration within about a minute.
+
+DMs work immediately even without publication (apps respond to DMs by
+default); space/group installation needs "Join spaces and group
+conversations", which is gated on publication for consumer accounts.
 
 ## Verify
 
