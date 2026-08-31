@@ -35,7 +35,7 @@ phase 1 (the real daemon) reuses this same app unchanged.
 ## Steps
 
 1. Open the Chat API configuration page for the project:
-   `https://console.cloud.google.com/apis/api/chat.googleapis.com/configuration?project=pi-gchat`
+   `https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=pi-gchat`
    (or Console → project **pi-gchat** → **Google Chat API** → **Configuration**).
 
 2. **App name:** `pi-gchat`
