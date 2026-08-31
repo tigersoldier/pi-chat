@@ -11,7 +11,7 @@
 
   <rect width="512" height="512" rx="112" fill="url(#bg)"/>
 
-  <path d="M 170 384 L 118 470 L 226 384 Z" fill="#ffffff"/>
+  <path d="M 162 384 L 118 470 L 238 384 Z" fill="#ffffff"/>
   <rect x="116" y="128" width="280" height="256" rx="64" fill="#ffffff"/>
 
   <rect x="243" y="196" width="26" height="120" rx="13" fill="#16a34a"/>

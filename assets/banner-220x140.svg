@@ -24,7 +24,7 @@
   <rect x="156" y="28" width="32" height="4" rx="2" fill="#ffffff" opacity="0.08"/>
 
   <!-- chat bubble with tail -->
-  <path d="M 30 108 L 16 130 L 56 108 Z" fill="#ffffff"/>
+  <path d="M 28 108 L 16 130 L 60 108 Z" fill="#ffffff"/>
   <rect x="16" y="36" width="72" height="72" rx="18" fill="#ffffff"/>
 
   <!-- prompt inside the bubble -->

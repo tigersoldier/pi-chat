@@ -87,6 +87,7 @@ On a non-Workspace account the app will not appear in Google Chat's
 2. **App configuration:** name, icons — `assets/avatar-128.png` (128×128)
    and `assets/avatar-32.png` (32×32) — **card banner**
    `assets/banner-220x140.png` (220×140),
+   **screenshot** `assets/screenshot-intro.png` (1280×800, intro banner),
    description, **Privacy Policy URL**
    (`https://raw.githubusercontent.com/tigersoldier/pi-gchat/main/PRIVACY.md`),
    **Terms of Service URL**
