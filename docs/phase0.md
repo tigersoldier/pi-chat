@@ -31,6 +31,7 @@ Creates, idempotently:
 ## Step 2 — create the Chat app (console, manual)
 
 There is no gcloud/API equivalent; this is a one-time console step.
+Full walkthrough with exact values and verification: **[chat-app-setup.md](chat-app-setup.md)**.
 
 1. Google Cloud Console → project `<PROJECT_ID>` → **Google Chat API** →
    **Configuration** (the API library page for Chat API has a Configuration tab).

@@ -38,7 +38,8 @@ reference copy with placeholders.
 ```
 cmd/probe/              phase-0 spike: pull one event, reply, exit
 scripts/setup-gcp.sh    idempotent GCP provisioning (gcloud)
-docs/phase0.md          console walkthrough, verification, troubleshooting
+docs/phase0.md          spike walkthrough, verification, troubleshooting
+docs/chat-app-setup.md  the one manual step: creating the Chat app
 pi-gchat.toml.example   reference config with placeholders (copy, don't commit)
 DESIGN.md               full high-level design
 ```
