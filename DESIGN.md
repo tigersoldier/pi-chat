@@ -1,267 +1,481 @@
-# pi-gchat — High-Level Design
+# pi-chat — High-Level Design
 
-Control local [pi](https://pi.dev) coding-agent sessions from Google Chat.
+Bot integrations for [pi-gateway](https://github.com/tigersoldier/pi-gateway): drive local
+[pi](https://pi.dev) coding-agent sessions from chat platforms.
 
-## Goals (v1 feature set)
+Slack is the first integration. Google Chat is a planned second one; nothing in the
+core is Slack-specific except the adapter.
 
-1. Start a new pi session from chat.
-2. Interact with that session from chat.
-3. Only the owner's Google account can use it.
-4. Resume pi sessions that were started *outside* the chat bot.
-
----
-
-## Architecture
-
-```
-                    Google Cloud                                Local machine
- ┌─────────────────────────────────────────┐      ┌─────────────────────────────────────────┐
- │  Google Chat (you, on any device)        │      │                                         │
- │     │  messages / mentions / commands    │      │                                         │
- │     ▼                                    │      │                                         │
- │  Chat app  ──publishes events──▶  Pub/Sub topic          Pub/Sub subscription (pull)      │
- │     ▲                                    │      │     │  (streaming pull, low latency)    │
- │     └── spaces.messages.create ◀───────────────┼─────┼─────┤                                 │
- │            (app auth / service account) │      │     ▼                                 │
- └─────────────────────────────────────────┘      │  ┌──────────────┐   spawn/kill   ┌─────────────┐
-                                                  │  │  pi-gchat    │ ─────────────▶ │ pi --mode   │
-                                                  │  │  (Go daemon) │  stdin/stdout  │ rpc (per    │
-                                                  │  └──────┬───────┘    JSONL       │ session)    │
-                                                  │         │  SQLite               └─────────────┘
-                                                  │         ▼                                     │
-                                                  │  ~/.pi/agent/pi-gchat.db                      │
-                                                  └─────────────────────────────────────────────────┘
-```
-
-- The daemon is **fully outbound**: it pulls Pub/Sub and calls the Chat API. No listening socket, no tunnel, no public endpoint.
-- Each active session runs as its **own `pi --mode rpc` subprocess** (process isolation, natural concurrency).
+**Status:** design settled. Supersedes the previous `pi-gchat` design (Google Chat
+only, with the bot owning sessions itself). See §13 for build phasing.
 
 ---
 
-## Components
+## 1. Scope
 
-### Google Cloud side (configured once, in the console)
+**Is:** a long-running local service that
 
-- **GCP project** — owns everything below.
-- **Chat app** — a bot. Configured to deliver events to a **Pub/Sub topic** (not an HTTP endpoint).
-  - Slash commands (`/resume`, later `/delete`, `/abort`, `/status`, `/help`) are declared in the app's "Chat API configuration" page in the console.
-  - Install scope: restricted to the owner's account (defense-in-depth layer 1).
-- **Pub/Sub topic + pull subscription** — the Chat app publishes interaction events; the daemon pulls from the subscription.
-- **Service account** — dual purpose:
-  - Pub/Sub Subscriber on the subscription (read events).
-  - Chat app identity for `spaces.messages.create` (app auth, `chat.bot` scope).
-  - Key file stored locally (path in config).
+1. receives messages, commands and interactions from a chat platform (Slack),
+2. maps a chat *thread* to a pi session owned by `pi-gatewayd`,
+3. streams the agent's work back into that thread,
+4. enforces who may use it, how many sessions may run, and how they are cleaned up.
 
-### pi-gchat daemon (Go)
+**Is not:** a session daemon. `pi-gatewayd` owns pi processes, the prompt queue,
+hibernation, replay and the session catalog. This project never spawns `pi`.
 
-Libraries: `cloud.google.com/go/pubsub`, `google.golang.org/api/chat/v1`, `modernc.org/sqlite` (pure-Go, no cgo), `BurntSushi/toml`, `os/exec` + `bufio.Scanner` for the RPC subprocess.
+Non-goals are listed in §14.
 
-Responsibilities:
-1. **Pull** Chat events from Pub/Sub (streaming pull), ack them.
-2. **Verify** every event: sender email in `allowedEmails`; if `allowedSpaces` is set, space id in it.
-3. **Route** by event type:
-   - `MESSAGE` in a DM → new one-shot session.
-   - `MESSAGE` in a space → only act when the bot is @-mentioned; strip the `@BotName` prefix; start-or-continue the thread's session.
-   - `MESSAGE` with a slash command → dispatch (MVP: `/resume` only).
-   - `ADDED_TO_SPACE` → post a short help blurb.
-4. **Manage sessions**: spawn/kill `pi --mode rpc` subprocesses, keep the thread↔session mapping in SQLite.
-5. **Forward** pi's RPC events to Chat as rendered messages.
-6. **Create** project directories and inject the repo/worktree system-prompt convention for new sessions.
+---
 
-### pi subprocess
+## 2. Architecture
 
-`pi --mode rpc`, one per active session. Key commands used:
+```text
+   Slack (thread / DM)                                        local machine
+        │  Socket Mode (outbound WSS, no public endpoint)      ┌──────────────────────────┐
+        ▼                                                     │        pi-chatd          │
+   ┌───────────────┐   normalized events   ┌──────────────┐    │  ┌────────┐  ┌─────────┐ │
+   │ slack adapter │ ────────────────────▶ │    core      │    │  │ slack  │  │  core   │ │
+   │  (ingress)    │ ◀──────────────────── │   (policy)   │    │  └────────┘  └────┬────┘ │
+   └───────────────┘   Post/Update/Ask     └──────┬───────┘    │                   │      │
+                                                  │            │        gwclient (2 tokens)
+                                                  ▼            │                   │      │
+                                          ┌──────────────┐     │                   ▼      │
+                                          │   SQLite     │     │        ┌─────────────────┐
+                                          │ threads,     │     │        │  pi-gatewayd    │
+                                          │ cursor, seen │     │        └────────┬────────┘
+                                          └──────────────┘     │                 │
+                                                               │        pi --mode rpc (per session)
+                                                               └──────────────────────────┘
+```
 
-| Purpose | RPC command |
+Everything is **outbound**: one WSS to Slack (Socket Mode), loopback TCP to the
+gateway, plus the Slack Web API. No listening socket, no tunnel, no public URL, no
+certificate. `pi-gatewayd` is a prerequisite, not a component of this repository.
+
+### Two planes
+
+| Plane | Transport | Purpose |
+|---|---|---|
+| **Chat plane** | Slack Socket Mode + Web API | events in, messages out |
+| **Session plane** | `gwclient` over loopback TCP | sessions, prompts, events |
+
+The core is platform-independent; the Slack adapter owns everything that knows
+Slack's shapes (§12).
+
+---
+
+## 3. Upstream contract (pi-gateway v0.1.2)
+
+Dependency: `github.com/tigersoldier/pi-gateway` at **v0.1.2+**, importing the exported
+`gwclient`, `protocol` and `config` packages. Single local deployment; single
+`pi-gatewayd`.
+
+What this design relies on, all verified present in v0.1.2:
+
+| Need | API |
 |---|---|
-| Send prompt | `{"type":"prompt","message":...}` |
-| Abort (Phase 2) | `{"type":"abort"}` |
-| State (Phase 2) | `{"type":"get_state"}` |
+| Create/bind a session | `NewSession`, `SwitchSession` (path or name) |
+| Drive a turn | `Prompt`, `Steer`, `FollowUp`, `Abort`, `ClearQueue` |
+| Know when a turn ends | `TurnRunning`, `AwaitSettled`, `gw_turn` |
+| Stream progress | `Events()` / `Config.OnEvent`; daemon coalesces deltas (50 ms / 8 KB) |
+| Survive drops/restarts | `Cursor`/`LastSeq`/`LeafID` + `Reconnect`, replay or `gw_snapshot` |
+| Resume external sessions | `ListSessions(SessionFilter)`, `SwitchSession` |
+| Approvals | `Event.UIRequest`, `BlockingUIMethod`, `RespondUI` |
+| Release / destroy a session | `StopSession`, `DeleteSession` (v0.1.2) |
+| Terminal notification | `gw_session_state{state:"deleted"}`, `stopped` + `reason` |
+| Session state / models | `GetState`, `SetModel`, `GetAvailableModels`, `SetThinkingLevel`, `Compact` |
 
-Events consumed from stdout: `message_update` (`text_delta`, `thinking_delta`), `tool_execution_start/end`, `turn_end`, `agent_end`, `compaction_*`, errors.
+Notable upstream behaviour this design must respect:
 
-Spawn forms:
-- New session (DM or new space thread): `pi --mode rpc --name "<slug>" --append-system-prompt "<injected>"` with `cwd` = freshly created project dir.
-- Resume: `pi --mode rpc --session <file>` with `cwd` = the session's recorded cwd. **No** system-prompt injection.
+- **`admin` is required** for `gw_new_session`, `gw_stop_session`, `gw_delete_session`;
+  `control` is required for `set_model`, `compact`, `set_session_name`; `operator`
+  alone lacks `control`.
+- **One connection binds to exactly one session.** `SwitchSession` rebinds it.
+- **A delete tombstones the path** for the daemon's lifetime; a repeat delete or attach
+  answers `unknown_session`. The session file is deleted after pi is reaped.
+- **A stop/delete unbinds the affected connections** (they survive; they are not
+  closed). `gwclient` clears `Session()` on the terminal event.
+- **Attached clients never block a delete**; `gw_stop_session` refuses with
+  `session_attached` unless forced. A running turn refuses with `session_busy` unless
+  forced (which aborts, then stops after a 5 s grace).
+- **Open upstream gaps** — durable creator tags (in-memory, lost on daemon restart),
+  prompt idempotency, and connection/session caps. Their mitigations are ours (§7, §8).
 
----
+### Pending upstream ask
 
-## Configuration
+**`gw_stop_session` leaves the connection lazily-creating sessions.** After a stop the
+connection is unbound, but only `state:"deleted"` sets the daemon's "must rebind
+explicitly" flag, so the next session-scoped command silently creates a **second**
+session:
 
-`~/.pi/agent/pi-gchat.toml` (TOML; `~` is expanded by the daemon in all path values):
-
-```toml
-[access]
-allowed_emails = ["you@gmail.com"]          # required — feature #3
-allowed_spaces = ["spaces/ABC123..."]        # optional; omit = any space I'm in
-
-[gcp]
-project_id = "my-project"
-subscription_name = "pi-gchat-sub"
-credentials_file = "~/.pi/agent/pi-gchat-sa.json"
-
-[paths]
-projects_root = "~/work"                    # new session project dirs live here
-repos_root = "~/code"                       # git repos live here
-db_path = "~/.pi/agent/pi-gchat.db"
-
-[behavior]
-idle_timeout_minutes = 15
-max_concurrent_sessions = 10
-progress_update_interval_ms = 1000
-injected_prompt = """                        # template; {reposRoot} {projectsRoot} {date} {slug}
-Repositories live under {reposRoot} (some may be bare). To work on a task:
-1. List {reposRoot} and pick the repo this task needs.
-2. Detect layout: git -C <repo> rev-parse --is-bare-repository
-3. Normal clone only: git -C <repo> fetch origin   # read-only; updates remote-tracking refs, never local
-   Bare repo: skip this step (never fetch/pull; use refs already present).
-4. Resolve the default branch:
-   - normal clone: git -C <repo> rev-parse --abbrev-ref origin/HEAD   # e.g. origin/main
-   - bare repo:    git -C <repo> symbolic-ref --short HEAD             # e.g. main
-   (fallback: git -C <repo> ls-remote --symref origin HEAD)
-5. Create the worktree: git -C <repo> worktree add -b pi/{date}-{slug} ./repos/<repo-name> <default-branch-ref>
-6. cd ./repos/<repo-name>, do all work there, commit and push when done.
-"""
+```text
+registered after stop = 0
+prompt after stop = {command:prompt gw_session:s_1790… success:true}
+registered after prompt = 1
 ```
 
-Notes:
-- `injected_prompt` empty ⇒ no injection.
-- `allowed_spaces` empty ⇒ the per-event email check is still enforced everywhere.
+Fix requested: set that flag for `stopped` with `reason: requested|forced` too, with a
+message that distinguishes *stopped* (file exists, attach again) from *deleted*
+(gone). Until it ships, §4's attach-before-prompt rule is a hard invariant, not a
+convenience.
 
 ---
 
-## Data model (SQLite)
+## 4. Sessions and threads
+
+**A session is always thread-scoped.**
+
+| Context | Session |
+|---|---|
+| Channel thread | one session per thread (`workspace:channel:thread_ts`) |
+| DM thread | one session per thread |
+| Channel root, DM root | **no session** — only session-less commands are accepted |
+
+- The bot creates the thread when one is needed (`@pi <text>` in a channel root, or the
+  first `@pi <text>` / `@pi /<cmd>` in a DM root, which opens a DM thread).
+- Session identity is stored in `threads` (§7). Bot-created sessions are **named
+  deterministically** from the thread key (`slack-<workspace>-<channel>-<threadts>`) so
+  a lost database can be rebuilt by scanning the catalog.
+- Sessions started outside the bot (pilish, another integration) are adopted with
+  `/pi resume`; those keep their own names and paths.
+
+### Invariants
+
+1. **Attach before prompt.** Every turn begins with `SwitchSession(path)` — a no-op when
+   already bound. This is the §3 mitigation and the fix for the "stale connection forks
+   a new session" failure class.
+2. **Never prompt on an unbound connection** without attaching first; `Session() == nil`
+   is a state transition, never an assumed binding.
+3. **A deleted session is never re-attached.** On `state:"deleted"`, mark the thread
+   `deleted` and tell the user; a later message starts a *new* session deliberately.
+4. **pi is never stopped mid-turn by us.** Eviction and explicit stop use
+   `force: false`.
+
+### Lifecycle
+
+- **Warm:** the thread has a bound connection; the daemon holds a pi process.
+- **Cold:** the connection is closed after `thread_idle_close_minutes` of inactivity
+  (only when the turn is idle). The daemon hibernates the process later; the file
+  remains.
+- **Re-dial:** on the next message, dial with `Resume{Cursor}` — replay, or a snapshot
+  whose content is discarded (we render live turns, not history) while its watermark is
+  adopted.
+- **Deleted:** the session file is gone; the thread row is marked `deleted` and keeps
+  the key reserved so the next message starts fresh.
+
+---
+
+## 5. Interaction grammar
+
+Two trigger tokens, one vocabulary. The vocabulary is always written with its slash in
+threads and without a second slash in roots — because **Slack forbids developer slash
+commands inside message threads** and its slash-command payload carries no `thread_ts`.
+
+| Context | Form | Examples |
+|---|---|---|
+| Channel root, DM root | `/pi <command>` | `/pi status`, `/pi resume`, `/pi help` |
+| Channel thread, DM thread | `@pi /<command>` | `@pi /status`, `@pi /skill:grill-me`, `@pi /compact` |
+| Channel root | `@pi <text>` | `@pi fix the failing test` (starts a thread + session) |
+| Channel thread | `@pi <text>`, or plain text in a thread the bot is already in | continue the session |
+| DM thread | plain `<text>` | no mention needed |
+
+### Rules
+
+1. **Root commands are session-less only.** Legal: `/pi help`, `/pi status` (bot status:
+   gateway reachable, warm sessions, cap, this channel's threads), `/pi resume` (list
+   resumable sessions; picking one opens a thread and binds it). Anything else answers
+   with an ephemeral hint pointing at the thread form. A root invocation never creates
+   or touches a session as a side effect.
+2. **Resolution order:** bot control command → agent command → prompt. Agent commands
+   are validated against `GetCommands()` (extensions, prompt templates, skills);
+   an unknown `/X` is forwarded to pi verbatim so pi's own error is authoritative.
+3. **Near-miss guard:** a first token that matches a control name without its slash
+   (`@pi status`) gets an ephemeral `did you mean @pi /status?` instead of burning a
+   turn.
+4. **Mentions are stripped** before the text reaches the agent; a leading `/` after the
+   mention is preserved.
+5. **`@pi /delete` asks for confirmation with buttons**, then deletes.
+
+### Command reference (v1)
+
+| Command | Plane | Notes |
+|---|---|---|
+| `/pi help`, `@pi /help` | root / thread | usage + current thread state |
+| `/pi status` | root | bot status |
+| `@pi /status` | thread | session id, cwd, model, warm/cold, queue, last activity |
+| `/pi resume` | root | list adoptable sessions; pick with buttons |
+| `@pi /abort` | thread | `Abort`; queued prompts survive by design |
+| `@pi /delete` | thread | confirm → `DeleteSession` → worktree/branch cleanup → row deleted |
+| `@pi /model` | thread | `SetModel` / `GetAvailableModels` |
+| `@pi /stop` | thread | manual `StopSession` (cap debugging) |
+| `@pi /compact`, `@pi /skill:<name>`, `@pi /<template>` | thread | forwarded to pi |
+| `@pi <text>` | thread | prompt |
+
+---
+
+## 6. Rendering
+
+**Native Slack streaming is the primary path**; a patched placeholder is the documented
+fallback.
+
+- `chat.startStream` on turn start; `chat.appendStream` with
+  - `markdown_text` chunks for assistant text (standard markdown passes through — **no
+    mrkdwn conversion table**),
+  - `task_update` chunks for `tool_execution_start`/`_end` (`in_progress` →
+    `complete`/`error`), so tool calls render as a real timeline;
+- `chat.stopStream` finalizes the *same* message with any footer blocks.
+
+Constraints and behaviours:
+
+- Appends are coalesced on `flush_ms`, never per token (the daemon already coalesces at
+  50 ms / 8 KB).
+- `cannot_provide_both_markdown_text_and_chunks` per request — compose chunks.
+- Streaming to a channel requires `recipient_user_id` + `recipient_team_id`; thread
+  replies use `thread_ts`.
+- **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, degrade to
+  `chat.postMessage` + `chat.update` for that turn. The adapter seam has one method per
+  operation so the fallback stays inside the Slack adapter.
+- `assistant.threads.setStatus` for ambient state, `setTitle` for the derived thread
+  title.
+- **Approvals:** `confirm`/`select` → Block Kit buttons carrying the dialog id;
+  `input`/`editor` → a modal via the interaction's `trigger_id`; `pending_ui` (§7) maps
+  a click back to `RespondUI`. With `approvals = "auto"` sessions are spawned with
+  `--approve` and no dialogs appear. An unanswered dialog falls back to pi's own
+  timeout — the bot marks it expired rather than letting the turn stall silently.
+- **Admission notices** ("queued — waiting for a free slot") are posted in-thread; the
+  Slack ack always happens inside 3 s, before any work.
+
+---
+
+## 7. State
+
+SQLite (WAL, single writer), `db_path` from config. The gateway owns session files,
+processes and the catalog; **this database owns everything chat-side** — upstream's
+`createdBy`/tags are in-memory and vanish on a daemon restart.
 
 ```sql
-CREATE TABLE threads (
-  thread_name  TEXT PRIMARY KEY,   -- Chat thread name: spaces/{space}/threads/{thread}
-  session_file TEXT NOT NULL,      -- ~/.pi/agent/sessions/--cwd--/x.jsonl
-  session_id   TEXT NOT NULL,      -- from session header
-  cwd          TEXT NOT NULL,      -- project root
-  pid          INTEGER,            -- live RPC subprocess, or NULL when idle
-  status       TEXT NOT NULL,      -- running | idle | dead
-  created_at   TEXT NOT NULL,
-  last_active  TEXT NOT NULL
-);
+threads(thread_key PK,            -- workspace:channel:thread_ts
+        workspace_id, channel_id, thread_ts,
+        session_name, session_path, session_id, cwd, project_dir,
+        state,                    -- warm | cold | deleted
+        last_seq, leaf_id,        -- replay cursor (persist on settle and periodically)
+        progress_ts,              -- Slack message being streamed/patched
+        created_at, last_active)
+
+seen(event_id PK, received_at)    -- Slack retry dedupe (TTL sweep)
+pending_ui(dialog_id PK, thread_key, message_ts, created_at)
+admissions(id PK, thread_key, text, event_id, queued_at)
 ```
 
-- DM one-shot sessions have **no** `threads` row (the DM is a stateless launcher).
-- "Bound to chat" ⇒ has a row. `/resume` lists sessions with
-  `session_file NOT IN (SELECT session_file FROM threads)`.
+Rules:
+
+- **No conversation content is stored** — no transcripts, no assistant text, no tool
+  output. `admissions` holds text only until dispatch. (This is what the privacy note
+  will claim, and it must stay true.)
+- **Persist before acking** anything that mutates state, so a crash cannot lose an acked
+  message.
+- **`seen` is mandatory**, not an optimisation: upstream prompt idempotency is still
+  open, so this is the only guard against a Slack retry producing a double turn.
+- **`progress_ts` is persisted** so a bot restart can re-attach and keep updating the
+  same message instead of posting a duplicate.
+- **`deleted` is a state, not a delete**, so the thread key stays reserved.
 
 ---
 
-## Interaction model
+## 8. Concurrency and resources
 
-| Surface | Trigger | Behavior |
+The scarce resource is a **warm pi process**, held for every *bound* connection. The cap
+counts warm sessions, not sockets; an unbound connection is nearly free.
+
+- `max_warm_sessions` (default 8) — configurable.
+- **Overflow: evict → queue → refuse.**
+  1. Evict the least-recently-active **idle** session with `StopSession(force:false)`
+     and close its connection. Skip candidates whose turn is running, and skip any
+     session with another client attached (checked via `gw_list_sessions`' `clients`) —
+     the user may be driving it from pilish, and stopping pi under them is exactly what
+     `gw_stop_session` refuses.
+  2. If nothing is evictable, queue the message for `admission_wait_seconds` (default
+     120) with an in-thread notice; **re-check the allowlist at dequeue**; on expiry say
+     so.
+  3. Refuse with a clear message.
+- **Never `force`.** A busy or attached session is skipped, never killed.
+- **Every eviction is logged and counted** — an invisible cap that stops sessions is
+  indistinguishable from a bug.
+- The daemon's own idle hibernation (15 min after the last client detaches) is the
+  second tier and is not accounted; the idle-close sweep is what keeps the cap honest.
+
+---
+
+## 9. Workspace convention
+
+New sessions get a fresh project directory; the agent works in a git worktree of a real
+repository, so concurrent threads on one repo never collide and the user's own checkout
+is never touched.
+
+- Project dir: `{projects_root}/<date>-<slug>/`, passed to `gw_new_session.cwd`.
+- Repos: `{repos_root}` (some may be bare).
+- `injected_prompt` (config template; empty disables injection) instructs the agent to
+  pick the repo, detect bare vs clone, resolve the default branch, and
+  `git worktree add -b pi/{date}-{slug} ./repos/<repo> <ref>`, then work and push there.
+- It is passed at spawn as `piArgs: ["--append-system-prompt", <rendered>]`.
+
+Cleanup:
+
+- `@pi /delete` → `DeleteSession` (gateway removes the session file) → for each dir under
+  the project dir's `repos/*`: `git -C <mainrepo> worktree remove --force`, prune the
+  `pi/<date>-<slug>` branch → delete the row → remove the project dir if empty.
+- **Startup GC:** for each directory under `projects_root` with **no** `threads` row:
+  remove its worktrees, prune its branch, delete the directory. Orphans only — a cold
+  thread with a live row is never touched, because `/pi resume` must still find it.
+- Sessions adopted from outside the bot live outside `projects_root` and are therefore
+  structurally out of the GC's reach.
+
+---
+
+## 10. Access control and credentials
+
+**Deny by default.** Anyone who can talk to this bot can run an agent with shell access
+on the machine and, through the admin token, destroy sessions.
+
+- `allowed_users` (Slack user IDs) is required and enforced **before any side effect** —
+  no dial, no project dir, no session. The check uses the *event's* user, so edits and
+  bot-authored messages cannot slip through.
+- `allowed_channels` is optional; empty means any channel the bot is in.
+- `workspace_id` is recorded in every thread key from day one, so adding OAuth
+  distribution later does not require re-keying.
+
+Two gateway tokens (§3) — never the daemon's default token:
+
+| Token | File | Capabilities | Where used |
+|---|---|---|---|
+| admin | `admin_token_file` | `admin` (+ everything) | one **session-less** connection, lifecycle only: `gw_new_session`, `gw_stop_session`, `gw_delete_session` |
+| thread | `thread_token_file` | `observe, prompt, interject, ui, control` — deliberately **no `admin`** | per-thread connections |
+
+Rationale: lifecycle operations travel on a connection that never binds or prompts, so
+they cannot be confused by a stale binding; and the many long-lived per-thread
+connections cannot destroy sessions even if a rendering or dispatch bug abuses them.
+Mint with `pi-gatewayd --provision-token`; rotate via `tokens.json` + SIGHUP.
+
+---
+
+## 11. Configuration
+
+`~/.config/pi-chat/config.toml`, mode 0600 (it holds token *paths*; token values live in
+0600 files beside it). State in `~/.local/state/pi-chat/`.
+
+```toml
+[slack]
+app_token_file = "~/.config/pi-chat/slack-app-token"   # xapp-…, Socket Mode
+bot_token_file = "~/.config/pi-chat/slack-bot-token"   # xoxb-…
+
+[access]
+allowed_users    = ["U01234567"]   # required
+allowed_channels = []              # optional
+
+[gateway]
+state_dir         = "~/.config/pi-gateway"
+admin_token_file  = "~/.config/pi-chat/gateway-admin.token"
+thread_token_file = "~/.config/pi-chat/gateway-thread.token"
+pi_args           = ["--approve"]
+
+[paths]
+projects_root = "~/work"
+repos_root    = "~/code"
+db_path       = "~/.local/state/pi-chat/pi-chat.db"
+
+[concurrency]
+max_warm_sessions         = 8
+thread_idle_close_minutes = 10
+admission_wait_seconds    = 120
+eviction                  = "evict-then-queue"
+
+[render]
+mode     = "stream"                # stream | patch
+flush_ms = 1000
+
+[behavior]
+approvals = "auto"                 # auto (--approve) | interactive
+# injected_prompt = """…"""        # {reposRoot} {projectsRoot} {date} {slug}; empty = none
+
+[log]
+level  = "info"
+format = "text"
+```
+
+---
+
+## 12. Adapter seam
+
+Core is platform-independent; the Slack adapter owns platform shapes. The seam is drawn
+from Slack only — it deliberately does not anticipate Google Chat's cards or Pub/Sub.
+
+**Core:** gateway client pool and tokens, thread↔session binding and persistence,
+cursor handling, admission and eviction, command resolution, project provisioning and
+GC, the normalized progress model (turn started → tool activity → assistant text →
+terminal).
+
+**Slack adapter:** Socket Mode envelopes + ack, `event_id` dedupe, thread key and sender
+extraction, allowlist input, mention stripping, rendering and chunking, streaming vs
+fallback, interactive components and modals, file download → `protocol.ImageContent`,
+slash-command registration.
+
+**Seam:** inbound `{threadKey, senderID, text, attachments}` → core; outbound
+`Post`, `Update`, `AskConfirm`. No Slack envelope, `ts`, block or Socket Mode type
+crosses it.
+
+---
+
+## 13. Build phasing
+
+- **Phase 0 — vertical slice through the real seam.** One allowed user, one channel, no
+  database: Socket Mode → `@pi hello` in a thread → admin connection creates a session →
+  prompt → streamed reply rendered into that thread. The deliverable is a streamed pi
+  turn inside Slack. It reads the real config file, so nothing is thrown away.
+- **Phase 1 — MVP.** Allowlist + denial; SQLite binding, cursor, dedupe; session
+  provisioning (project dir, injected prompt, worktree convention); thread-scoped
+  sessions; prompt → streamed answer; `/pi help`; `/pi status`; `/pi resume`;
+  `@pi /<command>`; `@pi /status`; `--approve` mode; startup GC; systemd user unit.
+- **Phase 2.** `@pi /delete` (button confirm) + worktree/branch cleanup; `@pi /abort`;
+  `@pi /model`; interactive approvals (buttons + modal); concurrency cap with eviction
+  and bounded queue; streaming → patch fallback.
+- **Phase 3.** Message shortcut for in-thread discovery; `setTitle`/`setStatus` and
+  suggested prompts; image/attachment passthrough; `/pi resume` picker polish; metrics.
+
+Testing: run the real `pi-gatewayd` pointed at a stub `pi` binary (`--pi`), so the
+gateway contract is exercised for real while the agent is fake; recorded Slack payloads
+drive the adapter without a workspace.
+
+---
+
+## 14. Non-goals (v1)
+
+- Google Chat adapter (planned; the core is built to admit it).
+- Multi-workspace OAuth distribution, Marketplace listing, and the privacy/terms
+  artifacts a listing requires (Socket Mode apps cannot be listed, so there is no
+  listing in v1).
+- Per-user settings, model preferences, or quotas (single-owner deployment).
+- Browsing or replaying transcripts inside Slack; Slack renders live turns only.
+- Session groups across daemons, WebSocket transport (upstream M4).
+- Multi-instance operation: Socket Mode distributes events across connections, so the
+  bot is deliberately single-instance.
+
+---
+
+## 15. Decision log
+
+| # | Decision | Why |
 |---|---|---|
-| DM | any message | Always a fresh one-shot session; stream result back; session saved but not bound to a thread |
-| Space | @mention in a thread | Unknown thread → new session + project dir; known thread → continue that session |
-| Space | @mention, main conversation | New session in that message's (new) thread |
-| Space/other | non-mention | Ignored |
-| Space | slash command | Dispatched (see below) |
-
-### Slash commands
-
-| Command | Phase | Behavior |
-|---|---|---|
-| `/resume` / `/resume <n>` | MVP | List **unbound** sessions (~10 most recent across all projects); bind this thread to the chosen one |
-| `/abort` | 2 | Abort the running agent (RPC `abort`) |
-| `/status` | 2 | Session id, cwd, model, running/idle, file |
-| `/delete` | 2 | Kill → remove worktrees (+prune branches) → delete session file + row → delete project dir if empty (double-confirm) |
-| `/help` | 2 | List commands |
-
-`/resume` enumeration: daemon reads session JSONL files under `~/.pi/agent/sessions/` directly (header line for `cwd`/`id`/`timestamp`; title = `session_info` name, else first user message).
-
-`/delete` details:
-1. Abort + terminate the RPC subprocess if running.
-2. For each dir under `<projectRoot>/repos/*`: resolve main repo via `git rev-parse --git-common-dir`, `git worktree remove --force <path>` from that repo, then prune the `pi/<date>-<slug>` branch.
-3. Delete the session JSONL and the `threads` row.
-4. Delete the project dir only if empty; otherwise leave it and report.
-5. `/delete` asks for a second `/delete` to confirm.
-
----
-
-## Session & subprocess lifecycle
-
-- **Spawn** lazily on first @mention in a thread (or per DM message for one-shots). Keep warm between messages (spawning is slow — model/auth/extension init).
-- **Idle timeout:** 15 min without activity → kill subprocess, `pid = NULL, status = idle`.
-- **Concurrency cap:** 10 simultaneous sessions; beyond that reply "N sessions already running, try later."
-- **Restart recovery:** on daemon startup, mark all `running` rows `dead` (stale pids). Next message in a thread whose pid is dead → respawn `pi --mode rpc --session <file>` (pi resumes from the last auto-saved state).
-- DM one-shots: spawn per message, stream to `agent_end`, then exit.
-
----
-
-## Output rendering (pi → Chat)
-
-- On prompt receipt: post a **placeholder** message ("Working…") in the thread.
-- During the run: **patch that one message in place** (`spaces.messages.patch`) at coarse boundaries (turn end, tool start/end, compaction), rate-limited to `progress_update_interval_ms`. Never per-token.
-- On `agent_end`: post the **final answer** as a new message + footer with the session id (for later `/resume`).
-- Truncate to Chat's ~4 KB text limit at a block boundary; full output lives in the session JSONL.
-- **Markdown → Chat dialect** conversion applied to all rendered text:
-
-| Source (LLM markdown) | Chat text |
-|---|---|
-| `**bold**` | `*bold*` |
-| `*italic*` / `_italic_` | `_italic_` |
-| `~~strike~~` | `~strike~` |
-| `` `code` `` | `` `code` `` |
-| ``` fenced ``` | ``` fenced ``` |
-| `- item` | `* item` |
-| `1. item` | `1. item` |
-| `[label](url)` | `<url\|label>` |
-| `# Header` | `*Header*` |
-
-Tool activity rendered as terse lines: `✓ bash: npm test` / `✗ bash: npm test (exit 1)`.
-
----
-
-## Security (feature #3 — defense in depth)
-
-1. **Console:** Chat app installable only by the owner's account/domain.
-2. **Transport:** Pub/Sub subscription readable only by the service account (GCP IAM).
-3. **Per-event:** reject unless `event.user.email` and `event.message.sender.email` ∈ `allowedEmails`.
-4. **Space:** if `allowed_spaces` set, reject events from other spaces.
-
-Outbound: app auth (service account); replies attributed to the bot.
-
----
-
-## Message flow (example)
-
-**New session in a space thread:**
-1. You post a top-level message mentioning the bot → Pub/Sub event.
-2. Daemon verifies sender + space; `thread.name` unknown.
-3. Daemon creates `~/work/<date>-<slug>/`, renders `injected_prompt`, spawns `pi --mode rpc --name <slug> --append-system-prompt <rendered>` (cwd = project dir).
-4. Inserts `threads` row (`running`).
-5. Daemon posts "Working…" and forwards the prompt (mention stripped) via RPC `prompt`.
-6. RPC events stream → daemon patches the progress message (rate-limited).
-7. `agent_end` → final answer posted; row updated (`idle`).
-
-**Resume an external session:**
-1. In a thread: `/resume` → daemon lists unbound sessions.
-2. `/resume 3` → daemon reads that session's header (cwd, id), spawns `pi --mode rpc --session <file>` with that cwd, binds `threads` row. No injection.
-
----
-
-## Build phasing
-
-- **Phase 0 — Google plumbing spike (riskiest unknown, first):** GCP project, Chat app, Pub/Sub topic + pull subscription, service account; a tiny Go probe pulls one event and posts one reply. Nothing else until this round-trips.
-- **Phase 1 — MVP (all four core features):**
-  - TOML config, SQLite, allowlists.
-  - DM one-shot; Space @mention start/continue.
-  - Project-dir creation + injected worktree convention.
-  - Progress message + final answer; Markdown→Chat formatting.
-  - `/resume` (unbound sessions).
-  - Idle timeout, cap = 10, systemd `--user` service (`~/.config/systemd/user/pi-gchat.service`, `Restart=on-failure`, `loginctl enable-linger`), restart recovery. tmux window for dev.
-- **Phase 2 — remaining commands:** `/delete`, `/abort`, `/status`, `/help`.
-- **Phase 3 — polish:** button-cards for `/resume` picker, `/model`, `/projects`, image passthrough, richer status cards.
-
----
-
-## Verified assumptions
-
-- `pi --mode rpc --append-system-prompt "<text>"` is accepted and flows into the session system prompt (checked against the installed package; `get_state` round-trips cleanly).
-- RPC framing is strict JSONL, LF-only; use `bufio.Scanner` with a raised buffer (tool output lines can be large).
-- Sessions are JSONL under `~/.pi/agent/sessions/--<cwd>--/…`; header carries `cwd`/`id`/`timestamp`; `session_info` entries carry the display name.
-- Google Chat: events can be delivered via Pub/Sub; async replies via `spaces.messages.create` with `thread.name`; messages carry `thread.name` in both spaces and DMs (DM inline threading rolled out Nov 2025).
+| 1 | Built on `pi-gateway` as a `gwclient` consumer (v0.1.2+) | The daemon owns sessions, queue, replay, hibernation; reimplementing that was the old design's largest cost. Upstream explicitly scopes the Slack bot to a separate repo. |
+| 2 | Slack ingress: Socket Mode, wired directly (no transport interface) | Keeps the service fully outbound — no endpoint, tunnel or cert; slash commands and interactivity work. The platform seam below it is where reuse actually matters. |
+| 3 | Keep the worktree-per-session convention; `/delete` cleans up; startup GC sweeps orphans only | Worktrees are what allow concurrent threads per repo without touching the user's checkout; GC covers crashes, and cold-but-known threads stay resumable. |
+| 4 | Request the upstream stop-rebind fix; keep attach-before-prompt as an invariant | The defect silently forks a second session after a stop; the invariant is defence in depth either way. |
+| 5 | Rename to `pi-chat`, Google Chat named as a deferred adapter, gchat spike code deleted | The name is the scope statement; the module path has no external importers, so the rename is free. The gchat transport code does not survive the gateway rewrite. |
+| 6 | Core/adapter split, seam drawn from Slack, responsibilities written down | Avoids designing against a platform not yet implemented while keeping the second adapter cheap. |
+| 7 | Access: required user allowlist, optional channel allowlist, deny by default | An agent with shell access plus session-destroying capability is the thing being protected. |
+| 8 | Two gateway tokens: session-less admin, per-thread `operator + control` (no admin) | Least privilege on the hot path, and lifecycle ops that cannot be confused by a stale binding. |
+| 9 | Cap warm sessions (default 8); evict idle LRU → bounded queue → refuse; never force | The resource is the pi process, not the socket; eviction must never kill a turn or a session someone else is driving. |
+| 10 | Bound while hot, close after idle; persist the cursor; discard snapshot content | Fast within a conversation burst, with the tail decaying automatically; history is not replayed to a user who already saw it. |
+| 11 | SQLite + deterministic session names | Durable authoritative chat-side state, rebuildable from the catalog if the database is lost. |
+| 12 | Native Slack streaming primary, patched message as fallback | `task_update` chunks map tool executions onto a real timeline and pi's markdown passes through unmodified — strictly better than a mrkdwn conversion table. |
+| 13 | Two trigger tokens, one vocabulary: `/pi <cmd>` at root, `@pi /<cmd>` in a thread; sessions are thread-scoped | Slack forbids developer slash commands in threads and omits `thread_ts` from their payload; this is the only consistent grammar the platform allows. |
+| 14 | Phase 0 is the thinnest vertical slice through the real seam | The two unknowns (Slack ingress/egress, gateway integration) only meet at the seam; proving them one at a time proves neither. |
