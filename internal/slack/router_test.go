@@ -12,6 +12,11 @@ type recordingCore struct {
 	messages []bot.Message
 	commands []bot.Command
 	actions  []bot.Action
+	opened   []bot.Opened
+}
+
+func (c *recordingCore) HandleOpened(_ context.Context, o bot.Opened) {
+	c.opened = append(c.opened, o)
 }
 
 func (c *recordingCore) HandleMessage(_ context.Context, m bot.Message) {

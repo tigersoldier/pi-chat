@@ -189,6 +189,70 @@ func (b *Bot) HandleAction(ctx context.Context, a Action) {
 	}
 }
 
+// HandleOpened answers the platform telling us the user opened the bot's own
+// conversation: the moment to offer prompts built from this machine instead of a
+// list hard-coded in a manifest (DESIGN.md §6).
+func (b *Bot) HandleOpened(ctx context.Context, o Opened) {
+	if !b.claim(ctx, o.EventID) {
+		return
+	}
+	if !b.allowed(o.UserID, o.Channel) {
+		// Nothing to refuse: the conversation is empty, and a refusal in it would
+		// be noise a stranger cannot act on. The log is the record.
+		b.log.Warn("someone outside the allowlist opened the conversation",
+			"user", o.UserID, "channel", o.Channel)
+		return
+	}
+	go b.suggestPrompts(ctx, o)
+}
+
+// Limits on what a platform is offered. Slack takes four prompts, and a list of
+// four is already more than anyone reads.
+const (
+	suggestionLimit  = 4
+	suggestionsTitle = "Try one of these"
+)
+
+// suggestPrompts offers work the repos root actually contains.
+func (b *Bot) suggestPrompts(ctx context.Context, o Opened) {
+	reporter, ok := b.plat.(PromptReporter)
+	if !ok {
+		return
+	}
+	suggestions := b.suggestions()
+	if len(suggestions) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+	defer cancel()
+	if err := reporter.SetSuggestedPrompts(ctx, o.Channel, suggestionsTitle, suggestions); err != nil {
+		b.log.Debug("cannot offer suggestions", "channel", o.Channel, "error", err)
+	}
+}
+
+// suggestions names repositories that are really here, so the list is about this
+// machine rather than about the product: the first two repositories get a
+// question each, and an empty or unreadable repos root simply means no
+// suggestions rather than a fabricated list.
+func (b *Bot) suggestions() []Suggestion {
+	var out []Suggestion
+	for _, repo := range b.work.Repos() {
+		out = append(out,
+			Suggestion{
+				Title:   "What changed in " + repo + "?",
+				Message: "Summarize the uncommitted changes in " + repo + " and what I should look at.",
+			},
+			Suggestion{
+				Title:   "Fix the tests in " + repo,
+				Message: "Run the tests in " + repo + " and fix what fails.",
+			})
+		if len(out) >= suggestionLimit {
+			return out[:suggestionLimit]
+		}
+	}
+	return out
+}
+
 // Run performs the periodic maintenance the daemon needs, until ctx ends:
 // closing connections that have gone idle and pruning the dedupe table.
 //

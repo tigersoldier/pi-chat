@@ -307,6 +307,27 @@ func (a *API) Respond(ctx context.Context, responseURL, text string, blocks []bl
 	return fmt.Errorf("slack response_url: unexpected answer %q", answer)
 }
 
+// suggestion is one suggested prompt, in the shape Slack takes.
+type suggestion struct {
+	Title   string `json:"title"`
+	Message string `json:"message"`
+}
+
+// SetSuggestedPrompts offers prompts at the top of the app's Messages tab in
+// Slack's agent messaging experience.
+//
+// `thread_ts` is deliberately absent, and must stay absent: Slack documents that
+// in an agent app including it makes the call fail **silently** — a failure this
+// would return no error for — and the agent surface has moved suggestions out of
+// threads and into the Messages tab anyway, so there is no thread to name.
+func (a *API) SetSuggestedPrompts(ctx context.Context, channelID, title string, prompts []suggestion) error {
+	params := map[string]any{"channel_id": channelID, "prompts": prompts}
+	if title != "" {
+		params["title"] = title
+	}
+	return a.call(ctx, "assistant.threads.setSuggestedPrompts", params, nil)
+}
+
 // SetAgentStatus sets the lifecycle status of the agent session for a thread
 // (Slack's agent messaging experience). Slack creates the session if it does
 // not exist yet, which is also what makes writing this the thing that opens the

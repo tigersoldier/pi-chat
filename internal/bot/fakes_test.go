@@ -33,6 +33,25 @@ type fakePlatform struct {
 	thread   Thread   // what OpenThread returns; zero means a stand-in
 	renderer *recordingRenderer
 	statuses []Status // lifecycle states, in the order the core asked for them
+
+	prompts        []Suggestion
+	promptsChannel string
+}
+
+// SetSuggestedPrompts records suggestions, making the fake a PromptReporter.
+func (p *fakePlatform) SetSuggestedPrompts(_ context.Context, channel, _ string, suggestions []Suggestion) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.promptsChannel = channel
+	p.prompts = append([]Suggestion(nil), suggestions...)
+	return nil
+}
+
+// suggestedPrompts returns what the core offered, and to which channel.
+func (p *fakePlatform) suggestedPrompts() (string, []Suggestion) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.promptsChannel, append([]Suggestion(nil), p.prompts...)
 }
 
 func (p *fakePlatform) StartTurn(_ context.Context, m Message) (Renderer, error) {

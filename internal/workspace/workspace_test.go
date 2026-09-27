@@ -27,6 +27,50 @@ func newProvisioner(t *testing.T, template string) (*Provisioner, string, string
 	return p, projects, repos
 }
 
+func TestReposListsOnlyRepositories(t *testing.T) {
+	root := t.TempDir()
+	// A repository with a .git directory, and one with a .git file — which is
+	// what a linked worktree has.
+	dir := filepath.Join(root, "notes")
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	dir = filepath.Join(root, "app")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+		t.Fatalf("write .git: %v", err)
+	}
+	// Neither of these is a repository: a plain directory, and a hidden one.
+	for _, name := range []string{"scratch", ".cache"} {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := New(Config{ReposRoot: root}, discardLogger()).Repos()
+	if len(got) != 2 || got[0] != "app" || got[1] != "notes" {
+		t.Errorf("Repos() = %v, want [app notes] and nothing else", got)
+	}
+}
+
+func TestReposToleratesAMissingRoot(t *testing.T) {
+	// Offering suggestions is not worth failing an interaction over: an
+	// unconfigured or unreadable repos root is simply no repositories.
+	tests := map[string]Config{
+		"unconfigured": {},
+		"missing":      {ReposRoot: filepath.Join(t.TempDir(), "not", "there")},
+	}
+	for name, cfg := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := New(cfg, discardLogger()).Repos(); len(got) != 0 {
+				t.Errorf("Repos() = %v, want none", got)
+			}
+		})
+	}
+}
+
 func TestSlugFromPrompt(t *testing.T) {
 	tests := []struct{ prompt, want string }{
 		{"fix the failing test", "fix-the-failing-test"},

@@ -26,13 +26,13 @@ features:
   agent_view:
     # 300 characters max
     agent_description: Run local pi coding-agent sessions from Slack.
-    suggested_prompts:
-      - title: What changed?
-        message: Summarize the uncommitted changes in my main repository
-      - title: Fix the tests
-        message: Find and fix the failing test in this repository
-      - title: Start a skill
-        message: /skill:grill-me
+    # No suggested_prompts here on purpose. A hard-coded list cannot name
+    # anything about the machine the bot runs on, so pi-chat sets them at
+    # runtime instead: opening the conversation offers work in the
+    # repositories that are actually under paths.repos_root
+    # (assistant.threads.setSuggestedPrompts, which needs assistant:write
+    # below and, in an agent app, must NOT carry thread_ts — Slack documents
+    # that including it makes the call fail silently).
   bot_user:
     display_name: pi
     always_online: false

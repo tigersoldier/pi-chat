@@ -227,11 +227,12 @@ including conversations pi-chat does not care about. That is inherent to the Eve
 the daemon ignores anything that is not a thread it owns, and only responds when
 mentioned or addressed in a thread it already has a session for.
 
-The agent manifest adds four events: `app_home_opened` (how a DM open is detected in
-that surface — **no scope required**), `agent_session_stopped` (`chat:write`; subscribing is
-what makes the loading indicator's stop button real), `agent_session_title_changed`, and
-`app_context_changed` (the only one of the four that needs `assistant:write`, and the one
-pi-chat does not use — it is about tracking what the user is looking at).
+The agent manifest adds four events: `app_home_opened` (how a DM open is detected —
+**no scope required**; pi-chat uses it to offer suggested prompts), `agent_session_stopped`
+(`chat:write`; subscribing is what makes the loading indicator's stop button real, and
+pressing it aborts the turn), `agent_session_title_changed`, and `app_context_changed` (the
+only one of the four that needs `assistant:write`, and the one pi-chat does not use — it is
+about tracking what the user is looking at).
 
 ### Settings
 
@@ -265,8 +266,8 @@ credited with work it does not do:
 | Field | Required? | What it does |
 |---|---|---|
 | `features.agent_view` | optional in the schema, but it **is** the agent experience | turns the DM into an agent timeline. Including the group makes `agent_description` (300 chars max) required; `suggested_prompts` and `actions` are optional |
-| `assistant:write` | no — not for agent status or titles | `agents.sessions.setStatus` and `agents.sessions.rename` need `chat:write` only; `assistant:write` is required by `app_context_changed` and the legacy `assistant.threads.*` methods |
-| `app_home_opened` | no, and **no scope is required** | the DM-open signal (`tab == "messages"`), which replaces the retired `assistant_thread_started`. Only useful if you act on a DM being opened |
+| `assistant:write` | no — not for agent status or titles | `agents.sessions.setStatus` and `agents.sessions.rename` need `chat:write` only. This scope is required by `app_context_changed` and the legacy `assistant.threads.*` methods — including `setSuggestedPrompts`, which is how pi-chat offers prompts built from your own repositories |
+| `app_home_opened` | no, and **no scope is required** | the DM-open signal (`tab == "messages"`), which replaces the retired `assistant_thread_started`. pi-chat uses it to offer suggested prompts when you open the conversation |
 
 Without `features.agent_view` the app is just a bot that happens to be chatty: no
 timeline, no status, no stop button. That is exactly what
@@ -277,8 +278,8 @@ What that buys pi-chat:
 | Capability | Instead of |
 |---|---|
 | `agents.sessions.setStatus` with real values — `processing` while a turn runs, `suspended` while waiting for your approval, `active` when idle, `closed` after a delete | no status at all, or a free-form string with a two-minute timeout |
-| a **stop button** while the agent works (via the `agent_session_stopped` event), which a later phase wires to abort the turn | `/abort` typed by hand |
-| `agents.sessions.rename` titles, suggested prompts in the composer | untitled threads |
+| a **stop button** while the agent works (via the `agent_session_stopped` event), wired to abort the turn | `/abort` typed by hand |
+| suggested prompts built from the repositories under `paths.repos_root`, offered when you open the conversation | a hard-coded list in the manifest that cannot know anything about your machine |
 
 Before choosing it, know the caveats:
 

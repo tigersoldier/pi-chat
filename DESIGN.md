@@ -251,7 +251,8 @@ What reaches a session, and what does not:
 
 | Message | Behaviour |
 |---|---|
-| Channel or DM root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one |
+| Channel root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one — the bot sits in busy channels |
+| DM or group DM, plain text | A prompt, rooted at that message. In a conversation the bot was added to, the conversation *is* the address — and this is the shape a suggested prompt takes |
 | Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
 | DM root, `@pi <text>` | Same, and the thread is a DM thread |
 | Channel thread, plain text | A prompt **only if** that thread already has a session (the bot sits in busy channels) |
@@ -349,6 +350,18 @@ Constraints and behaviours:
     bookkeeping: a later append fails, and the renderer already answers an append failure
     by switching to message updates, so the partial answer still gets its final text. A
     stop that arrives with no turn running clears a stale status instead of doing nothing.
+
+    **Suggested prompts are computed, not declared.** `app_home_opened` with the
+    Messages tab is the signal to offer them, and the list names repositories that exist
+    under `paths.repos_root` — two questions per repository, four at most, and nothing at
+    all when there is nothing to name. A list hard-coded in the manifest cannot say
+    anything about the machine the bot runs on, which is the entire point of offering one.
+    `assistant.threads.setSuggestedPrompts` is the one thing here that needs
+    `assistant:write`, and in an agent app it must **not** carry `thread_ts`: Slack
+    documents that including it makes the call fail **silently**, which is why the adapter
+    has a test asserting the parameter is absent. An install that cannot show them — a
+    plain bot without the scope, or a workspace without the agent feature — is asked once
+    and then left alone, exactly like the status.
 
     **Still open:** `rename` titles, `suspended` while a turn waits for a human answer,
     and `closed` on `/delete` — the first two land with phase 2's approvals, the third

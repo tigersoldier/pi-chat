@@ -273,8 +273,14 @@ worth fixing before M5 builds `/delete` on top of this base.
       show one (`feature_disabled`, `missing_scope`)
 - [x] The stop button works: `agent_session_stopped` → `ActionStop` → abort the session,
       with a stale status cleared when nothing was running
-- [x] `app_home_opened` is subscribed but deliberately unused: nothing pi-chat does needs
-      to know a DM was opened, and a suggested prompt comes from the manifest
+- [x] A DM message is a prompt: a plain message in a DM or group DM now roots a thread,
+      because a conversation the bot was added to has no ambiguity about who is being
+      addressed — and because a suggested prompt arrives exactly that way
+- [x] Suggested prompts are computed from `paths.repos_root` when the user opens the
+      conversation, not declared in the manifest, and nothing is offered when there is
+      nothing to name (`assistant:threads.setSuggestedPrompts` needs `assistant:write`
+      and, in an agent app, must omit `thread_ts` — Slack fails the call silently if it is
+      present)
 
 **Exit:** the status appears in Slack and the stop button stops the turn.
 **Depends on:** M4.

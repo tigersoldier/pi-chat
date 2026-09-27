@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -63,6 +64,38 @@ type Project struct {
 // Name is the directory's base name, as the injected prompt's {slug} and
 // {date} describe it.
 func (p Project) Name() string { return filepath.Base(p.Dir) }
+
+// Repos lists the repositories directly under the repos root, sorted by name.
+//
+// It is what makes a suggested prompt reflect this machine instead of a
+// hard-coded list: the suggestions name repositories that are actually here.
+// Only directories that look like a repository count — a `.git` file (a linked
+// worktree) or a `.git` directory — and a root that cannot be read is simply no
+// repositories, not an error worth failing an interaction over.
+func (p *Provisioner) Repos() []string {
+	root := p.cfg.ReposRoot
+	if root == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		p.log.Debug("cannot list the repos root", "root", root, "error", err)
+		return nil
+	}
+	var repos []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || strings.HasPrefix(name, ".") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, name, ".git")); err != nil {
+			continue
+		}
+		repos = append(repos, name)
+	}
+	slices.Sort(repos)
+	return repos
+}
 
 // Provision creates a project directory for a new session. The name comes from
 // the first prompt and the date, and a collision gets a counter rather than a

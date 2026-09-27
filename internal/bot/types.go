@@ -162,6 +162,34 @@ type StatusReporter interface {
 	SetStatus(ctx context.Context, t Thread, s Status) error
 }
 
+// Suggestion is one prompt a platform offers before the user types: a title for
+// the choice, and the message choosing it sends.
+type Suggestion struct {
+	Title   string
+	Message string
+}
+
+// PromptReporter is implemented by a platform that can show suggestions in its
+// own UI. Slack's agent surface shows up to four at the top of the Messages tab.
+//
+// They are per conversation, not per thread: the agent experience moved
+// suggestions out of threads and into the Messages tab, so a channel is the
+// whole address (DESIGN.md §6).
+type PromptReporter interface {
+	SetSuggestedPrompts(ctx context.Context, channel, title string, suggestions []Suggestion) error
+}
+
+// Opened reports that a user opened the bot's own conversation. It is the moment
+// to offer suggestions built from this deployment rather than from a list
+// hard-coded in a manifest (DESIGN.md §6), and the reason `app_home_opened` is
+// subscribed at all.
+type Opened struct {
+	EventID   string
+	Channel   string
+	UserID    string
+	Workspace string
+}
+
 // Notice is a message the core posts outside a turn: a command answer, a
 // refusal, a hint, or a picker.
 //

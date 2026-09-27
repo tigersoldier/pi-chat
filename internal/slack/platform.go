@@ -41,6 +41,11 @@ type Platform struct {
 	// app whose feature was never enabled answers `missing_scope`. Turns run
 	// without an indicator instead of asking again on every one.
 	statusRefused atomic.Bool
+
+	// promptsRefused is the same latch for suggestions: a plain-bot install has
+	// no agent surface to show them on, and the method needs a scope the default
+	// manifest deliberately does not request.
+	promptsRefused atomic.Bool
 }
 
 // NewPlatform builds the Slack adapter. teamID is the workspace the bot token
@@ -133,7 +138,7 @@ func (p *Platform) SetStatus(ctx context.Context, t bot.Thread, s bot.Status) er
 	if err == nil {
 		return nil
 	}
-	if !statusIsUnavailable(err) {
+	if !capabilityUnavailable(err) {
 		return err
 	}
 	// Ask once, then stop: the answer will not change while this process lives,
@@ -144,9 +149,35 @@ func (p *Platform) SetStatus(ctx context.Context, t bot.Thread, s bot.Status) er
 	return nil
 }
 
-// statusIsUnavailable reports whether err means "this install can never show an
-// agent status", as opposed to a failure that may pass.
-func statusIsUnavailable(err error) bool {
+// SetSuggestedPrompts offers prompts in Slack's agent surface, best-effort by
+// contract (bot.PromptReporter).
+func (p *Platform) SetSuggestedPrompts(ctx context.Context, channel, title string, suggestions []bot.Suggestion) error {
+	if len(suggestions) == 0 || p.promptsRefused.Load() {
+		return nil
+	}
+	prompts := make([]suggestion, 0, len(suggestions))
+	for _, s := range suggestions {
+		prompts = append(prompts, suggestion{Title: s.Title, Message: s.Message})
+	}
+	err := p.api.SetSuggestedPrompts(ctx, channel, title, prompts)
+	if err == nil {
+		return nil
+	}
+	if !capabilityUnavailable(err) {
+		return err
+	}
+	p.promptsRefused.Store(true)
+	p.log.Info("this install cannot show agent suggestions; the conversation stays as it is",
+		"error", err)
+	return nil
+}
+
+// capabilityUnavailable reports whether err means "this install can never do
+// this", as opposed to a failure that may pass: a workspace without the agent
+// feature, an app that was never granted the scope, or an API surface that has
+// moved on. The answer will not change while this process lives, so it is worth
+// asking exactly once and then leaving alone.
+func capabilityUnavailable(err error) bool {
 	for _, code := range []string{
 		"feature_disabled",       // no agent feature in this workspace
 		"missing_scope",          // declared agent_view but never granted the scope

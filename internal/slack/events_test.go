@@ -101,6 +101,39 @@ func TestParseMessageDirectMessages(t *testing.T) {
 		}
 	})
 
+	t.Run("plain text at the DM root opens a thread", func(t *testing.T) {
+		// A suggested prompt arrives exactly like this, and so does the first
+		// thing anyone types in the DM composer: no mention, no thread yet.
+		env := eventsAPI(`{"type":"message","user":"U1","text":"fix the failing test",` +
+			`"ts":"1721609940.000450","channel":"D1","channel_type":"im"}`)
+
+		message, ok := parseMessage(env, botUser)
+		if !ok {
+			t.Fatal("plain text in a DM root should start a session")
+		}
+		if !message.Direct || message.Mentioned {
+			t.Errorf("mentioned/direct = %v/%v, want false/true", message.Mentioned, message.Direct)
+		}
+		if message.Thread.ThreadTS != "1721609940.000450" {
+			t.Errorf("thread_ts = %q, want the message's own timestamp", message.Thread.ThreadTS)
+		}
+	})
+
+	t.Run("a group DM is a conversation too", func(t *testing.T) {
+		// The bot was added to it deliberately, so a bare message there is
+		// addressed to the bot for the same reason a DM's is.
+		env := eventsAPI(`{"type":"message","user":"U1","text":"what changed?",` +
+			`"ts":"1721609960.000600","channel":"G1","channel_type":"mpim"}`)
+
+		message, ok := parseMessage(env, botUser)
+		if !ok {
+			t.Fatal("plain text in a group DM should reach the core")
+		}
+		if !message.Direct {
+			t.Error("a group DM should count as direct")
+		}
+	})
+
 	t.Run("a mention at the DM root opens a thread", func(t *testing.T) {
 		// DESIGN.md §4: the first `@pi <text>` in a DM root opens a DM thread,
 		// rooted at the message that asked for it.
@@ -129,7 +162,6 @@ func TestParseMessageRejectsWhatIsNotAddressedToTheBot(t *testing.T) {
 		env  Envelope
 	}{
 		{"plain text in a channel root", eventsAPI(`{"type":"message","user":"U1","text":"hi","ts":"1","channel":"C1"}`)},
-		{"plain text in a DM root", eventsAPI(`{"type":"message","user":"U1","text":"hi","ts":"1","channel":"D1","channel_type":"im"}`)},
 		{"the bot's own post", eventsAPI(`{"type":"app_mention","bot_id":"B1","text":"<@U0BOT> hi","ts":"1","channel":"C1"}`)},
 		{"an edited message", eventsAPI(`{"type":"app_mention","subtype":"message_changed","user":"U1","text":"<@U0BOT> hi","ts":"1","channel":"C1"}`)},
 		{"no channel", eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> hi","ts":"1"}`)},

@@ -14,10 +14,11 @@ type Core interface {
 	HandleMessage(ctx context.Context, m bot.Message)
 	HandleCommand(ctx context.Context, c bot.Command)
 	HandleAction(ctx context.Context, a bot.Action)
+	HandleOpened(ctx context.Context, o bot.Opened)
 }
 
-// Router turns Socket Mode envelopes into core calls: it parses the three
-// envelope kinds pi-chat answers and drops the rest.
+// Router turns Socket Mode envelopes into core calls: it parses the envelope
+// kinds pi-chat answers and drops the rest.
 //
 // Parsing lives here, not in the daemon's main, so that main only wires
 // components together and the payload handling is testable with recorded
@@ -63,6 +64,12 @@ func (r *Router) Handle(ctx context.Context, env Envelope) {
 		r.log.Debug("the user stopped the turn from Slack",
 			"channel", stop.Channel, "user", stop.UserID, "thread", stop.Thread.Key())
 		r.core.HandleAction(ctx, stop)
+		return
+	}
+	if opened, ok := parseOpened(env); ok {
+		r.log.Debug("the user opened the conversation",
+			"channel", opened.Channel, "user", opened.UserID)
+		r.core.HandleOpened(ctx, opened)
 		return
 	}
 	r.log.Debug("ignoring an envelope this build does not answer", "type", env.Type)

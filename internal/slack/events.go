@@ -70,7 +70,13 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 
 	switch {
 	case mentioned:
-	case direct && event.ThreadTS != "":
+	case direct:
+		// Anything in a DM is addressed to the bot. In a one-to-one conversation
+		// the conversation *is* the address — and this is the shape Slack's agent
+		// experience is built around: the user types in the DM's composer, the bot
+		// answers in a thread rooted at that message. Channel roots are not in
+		// this category: the bot sits in busy channels, and a stray message must
+		// not start a session.
 	case event.ThreadTS != "":
 	default:
 		return bot.Message{}, false
@@ -194,6 +200,44 @@ func parseAction(env Envelope) (bot.Action, bool) {
 		Value:     payload.Actions[0].Value,
 		MessageTS: payload.Message.TS,
 		ReplyTo:   payload.ResponseURL,
+	}, true
+}
+
+// parseOpened reads Slack telling us a user opened the bot's own conversation:
+// `app_home_opened` with the Messages tab, the event that replaced
+// `assistant_thread_started` in the agent messaging experience.
+//
+// Only the Messages tab counts. The same event fires for the Home tab, which
+// pi-chat publishes no view for, and treating that as a conversation opening
+// would offer prompts nobody asked for.
+func parseOpened(env Envelope) (bot.Opened, bool) {
+	if env.Type != "events_api" {
+		return bot.Opened{}, false
+	}
+	var callback struct {
+		TeamID  string `json:"team_id"`
+		EventID string `json:"event_id"`
+		Event   struct {
+			Type    string `json:"type"`
+			Tab     string `json:"tab"`
+			Channel string `json:"channel"`
+			User    string `json:"user"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(env.Payload, &callback); err != nil {
+		return bot.Opened{}, false
+	}
+	if callback.Event.Type != "app_home_opened" || callback.Event.Tab != "messages" {
+		return bot.Opened{}, false
+	}
+	if callback.Event.Channel == "" || callback.Event.User == "" {
+		return bot.Opened{}, false
+	}
+	return bot.Opened{
+		EventID:   callback.EventID,
+		Channel:   callback.Event.Channel,
+		UserID:    callback.Event.User,
+		Workspace: callback.TeamID,
 	}, true
 }
 
