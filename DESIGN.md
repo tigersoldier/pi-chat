@@ -248,14 +248,22 @@ Constraints and behaviours:
 - **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, degrade to
   `chat.postMessage` + `chat.update` for that turn. The adapter seam has one method per
   operation so the fallback stays inside the Slack adapter.
-- **Status and title:** `assistant.threads.setStatus` for ambient state,
-  `assistant.threads.setTitle` for the derived thread title. Verified scopes:
-  `setTitle` needs `assistant:write` (the scope that makes the app an agent, and also
-  the one behind `app_context_changed`); `setStatus` currently accepts either
-  `assistant:write` or `chat:write` but Slack is narrowing it to `chat:write`, which we
-  already hold. **Slack is migrating this surface:** `agents.sessions.setStatus` and
-  `agents.sessions.rename` supersede the `assistant.threads.*` methods for session
-  channels, so treat the method names here as the current spelling, not a commitment.
+- **Status and title, two tiers:**
+  - *Declared as an agent* (`slack/manifest-agent.yaml`, Slack's agent messaging
+    experience): `agents.sessions.setStatus` takes real lifecycle values that map onto
+    our states exactly — `processing` while a turn runs (Slack shows a loading UX and a
+    stop button when we subscribe to `agent_session_stopped`, which we wire to `Abort`),
+    `suspended` while we wait for an approval, `active` when idle, `closed` on delete.
+    Titles use `agents.sessions.rename`. The scope is `chat:write`; declaring the app as
+    an agent is what adds `assistant:write`, which covers suggested prompts and
+    `app_context_changed`. Caveats: the workspace must have the agent feature enabled
+    (`feature_disabled` otherwise), and switching an app from the legacy assistant view
+    to the agent view cannot be reversed.
+  - *Plain bot* (the default `slack/manifest.yaml`): the only status primitives are
+    `assistant.threads.setStatus` (a free-form string with a two-minute timeout) and
+    `assistant.threads.setTitle`, which needs `assistant:write`. Nothing breaks without
+    them; the thread simply shows no status. Slack is migrating these methods to the
+    `agents.sessions.*` names above, so treat both spellings as current, not settled.
 - **`extension_ui_request` is two things on one frame type, and the adapter must split
   them by `method`:**
   - *Dialogs* — `select`, `confirm`, `input`, `editor` — need an answer and are routed
@@ -469,6 +477,13 @@ terminal).
 extraction, allowlist input, mention stripping, rendering and chunking, streaming vs
 fallback, interactive components and modals, file download → `protocol.ImageContent`,
 slash-command registration.
+
+The Slack app itself is configuration as code: `slack/manifest.yaml` (standard bot) and
+`slack/manifest-agent.yaml` (agent messaging experience) are the two supported app
+shapes, applied by pasting one into the app's manifest editor;
+`docs/slack-app-setup.md` is the walkthrough. Keeping them in the repository means a
+scope or event is added once, reviewed as a diff in Slack, and never drifts from the
+adapter's expectations.
 
 **Seam:** inbound `{threadKey, senderID, text, attachments}` → core; outbound
 `Post`, `Update`, `AskConfirm`. No Slack envelope, `ts`, block or Socket Mode type

@@ -1,0 +1,78 @@
+# pi-chat — Slack app manifest (agent messaging experience)
+#
+# The same app as slack/manifest.yaml, plus Slack's agent surface: DM
+# conversations get a timeline, and Slack renders a real status for the agent
+# ("processing", "suspended", …) with a stop button while a turn runs.
+#
+# Read slack/README.md before choosing this one. It needs the agent feature to
+# be enabled for the workspace — on a workspace without it, calls fail with
+# `feature_disabled`, and switching an app from the legacy assistant view to
+# the agent view cannot be reversed.
+#
+# Docs: docs/slack-app-setup.md
+
+_metadata:
+  major_version: 2
+  minor_version: 1
+
+display_information:
+  name: pi
+  description: Drive local pi coding-agent sessions from Slack
+
+features:
+  # Declaring the app as an agent is what enables the agent experience, and it
+  # is what grants the assistant:write scope. New apps can only use agent_view;
+  # the older assistant_view is deprecated.
+  agent_view:
+    # 300 characters max
+    agent_description: Run local pi coding-agent sessions from Slack.
+    suggested_prompts:
+      - title: What changed?
+        message: Summarize the uncommitted changes in my main repository
+      - title: Fix the tests
+        message: Find and fix the failing test in this repository
+      - title: Start a skill
+        message: /skill:grill-me
+  bot_user:
+    display_name: pi
+    always_online: false
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  slash_commands:
+    - command: /pi
+      description: pi-chat control commands, usable in a channel or DM root
+      usage_hint: "status | resume | help"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - assistant:write      # setTitle, suggested prompts, agent context events
+      - files:read
+      - reactions:write
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - app_home_opened      # how a DM open is detected in the agent experience
+      - app_context_changed  # the user edited the agent's context
+      - agent_session_stopped  # the user pressed stop while we were working
+      - agent_session_title_changed  # the user renamed a session; optional
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

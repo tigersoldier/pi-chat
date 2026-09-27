@@ -1,0 +1,85 @@
+# pi-chat — Slack app manifest (standard bot)
+#
+# Paste this into Slack to create the app with every scope, event and setting
+# pi-chat needs, instead of clicking through half a dozen settings pages.
+#
+# Create a new app:   https://api.slack.com/apps → Create New App → From an app
+#                     manifest
+# Update an existing app: your app → Settings → App Manifest → paste → Save
+#
+# Editing an existing app shows a diff and then asks you to reinstall, which is
+# the point: a manifest change is reviewed before it takes effect.
+#
+# Docs: docs/slack-app-setup.md
+#
+# --- What to customize -------------------------------------------------------
+#
+#   display_information.name        the app name, which is also the mention
+#                                   handle people type (@pi). 35 characters max.
+#   display_information.description one line shown in the app directory
+#   features.bot_user.display_name  the @handle shown on messages
+#   features.slash_commands[].command, .description, .usage_hint
+#                                   renaming the command is fine — pi-chat uses
+#                                   whatever command name Slack delivers
+#
+# --- What NOT to change ------------------------------------------------------
+#
+#   oauth_config.scopes.bot     the whole point of this file
+#   settings.event_subscriptions.bot_events
+#   settings.socket_mode_enabled
+#   features.app_home           direct messages depend on it
+#
+# Tokens are not part of a manifest and cannot be: after saving this, generate
+# an app-level token (Basic Information → App-Level Tokens → connections:write)
+# and install the app to get the bot token. See docs/slack-app-setup.md.
+
+_metadata:
+  major_version: 2
+  minor_version: 1
+
+display_information:
+  name: pi
+  description: Drive local pi coding-agent sessions from Slack
+  # background_color: "#1d1d1d"  # optional; once set it can only be changed,
+  #                            # not removed
+
+features:
+  bot_user:
+    display_name: pi
+    always_online: false
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true          # give the bot a Messages tab
+    messages_tab_read_only_enabled: false  # …that users can actually type into
+  slash_commands:
+    - command: /pi
+      description: pi-chat control commands, usable in a channel or DM root
+      usage_hint: "status | resume | help"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read   # receive @pi mentions
+      - chat:write          # post, update and stream messages
+      - channels:history    # plain text in public threads
+      - groups:history      # plain text in private channels
+      - im:history          # direct messages
+      - mpim:history        # group direct messages
+      - files:read          # download attachments sent to the agent
+      - reactions:write     # a 👀 receipt while the agent works
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: true        # approval buttons and modals; no request URL
+                            # under Socket Mode
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

@@ -56,10 +56,13 @@ Prove the session plane end to end with no Slack code at all.
 (`/tmp/e2e/bin/pi-gatewayd`, up for a day) held port 7331 and made the unit restart-loop.
 Killed it; no other instances remain.
 
-### M1 — Slack app (user, browser, ~15 min)
+### M1 — Slack app (user, browser, ~10 min)
 
-Full walkthrough with the exact click paths, the token files, and a troubleshooting
-table: **[docs/slack-app-setup.md](../docs/slack-app-setup.md)**.
+Full walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**. The app is
+configured by pasting **[slack/manifest.yaml](slack/manifest.yaml)** into Slack's app
+manifest editor, so scopes, events, Socket Mode, Interactivity, the Messages Tab and the
+`/pi` command are applied in one step. `slack/manifest-agent.yaml` is the variant that
+declares the app as a Slack agent (see [slack/README.md](slack/README.md)).
 
 - [x] M1.1 App created from scratch; **Socket Mode enabled**; app-level token with
       `connections:write` → `~/.config/pi-chat/slack-app-token`
@@ -69,12 +72,15 @@ table: **[docs/slack-app-setup.md](../docs/slack-app-setup.md)**.
       `[slack.access] allowed_users` populated; both token files verified as real
       (correct prefixes, no trailing newline, `chmod 600`); app must still be invited to
       a channel with `/invite @pi` if that has not happened yet
-- [ ] M1.5 Phase-1 scopes, all at once: `channels:history`, `groups:history`,
-      `im:history`, `mpim:history`, `assistant:write`, `files:read`, `reactions:write`,
-      plus the four `message.*` bot events and the App Home Messages Tab setting
-- [ ] M1.6 Phase-1 settings: **Interactivity** on (no request URL under Socket Mode) and
-      the `/pi` slash command registered — the creation form demands a URL that is never
-      called, so any parseable `https://` placeholder works
+- [ ] M1.5 Apply the remaining scopes, events and settings in one paste: app →
+      **Settings → App Manifest** → replace with `slack/manifest.yaml` → Save → reinstall.
+      Slack shows a diff first. This covers `channels:history`, `groups:history`,
+      `im:history`, `mpim:history`, `files:read`, `reactions:write`, the four
+      `message.*` events, the Messages Tab, Interactivity and the `/pi` command
+- [ ] M1.6 Optional, after M1.5: decide on the agent variant. It adds
+      `assistant:write` and the agent events for a DM timeline, real agent status
+      (`agents.sessions.setStatus`) and a stop button, at the cost of requiring the
+      workspace's agent feature (`feature_disabled` elsewhere) and an irreversible switch
 
 **Verified on 2026-09-26** with read-only API calls (`auth.test`,
 `apps.connections.open`); tokens were passed via a stdin curl config so they never
@@ -84,12 +90,11 @@ appeared in `ps`:
 |---|---|
 | Workspace | `Test` (`T6K8Y3FRR`) |
 | Bot user | `U0C4TM8KT5F` — the mention is `<@U0C4TM8KT5F>` |
-| Granted scopes | `app_mentions:read`, `chat:write` — phase 0 only |
+| Granted scopes | `app_mentions:read`, `chat:write` — phase 0 only, so M1.5 is still open |
 | Socket Mode | `apps.connections.open` returns ok, so the app token can open a real socket |
 | Allowed users | the owner's member ID is set in the live config |
 
-**Exit:** met for phase 0. `docs/slack-app-setup.md` now folds the phase-1 permissions
-into the main walkthrough, so M1.5/M1.6 cost one reinstall rather than several.
+**Exit:** met for phase 0, which is what M3 needs. M1.5/M1.6 cost one reinstall.
 **Owner:** user.
 
 ### M2 — Repo prep (mechanical, independent of M0/M1) — ✅ DONE

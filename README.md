@@ -42,7 +42,8 @@ next. `pi-chatd` today loads and validates its configuration and nothing else.
    operations use the admin token, and the long-lived per-thread connections
    cannot destroy sessions.
 
-3. **A Slack app** — full walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**.
+3. **A Slack app** — created from **[slack/manifest.yaml](slack/manifest.yaml)**;
+   walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**.
 
 ## Configuration
 
@@ -76,6 +77,7 @@ cmd/pi-chatd/          the daemon
 internal/config/       configuration file loading and validation
 internal/bot/          platform-independent core (M3)
 internal/slack/        Slack adapter: Socket Mode, rendering, interactions (M3)
+slack/                 Slack app manifests — the app's configuration as code
 tools/gateway-probe/   nested module: pi-gateway seam smoke test
 ```
 
