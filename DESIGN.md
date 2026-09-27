@@ -248,8 +248,14 @@ Constraints and behaviours:
 - **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, degrade to
   `chat.postMessage` + `chat.update` for that turn. The adapter seam has one method per
   operation so the fallback stays inside the Slack adapter.
-- `assistant.threads.setStatus` for ambient state, `setTitle` for the derived thread
-  title.
+- **Status and title:** `assistant.threads.setStatus` for ambient state,
+  `assistant.threads.setTitle` for the derived thread title. Verified scopes:
+  `setTitle` needs `assistant:write` (the scope that makes the app an agent, and also
+  the one behind `app_context_changed`); `setStatus` currently accepts either
+  `assistant:write` or `chat:write` but Slack is narrowing it to `chat:write`, which we
+  already hold. **Slack is migrating this surface:** `agents.sessions.setStatus` and
+  `agents.sessions.rename` supersede the `assistant.threads.*` methods for session
+  channels, so treat the method names here as the current spelling, not a commitment.
 - **`extension_ui_request` is two things on one frame type, and the adapter must split
   them by `method`:**
   - *Dialogs* — `select`, `confirm`, `input`, `editor` — need an answer and are routed
@@ -371,10 +377,14 @@ Cleanup:
 **Deny by default.** Anyone who can talk to this bot can run an agent with shell access
 on the machine and, through the admin token, destroy sessions.
 
-- `allowed_users` (Slack user IDs) is required and enforced **before any side effect** —
-  no dial, no project dir, no session. The check uses the *event's* user, so edits and
-  bot-authored messages cannot slip through.
-- `allowed_channels` is optional; empty means any channel the bot is in.
+- `slack.access.allowed_users` (Slack member IDs) is required and enforced **before any
+  side effect** — no dial, no project dir, no session. The check uses the *event's* user,
+  so edits and bot-authored messages cannot slip through.
+- `slack.access.allowed_channels` is optional; empty means any channel the bot is in.
+- **The allowlist lives under the platform's own section**, because the identity models
+  differ: Slack has member and channel IDs, Google Chat would have email addresses and
+  space names. Each adapter owns its access rules; the core enforces “default deny” and
+  never assumes one platform's identifiers apply to another.
 - `workspace_id` is recorded in every thread key from day one, so adding OAuth
   distribution later does not require re-keying.
 
@@ -409,9 +419,9 @@ Mint with `pi-gatewayd --provision-token`; rotate via `tokens.json` + SIGHUP.
 app_token_file = "~/.config/pi-chat/slack-app-token"   # xapp-…, Socket Mode
 bot_token_file = "~/.config/pi-chat/slack-bot-token"   # xoxb-…
 
-[access]
-allowed_users    = ["U01234567"]   # required
-allowed_channels = []              # optional
+[slack.access]
+allowed_users    = ["U01234567"]   # required; Slack member IDs
+allowed_channels = []              # optional; empty = any channel the bot is in
 
 [gateway]
 state_dir         = "~/.config/pi-gateway"

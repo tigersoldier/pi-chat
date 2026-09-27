@@ -15,7 +15,7 @@
 app_token_file = "~/.config/pi-chat/slack-app-token"
 bot_token_file = "~/.config/pi-chat/slack-bot-token"
 
-[access]
+[slack.access]
 # Deny by default: an empty list denies everyone. Slack member IDs (U…).
 allowed_users = []
 # Empty means any channel the bot is a member of.

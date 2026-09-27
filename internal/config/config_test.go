@@ -39,7 +39,7 @@ func TestDefaultsAreValid(t *testing.T) {
 
 func TestLoadAppliesDefaultsForMissingKeys(t *testing.T) {
 	home(t)
-	path := writeConfig(t, "[access]\nallowed_users = [\"U123\"]\n")
+	path := writeConfig(t, "[slack.access]\nallowed_users = [\"U123\"]\n")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -55,8 +55,8 @@ func TestLoadAppliesDefaultsForMissingKeys(t *testing.T) {
 	if got, want := len(cfg.Gateway.PiArgs), 1; got != want || cfg.Gateway.PiArgs[0] != "--approve" {
 		t.Errorf("pi_args = %v, want [--approve]", cfg.Gateway.PiArgs)
 	}
-	if len(cfg.Access.AllowedUsers) != 1 {
-		t.Errorf("allowed_users = %v, want one entry", cfg.Access.AllowedUsers)
+	if len(cfg.Slack.Access.AllowedUsers) != 1 {
+		t.Errorf("allowed_users = %v, want one entry", cfg.Slack.Access.AllowedUsers)
 	}
 	if cfg.Path() != path {
 		t.Errorf("Path() = %q, want %q", cfg.Path(), path)
@@ -112,6 +112,22 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+// The allowlist belongs to the platform: a top-level [access] section is the
+// shape this file used before Slack became one integration among several, and
+// silently ignoring it would deny (or allow) the wrong people.
+func TestLoadRejectsTopLevelAccessSection(t *testing.T) {
+	home(t)
+	path := writeConfig(t, "[access]\nallowed_users = [\"U123\"]\n")
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("a top-level [access] section must be rejected, not ignored")
+	}
+	if !strings.Contains(err.Error(), "access") {
+		t.Errorf("error should name the key, got: %v", err)
+	}
+}
+
 func TestValidateRejectsBadValues(t *testing.T) {
 	home(t)
 	cases := []struct {
@@ -159,8 +175,8 @@ func TestEmptyAllowlistIsValidButDeniesEveryone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an empty allowlist is a valid, if useless, configuration: %v", err)
 	}
-	if len(cfg.Access.AllowedUsers) != 0 {
-		t.Fatalf("allowed_users = %v, want empty", cfg.Access.AllowedUsers)
+	if len(cfg.Slack.Access.AllowedUsers) != 0 {
+		t.Fatalf("allowed_users = %v, want empty", cfg.Slack.Access.AllowedUsers)
 	}
 	joined := strings.Join(cfg.Summary(), "\n")
 	if !strings.Contains(joined, "every request is denied") {

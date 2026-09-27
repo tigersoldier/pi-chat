@@ -34,7 +34,6 @@ const (
 // Config is the whole configuration file.
 type Config struct {
 	Slack       Slack       `toml:"slack"`
-	Access      Access      `toml:"access"`
 	Gateway     Gateway     `toml:"gateway"`
 	Paths       Paths       `toml:"paths"`
 	Concurrency Concurrency `toml:"concurrency"`
@@ -45,13 +44,17 @@ type Config struct {
 	path string
 }
 
-// Slack holds the Socket Mode credentials.
+// Slack holds the Socket Mode credentials and the Slack-specific access rules.
 type Slack struct {
 	AppTokenFile string `toml:"app_token_file"`
 	BotTokenFile string `toml:"bot_token_file"`
+	Access       Access `toml:"access"`
 }
 
-// Access is the deny-by-default allowlist (DESIGN.md §10).
+// Access is a platform's deny-by-default allowlist (DESIGN.md §10). It lives
+// under the platform's own section because each integration has a different
+// identity model: Slack uses member and channel IDs, Google Chat would use
+// email addresses and space names.
 type Access struct {
 	AllowedUsers    []string `toml:"allowed_users"`
 	AllowedChannels []string `toml:"allowed_channels"`
@@ -289,8 +292,8 @@ func (c *Config) Summary() []string {
 		file("gateway admin token", c.Gateway.AdminTokenFile),
 		file("gateway thread token", c.Gateway.ThreadTokenFile),
 		fmt.Sprintf("gateway state dir: %s", c.Gateway.StateDir),
-		fmt.Sprintf("allowed users: %s", joinOr(c.Access.AllowedUsers, "none — every request is denied")),
-		fmt.Sprintf("allowed channels: %s", joinOr(c.Access.AllowedChannels, "any channel the bot is in")),
+		fmt.Sprintf("allowed users: %s", joinOr(c.Slack.Access.AllowedUsers, "none — every request is denied")),
+		fmt.Sprintf("allowed channels: %s", joinOr(c.Slack.Access.AllowedChannels, "any channel the bot is in")),
 		fmt.Sprintf("projects root: %s", c.Paths.ProjectsRoot),
 		fmt.Sprintf("repos root: %s", c.Paths.ReposRoot),
 		fmt.Sprintf("database: %s", c.Paths.DBPath),

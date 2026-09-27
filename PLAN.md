@@ -16,14 +16,14 @@ for.
 |---|---|
 | Design | **Settled.** All 14 questions answered; `DESIGN.md` rewritten for the pi-gateway-based, Slack-first scope |
 | M0 — gateway running | **Done and verified** (see M0 below) |
+| M1 — Slack app | **Done for phase 0, verified live** (see M1 below): Socket Mode socket opens, bot token authenticates, phase-0 scopes granted. The phase-1 scopes are still to be added in one reinstall |
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
 | Code | `internal/config` + `cmd/pi-chatd --check` (loads, validates, redacts). No Slack or gateway code yet; `tools/gateway-probe/` is the working seam smoke test |
 | `pi-gatewayd` | **Installed and running** as a user unit; built from `~/code/pi-gateway` @ `119f0f2` (= tag `v0.1.2` content), self-reports `0.2.0` |
-| Slack app (M1) | **Not created** — this is what unblocks M3 |
 | GitHub repo rename | **Not done** — browser action; local `origin` still says `pi-gchat`, which keeps working through GitHub's redirect |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: M1 (Slack app) is the critical path; M3 follows it.**
+**Current position: M3 is unblocked — both halves (gateway and Slack) are verified working.**
 
 ---
 
@@ -43,8 +43,8 @@ Prove the session plane end to end with no Slack code at all.
 - [x] M0.3 Installed the upstream user unit plus a drop-in forcing
       `--pi %h/.local/bin/pi` and an explicit `PATH`; enabled at boot; running on
       `127.0.0.1:7331`, debug listener on `127.0.0.1:7332`, pi `0.85.1`
-- [x] M0.4 Wrote `~/.config/pi-chat/config.toml` (0600) per DESIGN §11; `allowed_users`
-      still empty pending M1
+- [x] M0.4 Wrote `~/.config/pi-chat/config.toml` (0600) per DESIGN §11;
+      `slack.access.allowed_users` still empty pending M1
 - [x] M0.5 `tools/gateway-probe` (`go run .` there) → **PASS**: admin token granted
       `observe,interject,prompt,ui,control,admin` and started session-less; thread token
       granted the five expected capabilities and `gw_new_session` was refused with
@@ -61,19 +61,35 @@ Killed it; no other instances remain.
 Full walkthrough with the exact click paths, the token files, and a troubleshooting
 table: **[docs/slack-app-setup.md](../docs/slack-app-setup.md)**.
 
-- [ ] M1.1 Create app from scratch; **enable Socket Mode**; app-level token with
+- [x] M1.1 App created from scratch; **Socket Mode enabled**; app-level token with
       `connections:write` → `~/.config/pi-chat/slack-app-token`
-- [ ] M1.2 Bot scopes, phase 0: `app_mentions:read`, `chat:write`
-- [ ] M1.3 Subscribe to the `app_mention` bot event (no Request URL under Socket Mode)
-- [ ] M1.4 Install to workspace → `~/.config/pi-chat/slack-bot-token` (0600), invite
-      `@pi` to a test channel, put your member ID in `allowed_users`
-- [ ] M1.5 V1 scopes (add when phase 1 starts): `channels:history`, `groups:history`,
-      `im:history`, `mpim:history`, `assistant:write`, `files:read`, `reactions:write`
-- [ ] M1.6 V1 settings: enable **Interactivity** (no request URL needed under Socket
-      Mode) and register the `/pi` slash command — the creation form demands a URL that
-      is never called, so any `https://` placeholder works
+- [x] M1.2 Bot scopes, phase 0: `app_mentions:read`, `chat:write` (verified granted)
+- [x] M1.3 Subscribed to the `app_mention` bot event (no Request URL under Socket Mode)
+- [x] M1.4 Installed to the workspace → `~/.config/pi-chat/slack-bot-token` (0600);
+      `[slack.access] allowed_users` populated; both token files verified as real
+      (correct prefixes, no trailing newline, `chmod 600`); app must still be invited to
+      a channel with `/invite @pi` if that has not happened yet
+- [ ] M1.5 Phase-1 scopes, all at once: `channels:history`, `groups:history`,
+      `im:history`, `mpim:history`, `assistant:write`, `files:read`, `reactions:write`,
+      plus the four `message.*` bot events and the App Home Messages Tab setting
+- [ ] M1.6 Phase-1 settings: **Interactivity** on (no request URL under Socket Mode) and
+      the `/pi` slash command registered — the creation form demands a URL that is never
+      called, so any parseable `https://` placeholder works
 
-**Exit:** `make check` reports both Slack token files present and you as an allowed user.
+**Verified on 2026-09-26** with read-only API calls (`auth.test`,
+`apps.connections.open`); tokens were passed via a stdin curl config so they never
+appeared in `ps`:
+
+| Fact | Value |
+|---|---|
+| Workspace | `Test` (`T6K8Y3FRR`) |
+| Bot user | `U0C4TM8KT5F` — the mention is `<@U0C4TM8KT5F>` |
+| Granted scopes | `app_mentions:read`, `chat:write` — phase 0 only |
+| Socket Mode | `apps.connections.open` returns ok, so the app token can open a real socket |
+| Allowed users | the owner's member ID is set in the live config |
+
+**Exit:** met for phase 0. `docs/slack-app-setup.md` now folds the phase-1 permissions
+into the main walkthrough, so M1.5/M1.6 cost one reinstall rather than several.
 **Owner:** user.
 
 ### M2 — Repo prep (mechanical, independent of M0/M1) — ✅ DONE
@@ -207,8 +223,10 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 - Slack retries events by `event_id` — the reason `seen` is mandatory.
 - Streaming: `chat.startStream`/`appendStream`/`stopStream`, chunks accept
   `markdown_text` and `task_update` (256-char limit) with `task_display_mode`; channel
-  streaming needs `recipient_user_id` + `recipient_team_id`; `assistant.threads.setStatus`
-  / `setTitle` need `assistant:write`.
+  streaming needs `recipient_user_id` + `recipient_team_id`; `assistant.threads.setTitle`
+  needs `assistant:write`, while `assistant.threads.setStatus` accepts
+  `chat:write` (Slack is narrowing it to `chat:write` alone), and Slack is migrating
+  both to `agents.sessions.setStatus` / `agents.sessions.rename`.
 
 ### Testing approach
 
@@ -220,15 +238,14 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 ## Next action
 
-1. **M1 in the browser** (user) — the only thing gating M3: create the Slack app,
-   enable Socket Mode, generate the app-level token (`connections:write`), add the
-   phase-0 bot scopes (`app_mentions:read`, `chat:write`), install it, invite `@pi` to a
-   test channel, write the two token values to
-   `~/.config/pi-chat/slack-{app,bot}-token` (0600), and put your Slack member ID in
-   `allowed_users` (`make check` shows whether the files are seen).
-2. **M3** once those tokens exist: the phase-0 vertical slice.
-3. **Optionally, whenever you like:** rename the GitHub repo to `pi-chat`, and file the
-   upstream rebind fix (DESIGN §3) — neither blocks M3.
+1. **M3 — the phase-0 vertical slice.** Both halves are verified: `pi-gatewayd` is up with
+   working tokens, and the Slack app opens a Socket Mode socket with `app_mentions:read`
+   and `chat:write`. Nothing is blocking it.
+2. **When convenient (one reinstall):** the phase-1 scopes and settings (M1.5/M1.6) — see
+   [docs/slack-app-setup.md](docs/slack-app-setup.md), which now includes them in the main
+   walkthrough.
+3. **Whenever you like:** rename the GitHub repo to `pi-chat`, and file the upstream
+   rebind fix (DESIGN §3) — neither blocks M3.
 
 The gateway side is ready: `pi-gatewayd` is running, both tokens work, and the seam is
 proven by `tools/gateway-probe`. The repo side is ready: `make check` validates the live
