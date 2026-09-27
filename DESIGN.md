@@ -330,9 +330,29 @@ Constraints and behaviours:
     non-interactive spinner instead. Two details the adapter must honour: the event
     arrives with `streaming_message_ts`, the streams Slack has *already* stopped, so we
     must not stop them again; and the status does **not** change on its own when the user
-    presses stop, so we transition off `processing` ourselves. **Phase 3 work:** neither
-    `setStatus` nor `rename` nor the stop button's `Abort` is wired up yet — the scope and
-    the events are declared now so that adding them needs no reinstall.
+    presses stop, so we transition off `processing` ourselves.
+
+    **Status is implemented.** The core owns a small platform-neutral vocabulary — `busy`,
+    `waiting`, `idle`, `closed` — and the adapter maps it onto Slack's values
+    (`processing`, `suspended`, `active`, `closed`); a platform with no status surface
+    simply does not implement `StatusReporter`. `busy` goes up before the turn's first
+    byte and `idle` comes down however the turn ends — a failure and a stop included — so
+    a spinner cannot outlive its turn. An install that cannot show one (a workspace
+    without the agent feature answers `feature_disabled`; an app that was never granted a
+    scope answers `missing_scope`) is asked **once** and then left alone: a missing
+    indicator is cosmetic, and a warning per turn would not be.
+
+    **The stop button works.** Pressing it arrives as `agent_session_stopped`, which the
+    adapter hands to the button path — allowlist, thread lookup and dedupe all apply
+    unchanged — as `ActionStop`; the core aborts the session and the turn ends through its
+    normal path. Slack has already stopped the reply's stream by then, and that needs no
+    bookkeeping: a later append fails, and the renderer already answers an append failure
+    by switching to message updates, so the partial answer still gets its final text. A
+    stop that arrives with no turn running clears a stale status instead of doing nothing.
+
+    **Still open:** `rename` titles, `suspended` while a turn waits for a human answer,
+    and `closed` on `/delete` — the first two land with phase 2's approvals, the third
+    with its delete.
 
     The scopes, precisely: `agents.sessions.setStatus` and `agents.sessions.rename` need
     **`chat:write` alone** — the agent surface is not what buys `assistant:write`.

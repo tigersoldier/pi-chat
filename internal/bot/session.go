@@ -116,6 +116,29 @@ func (th *thread) live() *gwclient.Client {
 // status command reads before touching the client: see statusThread.
 func (th *thread) busy() bool { return th.cur.Load() != nil }
 
+// abort stops the turn running in this thread, reporting whether there was one
+// to stop. The platform's stop control is also how a stale loading indicator
+// gets cleared, and the caller has to tell those two cases apart.
+//
+// It deliberately does not take turnMu: a turn holds that lock for its whole
+// life, so waiting for it would mean stopping pi only after pi had finished.
+func (th *thread) abort(ctx context.Context) bool {
+	if !th.busy() {
+		return false
+	}
+	client := th.live()
+	if client == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+	defer cancel()
+	if _, err := client.Abort(ctx); err != nil {
+		th.log.Warn("cannot stop the turn", "error", err)
+		return false
+	}
+	return true
+}
+
 // bound reports whether a connection is still attached to the session this
 // thread owns. gwclient keeps Err() nil when the daemon unbinds a client, so
 // the binding itself is what has to be checked.

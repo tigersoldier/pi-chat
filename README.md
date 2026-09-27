@@ -15,13 +15,15 @@ Architecture, the thread/session model, the access rules and the build phases:
 ## Status
 
 Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0), M2 (repo prep), M3
-(the vertical slice) and **M4 (the phase-1 MVP) are done**: in Slack, a mention or a
-command starts a pi session in a thread, the answer streams back, and the thread's state
-survives a restart. Phase 1 has a user allowlist, durable thread state, project
-directories with the worktree convention, `/pi help|status|resume`, `@pi /<command>`
-pass-through, idle close and cold resume. Still to come (phase 2): `@pi /delete`,
-`/abort`, `/model`, interactive approvals, and the warm-session cap with eviction.
-Details: `PLAN.md`.
+(the vertical slice), **M4 (the phase-1 MVP)** and **M4.6 (the agent surface) are done**:
+in Slack, a mention or a command starts a pi session in a thread, the answer streams back,
+and the thread's state survives a restart. Phase 1 has a user allowlist, durable thread
+state, project directories with the worktree convention, `/pi help|status|resume`,
+`@pi /<command>` pass-through, idle close and cold resume. Declared as Slack's agent
+messaging experience (the recommended manifest), the session also shows a real status
+while it works and a stop button that aborts the turn. Still to come (phase 2):
+`@pi /delete`, `/abort`, `/model`, interactive approvals, and the warm-session cap with
+eviction. Details: `PLAN.md`.
 
 ## Prerequisites
 

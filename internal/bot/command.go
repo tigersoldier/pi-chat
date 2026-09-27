@@ -27,6 +27,13 @@ const (
 // one place.
 const ActionResume = "resume"
 
+// ActionStop is the platform's own stop control rather than a button pi-chat
+// posted: Slack shows one while an agent session is `processing`, and pressing
+// it arrives as the `agent_session_stopped` event. The adapter hands it to the
+// button path so the allowlist, the thread lookup and the dedupe all apply
+// unchanged (DESIGN.md §6).
+const ActionStop = "stop"
+
 // Limits on what the bot lists, so an answer stays a message rather than a
 // dump.
 const (

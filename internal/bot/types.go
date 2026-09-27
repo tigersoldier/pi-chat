@@ -134,6 +134,34 @@ type ProgressReporter interface {
 	Progress() string
 }
 
+// Status is a thread session's lifecycle state, in the vocabulary the core
+// reasons about. Mapping it onto a platform's own states is the adapter's job:
+// a platform that cannot show one simply does not implement StatusReporter.
+type Status string
+
+const (
+	// StatusBusy: a turn is running. This is what a platform shows as a loading
+	// indicator.
+	StatusBusy Status = "busy"
+	// StatusWaiting: the turn is blocked until a human answers pi.
+	StatusWaiting Status = "waiting"
+	// StatusIdle: the session is attached or resumable, with nothing running.
+	StatusIdle Status = "idle"
+	// StatusClosed: the session is gone.
+	StatusClosed Status = "closed"
+)
+
+// StatusReporter is implemented by a platform that can display a session's
+// state outside the conversation (DESIGN.md §6).
+//
+// It is best-effort by construction: a status is a nicety, never a
+// precondition, so the core logs a failure and carries on. A platform that has
+// nowhere to show one — or an install that is not permitted to — is asked once
+// and not again (the adapter remembers its own refusal).
+type StatusReporter interface {
+	SetStatus(ctx context.Context, t Thread, s Status) error
+}
+
 // Notice is a message the core posts outside a turn: a command answer, a
 // refusal, a hint, or a picker.
 //

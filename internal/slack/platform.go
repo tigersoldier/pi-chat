@@ -35,6 +35,12 @@ type Platform struct {
 	// recipientRefused records that this install rejects the recipient fields
 	// on chat.startStream, so later turns do not repeat a doomed attempt.
 	recipientRefused atomic.Bool
+
+	// statusRefused records that this install cannot show agent statuses at all:
+	// a workspace without the agent feature answers `feature_disabled`, and an
+	// app whose feature was never enabled answers `missing_scope`. Turns run
+	// without an indicator instead of asking again on every one.
+	statusRefused atomic.Bool
 }
 
 // NewPlatform builds the Slack adapter. teamID is the workspace the bot token
@@ -100,6 +106,59 @@ func threadTS(t *bot.Thread) string {
 		return ""
 	}
 	return t.ThreadTS
+}
+
+// agentStatus maps the core's platform-neutral states onto Slack's agent
+// session statuses. Slack renders `processing` as a loading indicator and a
+// stop button (DESIGN.md §6).
+var agentStatus = map[bot.Status]string{
+	bot.StatusBusy:    "processing",
+	bot.StatusWaiting: "suspended",
+	bot.StatusIdle:    "active",
+	bot.StatusClosed:  "closed",
+}
+
+// SetStatus displays a thread session's lifecycle state in Slack's agent
+// surface. It is best-effort by contract (bot.StatusReporter): the core logs a
+// failure and carries on.
+func (p *Platform) SetStatus(ctx context.Context, t bot.Thread, s bot.Status) error {
+	status, ok := agentStatus[s]
+	if !ok {
+		return fmt.Errorf("slack: no agent status for %q", s)
+	}
+	if p.statusRefused.Load() {
+		return nil
+	}
+	err := p.api.SetAgentStatus(ctx, t.Channel, t.ThreadTS, status)
+	if err == nil {
+		return nil
+	}
+	if !statusIsUnavailable(err) {
+		return err
+	}
+	// Ask once, then stop: the answer will not change while this process lives,
+	// and a per-turn warning would be noise about a cosmetic loss.
+	p.statusRefused.Store(true)
+	p.log.Info("this install has no agent status; turns will run without an indicator",
+		"error", err)
+	return nil
+}
+
+// statusIsUnavailable reports whether err means "this install can never show an
+// agent status", as opposed to a failure that may pass.
+func statusIsUnavailable(err error) bool {
+	for _, code := range []string{
+		"feature_disabled",       // no agent feature in this workspace
+		"missing_scope",          // declared agent_view but never granted the scope
+		"unknown_method",         // an older API surface
+		"method_deprecated",      //
+		"not_allowed_token_type", // a token Slack will not accept here at all
+	} {
+		if IsCode(err, code) {
+			return true
+		}
+	}
+	return false
 }
 
 // renderer writes one turn into one thread. Streaming is preferred and patching

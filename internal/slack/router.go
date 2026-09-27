@@ -59,5 +59,11 @@ func (r *Router) Handle(ctx context.Context, env Envelope) {
 		r.core.HandleAction(ctx, action)
 		return
 	}
+	if stop, ok := parseStopped(env); ok {
+		r.log.Debug("the user stopped the turn from Slack",
+			"channel", stop.Channel, "user", stop.UserID, "thread", stop.Thread.Key())
+		r.core.HandleAction(ctx, stop)
+		return
+	}
 	r.log.Debug("ignoring an envelope this build does not answer", "type", env.Type)
 }

@@ -264,11 +264,31 @@ worth fixing before M5 builds `/delete` on top of this base.
   seconds, so the claim cannot precede it; a crash in that window loses a message Slack
   will not redeliver. DESIGN §7 records the trade-off.
 
+### M4.6 — the agent surface
+
+- [x] `slack/manifest-agent.yaml` is the recommended app: Slack's agent messaging
+      experience, with the plain manifest kept for workspaces that cannot have it
+- [x] Status follows the turn: `agents.sessions.setStatus` on `busy` → `idle`, mapped from
+      a platform-neutral vocabulary, best-effort, and asked once when the install cannot
+      show one (`feature_disabled`, `missing_scope`)
+- [x] The stop button works: `agent_session_stopped` → `ActionStop` → abort the session,
+      with a stale status cleared when nothing was running
+- [x] `app_home_opened` is subscribed but deliberately unused: nothing pi-chat does needs
+      to know a DM was opened, and a suggested prompt comes from the manifest
+
+**Exit:** the status appears in Slack and the stop button stops the turn.
+**Depends on:** M4.
+
+Not built here, because each belongs with the thing that needs it: `agents.sessions.rename`
+titles, `suspended` while a turn waits for an approval (M5), `closed` on `/delete` (M5).
+
 ### M5 — Phase 2
 
 - [ ] `@pi /delete` with button confirm → `DeleteSession` → worktree/branch cleanup → row
 - [ ] `@pi /abort`, `@pi /model`, `@pi /stop`
 - [ ] Interactive approvals: buttons + modal via `trigger_id`; `pending_ui` → `RespondUI`
+- [ ] Status `suspended` while a turn waits for an answer; `closed` on delete; titles via
+      `agents.sessions.rename`
 - [ ] Warm-session cap (default 8) with evict-idle → bounded queue → refuse; never force;
       skip attached sessions (DESIGN §8)
 - [ ] Streaming → patch fallback hardening

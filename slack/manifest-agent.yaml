@@ -69,12 +69,12 @@ settings:
       - message.im
       - message.mpim
       - app_home_opened      # a DM open; no scope required
-      # Phase 3: no agent event below is handled yet. They are declared now
-      # because subscribing is what makes Slack's loading indicator
-      # interactive, and a scope or event change forces a reinstall.
-      - app_context_changed  # the user edited the agent's context
+      # agent_session_stopped is handled: it is what makes Slack's loading
+      # indicator interactive, and pressing it aborts the turn.
       - agent_session_stopped  # the user pressed stop while we were working
-      - agent_session_title_changed  # the user renamed a session; optional
+      # Declared but unused, kept so that adding them needs no reinstall:
+      - app_context_changed  # what the user is viewing; unused
+      - agent_session_title_changed  # renamed by the user; unused
   interactivity:
     is_enabled: true
   org_deploy_enabled: false

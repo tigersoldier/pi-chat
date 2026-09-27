@@ -182,6 +182,8 @@ func (b *Bot) HandleAction(ctx context.Context, a Action) {
 	switch a.ActionID {
 	case ActionResume:
 		go b.resumeSession(ctx, a)
+	case ActionStop:
+		b.stopTurn(ctx, a)
 	default:
 		b.log.Warn("ignoring a button this build does not know", "action", a.ActionID)
 	}
@@ -461,6 +463,12 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 			b.log.Error("cannot start the reply", "thread", th.key, "error", err)
 			return
 		}
+		// The status is the platform's loading indicator, and it is the only part
+		// of this that a user sees before the first byte arrives. It goes up
+		// here rather than inside the turn so that every ending — an answer, a
+		// failure, a stop — takes it down again.
+		b.setStatus(ctx, th, StatusBusy)
+		defer b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
 		if err := th.runTurn(ctx, m, r); err != nil {
 			b.log.Warn("turn failed", "thread", th.key, "error", err)
 			if ferr := r.Fail(ctx, err); ferr != nil {
@@ -468,6 +476,47 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 			}
 		}
 	}()
+}
+
+// setStatus shows a thread session's lifecycle state, on platforms that can
+// display one. It never fails a turn: a missing indicator is a cosmetic loss,
+// and the adapter is the one that decides whether to try again.
+func (b *Bot) setStatus(ctx context.Context, th *thread, s Status) {
+	reporter, ok := b.plat.(StatusReporter)
+	if !ok {
+		return
+	}
+	if err := reporter.SetStatus(ctx, th.t, s); err != nil {
+		b.log.Debug("cannot show the session status", "thread", th.key, "status", s, "error", err)
+	}
+}
+
+// stopTurn handles the platform's own stop control: Slack's agent stop button,
+// which arrives as an action because that is the path where the allowlist, the
+// thread lookup and the dedupe already live.
+//
+// By the time it arrives Slack has already stopped the reply's stream, so the
+// only thing left is to stop pi.
+func (b *Bot) stopTurn(ctx context.Context, a Action) {
+	if a.Thread == nil {
+		b.log.Warn("a stop arrived without a thread to stop", "channel", a.Channel)
+		return
+	}
+	// tracked, not threadFor: a stop is not a conversation, so it must not
+	// register a row for a thread nothing has ever prompted in.
+	th, ok := b.tracked(*a.Thread)
+	if !ok {
+		b.log.Debug("a stop arrived for a thread with no session", "thread", a.Thread.Key())
+		return
+	}
+	if th.abort(ctx) {
+		// The turn clears the status itself, wherever it ends.
+		b.log.Info("stopped the turn", "thread", th.key, "user", a.UserID)
+		return
+	}
+	// Nothing was running, so the indicator was stale: clear it rather than
+	// leaving a spinner that will never stop.
+	b.setStatus(ctx, th, StatusIdle)
 }
 
 // reply posts a notice, logging a failure instead of returning it: nothing the

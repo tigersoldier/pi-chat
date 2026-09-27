@@ -40,8 +40,12 @@ socket. Consequences worth knowing before you start:
 1. Open <https://api.slack.com/apps> and click **Create New App**.
 2. Choose **From an app manifest**.
 3. Pick the workspace you want the bot in, and click **Next**.
-4. Paste the whole of [`slack/manifest.yaml`](../slack/manifest.yaml) into the field.
-   (Which manifest to choose: see [the agent variant](#the-agent-variant) below.)
+4. Paste the whole of [`slack/manifest-agent.yaml`](../slack/manifest-agent.yaml) into
+   the field. That is the recommended app: it gives the DM a conversation timeline and the
+   agent a real status with a working stop button. If your workspace has no agent feature —
+   it is an admin setting, and Slack offers it on paid plans — or you want the smallest
+   possible app instead, paste [`slack/manifest.yaml`](../slack/manifest.yaml): same bot,
+   no agent surface. See [the agent variant](#the-agent-variant) below.
 5. Review the summary Slack shows — it lists the scopes, events and settings it is about
    to apply — and click **Create**.
 

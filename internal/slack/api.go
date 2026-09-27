@@ -307,6 +307,22 @@ func (a *API) Respond(ctx context.Context, responseURL, text string, blocks []bl
 	return fmt.Errorf("slack response_url: unexpected answer %q", answer)
 }
 
+// SetAgentStatus sets the lifecycle status of the agent session for a thread
+// (Slack's agent messaging experience). Slack creates the session if it does
+// not exist yet, which is also what makes writing this the thing that opens the
+// thread when a user replies.
+//
+// It needs `chat:write` alone — not the legacy `assistant:write` that the older
+// `assistant.threads.setStatus` required. Where the workspace has no agent
+// feature, it answers `feature_disabled`.
+func (a *API) SetAgentStatus(ctx context.Context, channel, threadTS, status string) error {
+	params := map[string]any{"channel_id": channel, "status": status}
+	if threadTS != "" {
+		params["thread_ts"] = threadTS
+	}
+	return a.call(ctx, "agents.sessions.setStatus", params, nil)
+}
+
 // StartStream opens a streaming message and returns its timestamp. Slack
 // requires the recipient for streams that are not thread replies, so pi-chat
 // passes whoever asked.

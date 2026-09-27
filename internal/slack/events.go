@@ -197,6 +197,55 @@ func parseAction(env Envelope) (bot.Action, bool) {
 	}, true
 }
 
+// parseStopped turns Slack's agent stop button into a core action: the user
+// pressed stop while a turn was `processing`, and Slack sends
+// `agent_session_stopped` for it.
+//
+// It becomes an Action rather than a fourth kind of ingress because that is the
+// path where the allowlist, the thread lookup and the dedupe already live — and
+// a stop that skipped the allowlist would be a way to interrupt other people's
+// work.
+//
+// The event also carries `streaming_message_ts`, the streams Slack has already
+// stopped. Nothing here needs it: a later append to a stopped stream fails, and
+// the renderer already answers an append failure by switching to message
+// updates, which is how the partial answer still gets its final text.
+func parseStopped(env Envelope) (bot.Action, bool) {
+	if env.Type != "events_api" {
+		return bot.Action{}, false
+	}
+	var callback struct {
+		TeamID string `json:"team_id"`
+		Event  struct {
+			Type     string `json:"type"`
+			Channel  string `json:"channel"`
+			ThreadTS string `json:"thread_ts"`
+			User     string `json:"user"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(env.Payload, &callback); err != nil {
+		return bot.Action{}, false
+	}
+	// A stop without a thread is one pi-chat cannot route: the thread is the
+	// session's whole identity.
+	if callback.Event.Type != "agent_session_stopped" || callback.Event.Channel == "" || callback.Event.ThreadTS == "" {
+		return bot.Action{}, false
+	}
+	thread := bot.Thread{
+		Workspace: callback.TeamID,
+		Channel:   callback.Event.Channel,
+		ThreadTS:  callback.Event.ThreadTS,
+	}
+	return bot.Action{
+		EventID:   env.EnvelopeID,
+		Channel:   callback.Event.Channel,
+		Thread:    &thread,
+		UserID:    callback.Event.User,
+		Workspace: callback.TeamID,
+		ActionID:  bot.ActionStop,
+	}, true
+}
+
 // stripMention removes mentions of the bot itself from message text, leaving
 // the prompt. Slack renders a mention as <@U123>, and older payloads use the
 // labelled form <@U123|pi>; mentions of other people are left alone.

@@ -32,6 +32,7 @@ type fakePlatform struct {
 	opened   []string // the text of each thread the core asked for
 	thread   Thread   // what OpenThread returns; zero means a stand-in
 	renderer *recordingRenderer
+	statuses []Status // lifecycle states, in the order the core asked for them
 }
 
 func (p *fakePlatform) StartTurn(_ context.Context, m Message) (Renderer, error) {
@@ -67,6 +68,21 @@ func (p *fakePlatform) startedTurns() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.turns)
+}
+
+// SetStatus records a lifecycle state, making the fake a StatusReporter.
+func (p *fakePlatform) SetStatus(_ context.Context, _ Thread, s Status) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.statuses = append(p.statuses, s)
+	return nil
+}
+
+// reportedStatuses returns the states the core asked for, in order.
+func (p *fakePlatform) reportedStatuses() []Status {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Status(nil), p.statuses...)
 }
 
 // postedNotices returns the notices posted so far.
@@ -113,6 +129,12 @@ func newTestBotWith(t *testing.T, adjust func(*config.Config)) (*Bot, *fakePlatf
 	cfg.Paths.ProjectsRoot = filepath.Join(dir, "work")
 	cfg.Paths.ReposRoot = filepath.Join(dir, "code")
 	cfg.Paths.DBPath = filepath.Join(dir, "state", "pi-chat.db")
+	// The gateway is pinned into the temporary directory too. Defaults() leaves
+	// these unexpanded (a literal `~`), so a test cannot reach a real daemon by
+	// luck; saying so here keeps it that way when someone expands the default.
+	cfg.Gateway.StateDir = filepath.Join(dir, "gateway")
+	cfg.Gateway.AdminTokenFile = filepath.Join(dir, "gateway", "admin.token")
+	cfg.Gateway.ThreadTokenFile = filepath.Join(dir, "gateway", "thread.token")
 	if adjust != nil {
 		adjust(cfg)
 	}

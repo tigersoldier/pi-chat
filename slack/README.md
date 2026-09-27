@@ -7,8 +7,11 @@ command.
 
 | File | App shape | Use when |
 |---|---|---|
-| `manifest.yaml` | Standard bot | Default. Works on any workspace. |
-| `manifest-agent.yaml` | Agent messaging experience | You want Slack's agent UX: a DM timeline, a real agent status, and a stop button while a turn runs. Needs the agent feature enabled for the workspace; on a workspace without it, calls fail with `feature_disabled`. |
+| `manifest-agent.yaml` | **Agent messaging experience** | **Recommended.** Slack's agent UX for DMs: a conversation timeline, a real agent status while a turn runs, and an interactive stop button. Needs the agent feature; where it is unavailable, pi-chat logs it once and runs without a status. |
+| `manifest.yaml` | Standard bot | A smaller app for a workspace where the agent feature is unavailable or an admin has it disabled. Same bot in every other respect — no timeline, no status, no stop button. |
+
+Both declare the same scopes and events. Nothing in pi-chat requires the agent one: it is a
+surface, not a dependency.
 
 Both are ordinary YAML; the comments mark the fields worth customizing (app name,
 descriptions, the slash-command name) and the fields that are load-bearing (scopes,
@@ -25,6 +28,12 @@ Your app → **Settings → App Manifest** → replace the contents → **Save**
 diff of what changes and then asks you to reinstall, so nothing changes silently. This is
 the supported way to pick up a new scope or event: one paste instead of one click per
 setting, and the reinstall is the same either way.
+
+Moving an existing plain-bot app to `manifest-agent.yaml` is one such paste. Two things to
+know: the reinstall may issue a new bot token (check the `xoxb-` file and rewrite it if the
+prefix or value changed), and the agent experience is an admin setting — Admin → Apps and
+workflows → the app → App Settings → **AI agent experience** → Enabled — that needs a paid
+plan. Where it is off, the bot keeps working exactly as before.
 
 ## What a manifest cannot do
 
