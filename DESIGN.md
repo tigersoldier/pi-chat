@@ -276,7 +276,10 @@ Constraints and behaviours:
   `recipient_user_id`/`recipient_team_id` as required "when streaming to channels",
   while pi-chat always streams into a thread. The first attempt sends them, and a
   refusal is retried **once without** them before falling back to patching; the refusal
-  is remembered per process so later turns do not repeat a doomed call.
+  is remembered per process so later turns do not repeat a doomed call. **Verified live
+  on 2026-09-27:** a thread reply carrying both the recipient fields and `thread_ts`
+  streams fine, so the documented requirement is about channel-level streams. The retry
+  has never fired and stays as insurance.
 - **Text that has arrived is always rendered before the answer is finalised.** Streaming
   is progress, not the record: `Finish` presents the authoritative answer
   (`GetLastAssistantText`) and *corrects* the message when it differs from what streamed.
@@ -317,7 +320,10 @@ Constraints and behaviours:
     owns approvals, and must treat `ui_stale` on a late response as normal.
   - *Fire-and-forget* — `notify`, `setStatus`, `setWidget`, `setTitle`,
     `set_editor_text` — are **broadcast and must never be answered**. Map `setStatus`
-    and `setTitle` onto the Slack status/title; drop the rest.
+    and `setTitle` onto the Slack status/title; drop the rest. Phase 0 logs them at
+    debug (a `warning`/`error` `notify` goes to the journal at warn); treating them as
+    "unanswerable UI input" produced a false alarm on every single turn, since
+    `pi-lens-lsp` emits `setStatus` continuously.
 - `approvals = "auto"` passes `--approve` and pi resolves dialogs itself. That does
   **not** silence the frame type: sessions emit `setStatus`/`setWidget` regardless, so
   the classification above is always required.

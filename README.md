@@ -14,9 +14,9 @@ Architecture, the thread/session model, the access rules and the build phases:
 
 ## Status
 
-Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0) and M2 (repo prep)
-are done. **M3, the phase-0 vertical slice, is implemented and verified against the live
-gateway**: a mention becomes a pi session, the turn streams, and the answer lands in the
+Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0), M2 (repo prep) and
+**M3 (the phase-0 vertical slice) are done**: verified end-to-end on 2026-09-27 — a mention
+in a Slack thread became a pi session, the turn streamed, and the answer landed in that
 thread. What is not built yet is the command grammar below beyond mentions — that is M4
 (`PLAN.md`), along with the database, admission control and approvals.
 

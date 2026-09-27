@@ -86,11 +86,33 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		}
 
 	case "extension_ui_request":
-		// Phase 0 has approvals on auto and no modal support, so an
-		// interactive request has nobody to answer it. Say so loudly rather
-		// than stalling silently; M5 routes these to Block Kit.
-		log.Warn("pi asked for UI input, which phase 0 cannot answer",
-			"event", string(ev.Raw))
+		// Two kinds of frame share this type, and only one of them needs
+		// answering (DESIGN §6).
+		request, ok := ev.UIRequest()
+		if !ok {
+			log.Warn("pi sent an extension UI request that could not be decoded",
+				"event", string(ev.Raw))
+			return
+		}
+		if !request.Blocking {
+			// Fire-and-forget: never answered, and not silenced by `--approve`,
+			// so pi-lens and friends emit these on every turn. Phase 0 has
+			// nowhere to show them; M5 maps setStatus/setTitle onto Slack.
+			if request.Method == gwclient.UIMethodNotify && request.NotifyTypeOrInfo() != "info" {
+				log.Warn("pi raised a notification",
+					"type", request.NotifyTypeOrInfo(), "text", stripANSI(request.Text))
+				return
+			}
+			log.Debug("extension notification ignored",
+				"method", request.Method, "status_key", request.StatusKey)
+			return
+		}
+		// A dialog blocks pi until somebody answers it. On auto approvals pi
+		// resolves what it can itself, so reaching here means the thread will
+		// stall until pi's own timeout. M5 answers these with Block Kit.
+		log.Warn("pi is waiting for an answer this phase cannot give; the turn stalls until pi times out",
+			"method", request.Method, "id", request.ID,
+			"title", request.Title, "message", stripANSI(request.Message))
 
 	case "extension_error":
 		log.Warn("pi reported an extension error", "event", string(ev.Raw))
@@ -154,6 +176,31 @@ func (s *turnState) waitStarted(ctx context.Context, grace time.Duration) error 
 		return ctx.Err()
 	}
 	return nil
+}
+
+// stripANSI removes ANSI escape sequences, which pi extensions put in status
+// and notification text: observed verbatim as `\x1b[38;5;241mLSP Inactive\x1b[39m`.
+// Slack renders them literally, and they are noise in a journal.
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, 0x1b) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		// CSI: ESC [ , parameters, then a final byte in @..~
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+				j++
+			}
+			i = min(j+1, len(s))
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // onEvent routes one gateway event to the turn it belongs to. It runs on the

@@ -5,8 +5,8 @@ Reference file for resuming work after a context reset. Design and rationale liv
 the current position. **Update the status block and checkboxes as work lands.**
 
 Last updated: 2026-09-27 · repo `/home/pi/code/pi-gchat` (module
-`github.com/tigersoldier/pi-chat`) — M0, M1 (phase 0), M2 and the M3 code are done. M3's
-code is verified against the live gateway; the last step is one real Slack mention.
+`github.com/tigersoldier/pi-chat`) — M0–M3 done; the bot answers mentions in Slack
+threads through `pi-gatewayd`.
 
 ---
 
@@ -18,15 +18,16 @@ code is verified against the live gateway; the last step is one real Slack menti
 | M0 — gateway running | **Done and verified** (see M0 below) |
 | M1 — Slack app | **Done for phase 0, verified live** (see M1 below): Socket Mode socket opens, bot token authenticates, phase-0 scopes granted. The phase-1 scopes are still to be added in one reinstall |
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
-| M3 — phase-0 vertical slice | **Code complete and verified against the live gateway**; waiting on one real Slack mention to close M3.5 (see M3 below) |
+| M3 — phase-0 vertical slice | **Done and verified end-to-end** on 2026-09-27: a mention in a Slack thread streamed a real pi answer back into it (see M3 below) |
 | Code | `internal/config`, `internal/bot` (core), `internal/slack` (Socket Mode, Web API, rendering), `cmd/pi-chatd`; 4 packages of tests. `tools/gateway-probe/` remains the seam smoke test |
 | `pi-chatd` | **Installed and running** as a systemd user unit (`packaging/pi-chatd.service`, `make install install-unit`), enabled at boot |
 | `pi-gatewayd` | **Installed and running** as a user unit; built from `~/code/pi-gateway` @ `119f0f2` (= tag `v0.1.2` content), self-reports `0.2.0` |
 | GitHub repo rename | **Not done** — browser action; local `origin` still says `pi-gchat`, which keeps working through GitHub's redirect |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: M3 — the code is done and proven against the live daemon; only the
-end-to-end Slack mention is outstanding.**
+**Current position: M3 is done end-to-end. Next is M4 (phase-1 MVP): allowlist enforcement
+with denial messages, SQLite state, session provisioning, the command grammar, and
+approvals.**
 
 ---
 
@@ -142,22 +143,35 @@ both unknowns (Slack ingress/egress and the gateway seam) in one runnable path.
 - [x] M3.4 Render the turn into the thread — `chat.startStream` / `appendStream` /
       `stopStream` with a patched-placeholder fallback, decided per turn and remembered
       per process
-- [ ] M3.5 **Deliverable: a streamed pi turn visible inside a Slack thread** — needs one
-      `@pi hello` from the owner in a channel the bot has been invited to
+- [x] M3.5 **Deliverable: a streamed pi turn visible inside a Slack thread** — verified by
+      the owner on 2026-09-27: `@pi hello` in a channel thread produced the answer in that
+      thread. Log evidence: session
+      `slack-t6k8y3frr-c0c4tmqnr8r-1790529157-569279` created in `~/work`, **no streaming
+      warnings** (so `chat.startStream` accepted the recipient fields on a thread reply),
+      and three `setStatus` frames from `pi-lens-lsp` that nothing had to answer.
 
 **Verified so far:** `make live-test` (`PI_CHAT_LIVE=1 go test ./internal/bot -run Live`)
 drives one real turn through the running `pi-gatewayd` with the configured tokens and a
 real `pi`: session created, connection bound, prompt sent, deltas streamed, final answer
-`"PONG"`. That covers M3.3 and the gateway half of M3.5.
+`"PONG"`. That covers M3.3; M3.5 is the same path with Slack on both ends.
 
-**Two bugs the live run caught** (both now fixed and pinned by tests, DESIGN §4):
+**Three bugs the live runs caught** (all fixed and pinned by tests):
 
 1. `message_end` was treated as the end of the turn, but one prompt emitted *two*
    messages — the flusher stopped on the first one and dropped the answer entirely.
-   Terminal signals are `agent_settled` / `gw_turn{state:"settled"}`.
+   Terminal signals are `agent_settled` / `gw_turn{state:"settled"}` (DESIGN §4).
 2. The flusher only rendered on its ticker, so a whole answer that arrived inside two
    ticks (all four deltas in 21 ms of a 2.4 s turn) was never rendered. It now renders on
-   the way out too.
+   the way out too (DESIGN §4).
+3. Every `extension_ui_request` was logged as "pi asked for UI input, which phase 0
+   cannot answer". Only *dialogs* need an answer; `setStatus`/`notify`/`setWidget` are
+   fire-and-forget and arrive on every turn (`--approve` does not silence them). The
+   adapter now splits them by method, so the journal has no false alarms (DESIGN §6).
+
+**Settled by the live run:** Slack accepts `recipient_user_id`/`recipient_team_id` on a
+`chat.startStream` that also carries `thread_ts`. The documented "required when streaming
+to channels" is therefore about channel-level streams; the defensive retry-without-
+recipient path stays as insurance and has never fired.
 
 **Exit:** the slice runs against the real daemon and a real `pi`.
 **Depends on:** M0, M1.

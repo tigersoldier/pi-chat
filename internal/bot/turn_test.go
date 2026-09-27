@@ -167,6 +167,88 @@ func TestWaitStarted(t *testing.T) {
 	})
 }
 
+// captureLogger returns a logger and the buffer it writes to.
+func captureLogger() (*slog.Logger, *strings.Builder) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return logger, &buf
+}
+
+// uiEvent builds an extension_ui_request frame.
+func uiEvent(t *testing.T, body string) gwclient.Event {
+	t.Helper()
+	raw := `{"type":"extension_ui_request",` + body + `}`
+	if !json.Valid([]byte(raw)) {
+		t.Fatalf("test built invalid JSON: %s", raw)
+	}
+	return gwclient.Event{Type: "extension_ui_request", Raw: []byte(raw)}
+}
+
+func TestFireAndForgetUINeedsNoAnswer(t *testing.T) {
+	// pi-lens emits setStatus on every turn, `--approve` does not silence it,
+	// and nothing waits for an answer. Warning about it would train the reader
+	// to ignore warnings.
+	log, logs := captureLogger()
+	st := newTurnState()
+	st.feed(uiEvent(t, `"id":"1","method":"setStatus","statusKey":"pi-lens-lsp",`+
+		`"statusText":"\u001b[38;5;241mLSP Inactive\u001b[39m"`), log)
+
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("a fire-and-forget request should not warn: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "setStatus") {
+		t.Fatalf("it should still be visible at debug level: %s", logs.String())
+	}
+	// It is not a turn boundary either.
+	select {
+	case <-st.doneCh:
+		t.Fatal("a notification must not end the turn")
+	default:
+	}
+}
+
+func TestBlockingUIDialogWarns(t *testing.T) {
+	// A dialog stalls the turn until pi times out, which the operator should
+	// learn from the journal rather than from a thread that never answers.
+	log, logs := captureLogger()
+	st := newTurnState()
+	st.feed(uiEvent(t, `"id":"q1","method":"confirm","title":"Run this?",`+
+		`"message":"\u001b[1mrm -rf build\u001b[0m"`), log)
+
+	got := logs.String()
+	if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "confirm") {
+		t.Fatalf("a blocking dialog should warn and name its method: %s", got)
+	}
+	if strings.Contains(got, "\\u001b") {
+		t.Fatalf("the message should be stripped of escapes: %s", got)
+	}
+}
+
+func TestNotifyWarningIsSurfaced(t *testing.T) {
+	log, logs := captureLogger()
+	st := newTurnState()
+	st.feed(uiEvent(t, `"id":"1","method":"notify","notifyType":"warning","text":"disk nearly full"`), log)
+
+	if got := logs.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "disk nearly full") {
+		t.Fatalf("a warning notification should reach the journal: %s", got)
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"plain", "plain"},
+		{"\x1b[38;5;241mLSP Inactive\x1b[39m", "LSP Inactive"},
+		{"\x1b[1mbold\x1b[0m and \x1b[4munderline\x1b[0m", "bold and underline"},
+		{"trailing\x1b", "trailing\x1b"}, // a lone ESC is not a sequence
+		{"", ""},
+	}
+	for _, test := range tests {
+		if got := stripANSI(test.in); got != test.want {
+			t.Errorf("stripANSI(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
 // recordingRenderer records what a turn renders.
 type recordingRenderer struct {
 	mu      sync.Mutex
