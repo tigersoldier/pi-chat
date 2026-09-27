@@ -58,16 +58,22 @@ Killed it; no other instances remain.
 
 ### M1 — Slack app (user, browser, ~15 min)
 
-- [ ] M1.1 Create app from scratch; **enable Socket Mode**; app-level token with
-      `connections:write`
-- [ ] M1.2 Bot scopes, phase 0: `app_mentions:read`, `chat:write`
-- [ ] M1.3 Install to workspace; invite `@pi` to a test channel
-- [ ] M1.4 V1 scopes (add when phase 1 starts): `channels:history`, `groups:history`,
-      `im:history`, `mpim:history`, `assistant:write`, `files:read`, `reactions:write`
-- [ ] M1.5 V1 settings: enable **Interactivity** (no request URL needed under Socket
-      Mode) and register the `/pi` slash command
+Full walkthrough with the exact click paths, the token files, and a troubleshooting
+table: **[docs/slack-app-setup.md](../docs/slack-app-setup.md)**.
 
-**Exit:** tokens written to `~/.config/pi-chat/slack-{app,bot}-token`, bot reachable.
+- [ ] M1.1 Create app from scratch; **enable Socket Mode**; app-level token with
+      `connections:write` → `~/.config/pi-chat/slack-app-token`
+- [ ] M1.2 Bot scopes, phase 0: `app_mentions:read`, `chat:write`
+- [ ] M1.3 Subscribe to the `app_mention` bot event (no Request URL under Socket Mode)
+- [ ] M1.4 Install to workspace → `~/.config/pi-chat/slack-bot-token` (0600), invite
+      `@pi` to a test channel, put your member ID in `allowed_users`
+- [ ] M1.5 V1 scopes (add when phase 1 starts): `channels:history`, `groups:history`,
+      `im:history`, `mpim:history`, `assistant:write`, `files:read`, `reactions:write`
+- [ ] M1.6 V1 settings: enable **Interactivity** (no request URL needed under Socket
+      Mode) and register the `/pi` slash command — the creation form demands a URL that
+      is never called, so any `https://` placeholder works
+
+**Exit:** `make check` reports both Slack token files present and you as an allowed user.
 **Owner:** user.
 
 ### M2 — Repo prep (mechanical, independent of M0/M1) — ✅ DONE

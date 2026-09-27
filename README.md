@@ -42,8 +42,7 @@ next. `pi-chatd` today loads and validates its configuration and nothing else.
    operations use the admin token, and the long-lived per-thread connections
    cannot destroy sessions.
 
-3. **A Slack app** (see PLAN.md M1) with Socket Mode enabled and its app-level
-   and bot tokens written to `~/.config/pi-chat/slack-{app,bot}-token`.
+3. **A Slack app** — full walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**.
 
 ## Configuration
 
