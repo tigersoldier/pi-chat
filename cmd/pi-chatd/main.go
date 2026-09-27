@@ -19,6 +19,7 @@ import (
 	"github.com/tigersoldier/pi-chat/internal/bot"
 	"github.com/tigersoldier/pi-chat/internal/config"
 	"github.com/tigersoldier/pi-chat/internal/slack"
+	"github.com/tigersoldier/pi-chat/internal/store"
 )
 
 // version is pi-chat's own version, not pi's and not pi-gateway's.
@@ -91,38 +92,61 @@ func run(cfg *config.Config) error {
 		"bot_user", me.User,
 		"bot_user_id", me.UserID)
 
-	core := bot.New(cfg, log, slack.NewPlatform(api, cfg, log))
+	st, err := store.Open(ctx, cfg.Paths.DBPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	// No thread is warm in a fresh process: a warm thread means a bound
+	// connection, and this process holds none yet. Without this, rows left by a
+	// crash would claim to be warm forever.
+	if n, err := st.MarkThreadsCold(ctx); err != nil {
+		log.Warn("cannot reset the warm markers", "error", err)
+	} else if n > 0 {
+		log.Info("reset threads that a previous run left warm", "count", n)
+	}
+
+	core := bot.New(cfg, log, slack.NewPlatform(api, cfg, me.TeamID, log), st, version)
 	defer core.Close()
 
-	socket := slack.NewSocket(appToken, api, log, func(ctx context.Context, env slack.Envelope) {
-		message, ok := slack.ParseMessage(env, me.UserID)
-		if !ok {
-			return
-		}
-		log.Debug("inbound mention",
-			"channel", message.Thread.Channel,
-			"user", message.UserID,
-			"thread", message.Thread.Key())
-		if message.Files > 0 {
-			log.Warn("this message carries attachments, which phase 0 ignores",
-				"count", message.Files, "thread", message.Thread.Key())
-		}
-		core.HandleMessage(ctx, message)
-	})
+	// Startup GC: a directory with no thread row is the remains of a crash or
+	// of an interrupted delete. Sessions the table still knows are kept, cold
+	// ones included, because /pi resume has to find them (DESIGN.md §9).
+	if removed, err := core.SweepWorkspaces(ctx); err != nil {
+		log.Warn("the workspace sweep reported problems", "error", err)
+	} else if len(removed) > 0 {
+		log.Info("swept orphaned project directories", "count", len(removed))
+	}
 
 	log.Info("pi-chatd is ready",
 		"config", cfg.Path(),
 		"render", cfg.Render.Mode,
 		"allowed_users", len(cfg.Slack.Access.AllowedUsers),
 		"allowed_channels", len(cfg.Slack.Access.AllowedChannels),
-		"gateway_state_dir", cfg.Gateway.StateDir)
+		"gateway_state_dir", cfg.Gateway.StateDir,
+		"database", cfg.Paths.DBPath)
 
-	err = socket.Run(ctx)
-	if errors.Is(err, context.Canceled) {
+	socket := slack.NewSocket(appToken, api, log, slack.NewRouter(core, me.UserID, log).Handle)
+
+	// The socket owns ingress; the core's maintenance loop runs beside it. A
+	// socket that stops for good — a revoked token, Socket Mode switched off —
+	// cancels the context so the sweeper stops with it, and vice versa: this is
+	// one service, not two processes sharing a token.
+	socketErr := make(chan error, 1)
+	go func() {
+		socketErr <- socket.Run(ctx)
+		stop()
+	}()
+	coreErr := core.Run(ctx)
+	if err := <-socketErr; err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	if errors.Is(coreErr, context.Canceled) {
 		log.Info("shutting down")
 		return nil
 	}
-	return err
+	return coreErr
 }
 
 // newLogger builds the logger the configuration asks for. Logs go to stderr;

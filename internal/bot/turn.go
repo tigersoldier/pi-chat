@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -16,12 +18,76 @@ import (
 // reached when a prompt is accepted and then produces nothing.
 const startGrace = 15 * time.Second
 
+// runTurn prompts the thread's session and renders the answer.
+func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
+	th.turnMu.Lock()
+	defer th.turnMu.Unlock()
+
+	client, err := th.ensure(ctx, m.Text)
+	if err != nil {
+		return err
+	}
+	if err := r.Start(ctx); err != nil {
+		return fmt.Errorf("start the reply: %w", err)
+	}
+	th.noteProgress(ctx, r)
+
+	// GetLastAssistantText returns the session's last answer, which is not
+	// necessarily an answer to *this* prompt, so remember it and refuse to
+	// present a stale answer as new.
+	before, err := client.GetLastAssistantText(ctx)
+	if err != nil {
+		th.log.Debug("cannot read the previous answer", "error", err)
+	}
+
+	st := newTurnState()
+	th.cur.Store(st)
+	defer th.cur.Store(nil)
+
+	stopFlush := th.flush(ctx, st, r)
+	defer stopFlush()
+
+	if _, err := client.Prompt(ctx, trimPrompt(m.Text)); err != nil {
+		return fmt.Errorf("prompt: %w", err)
+	}
+	if err := st.waitStarted(ctx, startGrace); err != nil {
+		return err
+	}
+	if err := client.AwaitSettled(ctx); err != nil {
+		return fmt.Errorf("wait for the turn: %w", err)
+	}
+
+	// The turn is over, wherever it ended: remember how far this connection
+	// got, so reopening the thread resumes here instead of replaying it.
+	th.saveCursor(ctx, client)
+
+	final, err := client.GetLastAssistantText(ctx)
+	if err != nil {
+		th.log.Warn("cannot read the answer", "error", err)
+	}
+	if final == "" {
+		// The streamed deltas are the fallback when the answer cannot be read
+		// back, for example after the session died mid-turn.
+		final = st.text()
+	}
+	if final == "" || (final == before && !st.sawWork()) {
+		return errors.New("the agent produced no answer")
+	}
+
+	stopFlush()
+	if err := r.Finish(ctx, final); err != nil {
+		return fmt.Errorf("finish the reply: %w", err)
+	}
+	th.touch(ctx)
+	return nil
+}
+
 // turnState accumulates what the gateway reports about one turn.
 //
 // It is written by the connection's OnEvent callback, which runs on the read
 // goroutine and therefore must not block or call back into the gateway
-// (DESIGN.md §4). Everything it does is a buffer append or a channel close; the
-// rendering side reads the buffers from other goroutines.
+// (DESIGN.md §4). Everything it does is a buffer append or a channel close;
+// the rendering side reads the buffers from other goroutines.
 type turnState struct {
 	mu      sync.Mutex
 	pending strings.Builder // text not yet rendered
@@ -39,7 +105,7 @@ func newTurnState() *turnState {
 }
 
 // feed records one gateway event. Unknown event types are ignored on purpose:
-// the gateway forwards everything pi emits, and phase 0 only renders text.
+// the gateway forwards everything pi emits, and this build renders text.
 func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	switch ev.Type {
 	case "message_update":
@@ -87,7 +153,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 
 	case "extension_ui_request":
 		// Two kinds of frame share this type, and only one of them needs
-		// answering (DESIGN §6).
+		// answering (DESIGN.md §6).
 		request, ok := ev.UIRequest()
 		if !ok {
 			log.Warn("pi sent an extension UI request that could not be decoded",
@@ -96,8 +162,8 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		}
 		if !request.Blocking {
 			// Fire-and-forget: never answered, and not silenced by `--approve`,
-			// so pi-lens and friends emit these on every turn. Phase 0 has
-			// nowhere to show them; M5 maps setStatus/setTitle onto Slack.
+			// so pi-lens and friends emit these on every turn. This build has
+			// nowhere to show them; phase 3 maps setStatus/setTitle onto Slack.
 			if request.Method == gwclient.UIMethodNotify && request.NotifyTypeOrInfo() != "info" {
 				log.Warn("pi raised a notification",
 					"type", request.NotifyTypeOrInfo(), "text", stripANSI(request.Text))
@@ -107,10 +173,10 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 				"method", request.Method, "status_key", request.StatusKey)
 			return
 		}
-		// A dialog blocks pi until somebody answers it. On auto approvals pi
-		// resolves what it can itself, so reaching here means the thread will
-		// stall until pi's own timeout. M5 answers these with Block Kit.
-		log.Warn("pi is waiting for an answer this phase cannot give; the turn stalls until pi times out",
+		// A dialog blocks pi until somebody answers it. With approvals on auto
+		// pi resolves what it can itself, so reaching here means the thread
+		// stalls until pi's own timeout. Phase 2 answers these with Block Kit.
+		log.Warn("pi is waiting for an answer this build cannot give; the turn stalls until pi times out",
 			"method", request.Method, "id", request.ID,
 			"title", request.Title, "message", stripANSI(request.Message))
 
@@ -209,7 +275,8 @@ func (th *thread) onEvent(ev gwclient.Event) {
 	cur := th.cur.Load()
 	if cur == nil {
 		// Nothing is being rendered: between turns, or a turn that already
-		// finished.
+		// finished. A resumed connection replays here, and replay is
+		// deliberately dropped — the thread shows live turns, not history.
 		th.log.Debug("gateway event outside a turn", "type", ev.Type)
 		return
 	}

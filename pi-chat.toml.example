@@ -26,9 +26,10 @@ state_dir         = "~/.config/pi-gateway"                  # port + token disco
 admin_token_file  = "~/.config/pi-chat/gateway-admin.token"  # role admin; lifecycle only
 thread_token_file = "~/.config/pi-chat/gateway-thread.token" # operator + control, no admin
 
-# Passed to gw_new_session. --approve lets pi resolve its own approval dialogs;
-# "interactive" approvals in [behavior] needs this list without it.
-pi_args = ["--approve"]
+# Passed to gw_new_session, on top of what pi-chat adds itself: the injected
+# prompt below, and --approve when [behavior] approvals is "auto". Anything else
+# you want a new pi process to start with belongs here.
+pi_args = []
 
 [paths]
 projects_root = "~/work"                                    # new sessions get a project dir

@@ -14,11 +14,14 @@ Architecture, the thread/session model, the access rules and the build phases:
 
 ## Status
 
-Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0), M2 (repo prep) and
-**M3 (the phase-0 vertical slice) are done**: verified end-to-end on 2026-09-27 — a mention
-in a Slack thread became a pi session, the turn streamed, and the answer landed in that
-thread. What is not built yet is the command grammar below beyond mentions — that is M4
-(`PLAN.md`), along with the database, admission control and approvals.
+Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0), M2 (repo prep), M3
+(the vertical slice) and **M4 (the phase-1 MVP) are done**: in Slack, a mention or a
+command starts a pi session in a thread, the answer streams back, and the thread's state
+survives a restart. Phase 1 has a user allowlist, durable thread state, project
+directories with the worktree convention, `/pi help|status|resume`, `@pi /<command>`
+pass-through, idle close and cold resume. Still to come (phase 2): `@pi /delete`,
+`/abort`, `/model`, interactive approvals, and the warm-session cap with eviction.
+Details: `PLAN.md`.
 
 ## Prerequisites
 
@@ -75,8 +78,10 @@ failure and is safe to leave running.
 Two trigger tokens, one vocabulary. Slack forbids developer slash commands
 inside message threads, which is why the two forms differ.
 
-> **Phase 0 (today) answers mentions only.** The command forms below are the designed
-grammar; `/pi …` and `@pi /…` commands arrive with M4.
+> **What works today:** the mention forms and `/pi help`, `/pi status`, `/pi resume`,
+> `@pi /status`, and pass-through of pi's own commands. `/delete`, `/abort`, `/model` and
+> `/stop` are part of the grammar but answer "not in this build yet" until phase 2 — they
+> are never forwarded to the agent as text.
 
 | Where | Form | Example |
 |---|---|---|
@@ -88,6 +93,16 @@ grammar; `/pi …` and `@pi /…` commands arrive with M4.
 
 A session is always thread-scoped; a root command never touches one. `/pi help`
 and `@pi /help` print the current list.
+
+In a **direct message**, mention the bot to start a thread (`@pi <prompt>`); after that,
+plain text in that DM thread continues the session — no mention needed. Plain text in a
+channel or DM *root* is ignored: roots are session-less, which is what keeps a busy
+channel from turning every later message into a prompt. Plain text in a **channel thread**
+is a prompt only if that thread already has a session.
+
+State lives in SQLite at `paths.db_path` (created on first run, mode 0600 directory). It
+holds thread keys, session identities, cursors and handled event IDs — never
+transcripts, prompts, or answers.
 
 ## Layout
 

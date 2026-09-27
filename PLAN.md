@@ -4,9 +4,10 @@ Reference file for resuming work after a context reset. Design and rationale liv
 [`DESIGN.md`](./DESIGN.md); this file is the operational plan, the environment facts, and
 the current position. **Update the status block and checkboxes as work lands.**
 
-Last updated: 2026-09-27 · repo `/home/pi/code/pi-gchat` (module
-`github.com/tigersoldier/pi-chat`) — M0–M3 done; the bot answers mentions in Slack
-threads through `pi-gatewayd`.
+Last updated: 2026-09-28 · repo `/home/pi/code/pi-gchat` (module
+`github.com/tigersoldier/pi-chat`) — M0–M4 done: the bot answers mentions and commands in
+Slack threads through `pi-gatewayd`, with durable thread state and provisioned
+workspaces.
 
 ---
 
@@ -19,15 +20,17 @@ threads through `pi-gatewayd`.
 | M1 — Slack app | **Done for phase 0, verified live** (see M1 below): Socket Mode socket opens, bot token authenticates, phase-0 scopes granted. The phase-1 scopes are still to be added in one reinstall |
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
 | M3 — phase-0 vertical slice | **Done and verified end-to-end** on 2026-09-27: a mention in a Slack thread streamed a real pi answer back into it (see M3 below) |
-| Code | `internal/config`, `internal/bot` (core), `internal/slack` (Socket Mode, Web API, rendering), `cmd/pi-chatd`; 4 packages of tests. `tools/gateway-probe/` remains the seam smoke test |
+| M4 — phase-1 MVP | **Done and verified live** on 2026-09-28: commands, allowlist refusals, SQLite thread state, provisioned project directories, cold/resume, startup GC (see M4 below) |
+| Code | `internal/config`, `internal/store` (SQLite), `internal/workspace` (provisioning + git cleanup), `internal/bot` (core), `internal/slack` (adapter), `cmd/pi-chatd`; five packages of tests |
 | `pi-chatd` | **Installed and running** as a systemd user unit (`packaging/pi-chatd.service`, `make install install-unit`), enabled at boot |
 | `pi-gatewayd` | **Installed and running** as a user unit; built from `~/code/pi-gateway` @ `119f0f2` (= tag `v0.1.2` content), self-reports `0.2.0` |
 | GitHub repo rename | **Not done** — browser action; local `origin` still says `pi-gchat`, which keeps working through GitHub's redirect |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: M3 is done end-to-end. Next is M4 (phase-1 MVP): allowlist enforcement
-with denial messages, SQLite state, session provisioning, the command grammar, and
-approvals.**
+**Current position: M4 is done and verified live. Next is M5 (phase 2): `/delete` with
+button confirmation and worktree cleanup, `/abort`, `/model`, interactive approvals
+(buttons + modal via `pending_ui`), and the warm-session cap with eviction and the bounded
+queue.**
 
 ---
 
@@ -176,18 +179,49 @@ recipient path stays as insurance and has never fired.
 **Exit:** the slice runs against the real daemon and a real `pi`.
 **Depends on:** M0, M1.
 
-### M4 — Phase 1 MVP
+### M4 — Phase 1 MVP — ✅ DONE
 
-- [ ] Allowlist enforcement **before any side effect**; denial message
-- [ ] SQLite (`threads`, `seen`, `pending_ui`, `admissions`) — DESIGN §7; persist before
-      ack; `seen` mandatory (upstream prompt idempotency still open)
-- [ ] Session provisioning: project dir, `injected_prompt` (worktree convention),
-      deterministic session names
-- [ ] Thread-scoped sessions; root is session-less; warm/cold idle-close
-- [ ] Prompt → streamed answer, cursor persistence, `Resume` on re-dial
-- [ ] Commands: `/pi help`, `/pi status`, `/pi resume`, `@pi /status`, `@pi /<command>`
-      pass-through, near-miss guard
-- [ ] `--approve` mode; systemd user unit; startup orphan GC
+- [x] Allowlist enforcement **before any side effect**; denial message. Refusals are
+      ephemeral and name the fact, never the configuration
+- [x] SQLite (`threads`, `seen`, `pending_ui`, `admissions`) — the whole schema in one
+      artifact; `threads` and `seen` are written in this phase, the other two wait for the
+      features that fill them. Persist before ack; a failed claim blocks the turn rather
+      than risking a double prompt
+- [x] Session provisioning: project dir `<date>-<slug>` (slug from the first prompt, a
+      counter on collision), `injected_prompt` rendering, deterministic session names,
+      `approvals = "auto"` adding `--approve`
+- [x] Thread-scoped sessions; root is session-less; warm/cold idle-close; startup reset of
+      the warm marker; stale-warm repair in the sweep
+- [x] Prompt → streamed answer, cursor persistence (on settle and on the sweep), `Resume`
+      on re-dial
+- [x] Commands: `/pi help`, `/pi status`, `/pi resume` (picker with buttons), `@pi /status`,
+      `@pi /<command>` pass-through, near-miss guard; reserved phase-2 commands are
+      answered rather than forwarded to the agent
+- [x] `--approve` mode; systemd user unit (landed early in M3); startup orphan GC
+- [ ] Warm-session cap with eviction and the bounded queue — **moved to M5**; phase 1
+      counts warm threads and warns at the cap
+
+**What landed where:** `internal/store` (SQLite in WAL, one writer, schema version),
+`internal/workspace` (provision, injected prompt, worktree cleanup, orphan sweep),
+`internal/bot` (command vocabulary, gateway reads through a narrow `gateway` interface,
+provisioning wiring, idle sweep), `internal/slack` (slash commands, buttons, DMs, plain
+thread text, notices and ephemeral answers).
+
+**Verified live** (`make live-test`, 3.7 s against the running daemon and real pi): the
+first prompt created session `slack-t-live-c-live-…` in a project directory named from the
+prompt (`~/work/2026-09-27-reply-with-exactly-the-single-word`) and streamed `PONG`;
+closing the connection marked the thread cold; the next prompt re-bound **the same
+session** at cursor seq 132 and answered `PONG2`; the cleanup deleted the session through
+the gateway and removed the directory (`removed=true left=[]`) — which also exercises the
+phase-2 delete path early.
+
+**Bug a test caught:** the interaction `response_url` reply matched on the substring
+`"ok"`, so `{"ok":false,"error":…}` — exactly what an expired response URL answers — read
+as success. It now parses the answer, accepts both documented shapes (the bare `ok` and an
+envelope), and never mistakes a failure for a success.
+
+**Exit:** the slice runs against the real daemon and a real `pi`.
+**Depends on:** M0, M1, M2, M3.
 
 ### M5 — Phase 2
 

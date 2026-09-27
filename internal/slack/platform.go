@@ -2,6 +2,7 @@ package slack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -24,20 +25,22 @@ const (
 	maxMessage = 38000
 )
 
-// Platform renders turns with Slack's Web API.
+// Platform renders turns and posts notices with Slack's Web API.
 type Platform struct {
-	api *API
-	cfg *config.Config
-	log *slog.Logger
+	api    *API
+	cfg    *config.Config
+	log    *slog.Logger
+	teamID string // this install's workspace, from auth.test
 
 	// recipientRefused records that this install rejects the recipient fields
 	// on chat.startStream, so later turns do not repeat a doomed attempt.
 	recipientRefused atomic.Bool
 }
 
-// NewPlatform builds the Slack adapter.
-func NewPlatform(api *API, cfg *config.Config, log *slog.Logger) *Platform {
-	return &Platform{api: api, cfg: cfg, log: log}
+// NewPlatform builds the Slack adapter. teamID is the workspace the bot token
+// belongs to, which is what a thread key starts with.
+func NewPlatform(api *API, cfg *config.Config, teamID string, log *slog.Logger) *Platform {
+	return &Platform{api: api, cfg: cfg, log: log, teamID: teamID}
 }
 
 // StartTurn builds the renderer for a reply to m. It has no side effect: the
@@ -53,6 +56,50 @@ func (p *Platform) StartTurn(_ context.Context, m bot.Message) (bot.Renderer, er
 		recipientTeam: m.TeamID,
 		wantStream:    p.cfg.Render.Mode == "stream",
 	}, nil
+}
+
+// Post posts a notice — a command answer, a refusal, a hint or a picker.
+//
+// Where it goes follows the notice: a response URL answers the interaction
+// that asked (and is the only way to replace an ephemeral message), an Update
+// replaces a message the bot already posted, an ephemeral notice is shown to
+// one user, and everything else is a normal message in the channel or thread.
+func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
+	blocks := blocksFor(n.Buttons)
+	switch {
+	case n.ReplyTo != "":
+		return p.api.Respond(ctx, n.ReplyTo, n.Text, blocks, n.Update != "")
+	case n.Update != "":
+		return p.api.UpdateBlocks(ctx, n.Channel, n.Update, n.Text, blocks)
+	case n.Ephemeral:
+		if n.UserID == "" {
+			return errors.New("slack: an ephemeral notice needs a user")
+		}
+		_, err := p.api.PostEphemeral(ctx, n.Channel, n.UserID, threadTS(n.Thread), n.Text, blocks)
+		return err
+	default:
+		_, err := p.api.PostBlocks(ctx, n.Channel, threadTS(n.Thread), n.Text, blocks)
+		return err
+	}
+}
+
+// OpenThread posts a top-level message and returns the thread it starts: the
+// new message's own timestamp is the thread root. The core needs this when a
+// root command has no message of its own to answer under.
+func (p *Platform) OpenThread(ctx context.Context, channel, text string) (bot.Thread, error) {
+	ts, err := p.api.PostMessage(ctx, channel, "", text)
+	if err != nil {
+		return bot.Thread{}, err
+	}
+	return bot.Thread{Workspace: p.teamID, Channel: channel, ThreadTS: ts}, nil
+}
+
+// threadTS is the thread a notice belongs to, and "" for a channel root.
+func threadTS(t *bot.Thread) string {
+	if t == nil {
+		return ""
+	}
+	return t.ThreadTS
 }
 
 // renderer writes one turn into one thread. Streaming is preferred and patching
@@ -107,6 +154,14 @@ func (r *renderer) Start(ctx context.Context) error {
 	}
 	r.ts = ts
 	return nil
+}
+
+// Progress names the message this renderer is writing into, so the core can
+// record which reply a restart interrupted (DESIGN.md §7).
+func (r *renderer) Progress() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ts
 }
 
 // recipientFields returns the chat.startStream recipient arguments.

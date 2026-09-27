@@ -172,7 +172,15 @@ convenience.
   remains.
 - **Re-dial:** on the next message, dial with `Resume{Cursor}` — replay, or a snapshot
   whose content is discarded (we render live turns, not history) while its watermark is
-  adopted.
+  adopted. The replayed frames are dropped because nothing is being rendered between
+  turns; what they carry forward is the sequence number the next save records.
+- **The cursor is saved on settle and on the sweep**, so a restart or an idle close
+  resumes at the tail rather than replaying from the head.
+- **A process starts with no warm threads.** No thread is warm in a fresh process —
+  warm means a bound connection, and a new process holds none — so startup clears the
+  marker. Without it, a crash would leave rows claiming to be warm, and both `/pi status`
+  and the warm-session cap read that marker. The sweep also repairs the same lie for a
+  thread whose connection died while the process kept running.
 - **Deleted:** the session file is gone; the thread row is marked `deleted` and keeps
   the key reserved so the next message starts fresh.
 
@@ -226,12 +234,28 @@ commands inside message threads** and its slash-command payload carries no `thre
 2. **Resolution order:** bot control command → agent command → prompt. Agent commands
    are validated against `GetCommands()` (extensions, prompt templates, skills);
    an unknown `/X` is forwarded to pi verbatim so pi's own error is authoritative.
-3. **Near-miss guard:** a first token that matches a control name without its slash
+3. **Near-miss guard:** a message that is *exactly* a control name without its slash
    (`@pi status`) gets an ephemeral `did you mean @pi /status?` instead of burning a
-   turn.
+   turn. Only the whole message counts: "delete the old branch" is a prompt, and
+   interrupting it would be worse than running it.
 4. **Mentions are stripped** before the text reaches the agent; a leading `/` after the
    mention is preserved.
-5. **`@pi /delete` asks for confirmation with buttons**, then deletes.
+5. **A command the grammar reserves but this build does not implement yet** (`/delete`
+   in phase 1) is answered rather than forwarded: pi would receive `/delete` as literal
+   prompt text, and a clear "not in this build yet" beats that.
+6. **`@pi /delete` asks for confirmation with buttons**, then deletes.
+
+What reaches a session, and what does not:
+
+| Message | Behaviour |
+|---|---|
+| Channel or DM root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one |
+| Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
+| DM root, `@pi <text>` | Same, and the thread is a DM thread |
+| Channel thread, plain text | A prompt **only if** that thread already has a session (the bot sits in busy channels) |
+| Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
+| DM thread, plain text | A prompt: in a DM the conversation is already the address |
+| Any thread, other people's messages | Dropped unless the thread is one of the bot's own, and unless the sender is allowed |
 
 ### Command reference (v1)
 
@@ -247,6 +271,14 @@ commands inside message threads** and its slash-command payload carries no `thre
 | `@pi /stop` | thread | manual `StopSession` (cap debugging) |
 | `@pi /compact`, `@pi /skill:<name>`, `@pi /<template>` | thread | forwarded to pi |
 | `@pi <text>` | thread | prompt |
+
+Command answers, hints, refusals and pickers are **ephemeral**: they are about the session,
+not part of the conversation, and a thread full of status messages buries the answers. A
+notice goes through the interaction's `response_url` when there is one (which is also the
+only way to replace an ephemeral message), and `chat.postEphemeral` otherwise.
+
+`@pi /help` lists pi's own commands (skills, templates, extensions) only when the thread is
+already warm: a help request must not dial, create or wake a session to answer itself.
 
 ---
 
@@ -365,10 +397,16 @@ Rules:
 - **Persist before acking** anything that mutates state, so a crash cannot lose an acked
   message.
 - **`seen` is mandatory**, not an optimisation: upstream prompt idempotency is still
-  open, so this is the only guard against a Slack retry producing a double turn.
+  open, so this is the only guard against a Slack retry producing a double turn. A
+  failure to *write* the claim blocks the turn: running the prompt once, late, beats
+  running it twice.
 - **`progress_ts` is persisted** so a bot restart can re-attach and keep updating the
   same message instead of posting a duplicate.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
+- **Phase 1 writes `threads` and `seen`.** `pending_ui` and `admissions` are created with
+  the rest of the schema — one artifact, one migration — and are written from phase 2,
+  when there are dialogs and a queue to put in them. The database carries a schema
+  version and refuses to open one written by a newer pi-chat.
 
 ---
 
@@ -397,6 +435,9 @@ counts warm sessions, not sockets; an unbound connection is nearly free.
 - **Never `force`.** A busy or attached session is skipped, never killed.
 - **Every eviction is logged and counted** — an invisible cap that stops sessions is
   indistinguishable from a bug.
+- **Phase 1 reports the cap but does not evict.** It counts warm threads and warns when
+  the cap is reached; evict-then-queue belongs with the queue that gives it something to
+  fall back on (phase 2). Session creation is never queued or refused before then.
 - The daemon's own idle hibernation (15 min after the last client detaches) is the
   second tier and is not accounted; the idle-close sweep is what keeps the cap honest.
 
@@ -408,7 +449,10 @@ New sessions get a fresh project directory; the agent works in a git worktree of
 repository, so concurrent threads on one repo never collide and the user's own checkout
 is never touched.
 
-- Project dir: `{projects_root}/<date>-<slug>/`, passed to `gw_new_session.cwd`.
+- Project dir: `{projects_root}/<date>-<slug>/`, passed to `gw_new_session.cwd`. The slug
+  comes from the first prompt (the first six words, reduced to letters, digits and inner
+  dashes) and a collision gets a counter rather than a shared directory: two threads must
+  never share one working tree.
 - Repos: `{repos_root}` (some may be bare).
 - `injected_prompt` (config template; empty disables injection) instructs the agent to
   pick the repo, detect bare vs clone, resolve the default branch, and
@@ -420,11 +464,18 @@ Cleanup:
 - `@pi /delete` → `DeleteSession` (gateway removes the session file) → for each dir under
   the project dir's `repos/*`: `git -C <mainrepo> worktree remove --force`, prune the
   `pi/<date>-<slug>` branch → delete the row → remove the project dir if empty.
+- **Cleanup only touches what it can prove is pi-chat's**: a linked worktree (git reports
+  a different `--git-dir` and `--git-common-dir`) sitting on a `pi/` branch. A real clone
+  the agent made, a worktree on somebody else's branch, or a file the agent wrote outside
+  `repos/` is reported as left behind, and a directory that is not empty is never
+  removed. Deleting the wrong repository is worse than a directory outliving its session.
 - **Startup GC:** for each directory under `projects_root` with **no** `threads` row:
   remove its worktrees, prune its branch, delete the directory. Orphans only — a cold
-  thread with a live row is never touched, because `/pi resume` must still find it.
-- Sessions adopted from outside the bot live outside `projects_root` and are therefore
-  structurally out of the GC's reach.
+  thread with a live row is never touched, because `/pi resume` (and the work in its
+  worktree) must still be there. Only names that look like pi-chat's own
+  (`<YYYY-MM-DD>-<slug>`) are considered at all.
+- Sessions adopted from outside the bot have no project dir, live outside `projects_root`,
+  and are therefore structurally out of the GC's reach — as well as out of `/delete`'s.
 
 ---
 
@@ -501,7 +552,7 @@ mode     = "stream"                # stream | patch
 flush_ms = 1000
 
 [behavior]
-approvals = "auto"                 # auto (--approve) | interactive
+approvals = "auto"                 # auto adds --approve to pi_args | interactive
 # injected_prompt = """…"""        # {reposRoot} {projectsRoot} {date} {slug}; empty = none
 
 [log]
@@ -533,9 +584,21 @@ shapes, applied by pasting one into the app's manifest editor;
 scope or event is added once, reviewed as a diff in Slack, and never drifts from the
 adapter's expectations.
 
-**Seam:** inbound `{threadKey, senderID, text, attachments}` → core; outbound
-`Post`, `Update`, `AskConfirm`. No Slack envelope, `ts`, block or Socket Mode type
-crosses it.
+**The seam, as implemented** (`internal/bot/types.go`):
+
+- *in* — `Message` (a mention or plain text, with `Mentioned`/`Direct` telling the core
+  how it was addressed), `Command` (`/pi <cmd>` at a root or `@pi /<cmd>` in a thread,
+  normalised so the text always carries its slash), `Action` (a button press).
+- *out* — a `Renderer` per turn (`Start`/`Delta`/`Finish`/`Fail`, plus an optional
+  `ProgressReporter` naming the message it writes into), `Notice` for everything that is
+  not a turn (text plus plain buttons, plus the opaque adapter handles `ReplyTo` and
+  `Update`), and `OpenThread` for the one case where a root command needs a thread.
+
+The adapter side declares the core as a three-method `Core` interface and owns the
+`Router` that turns envelopes into those calls, so main only wires components together
+and the payload handling is testable with recorded envelopes. No Slack envelope, `ts`,
+block or Socket Mode type crosses the seam; `ReplyTo` and `Update` are opaque strings the
+core passes back untouched.
 
 ---
 

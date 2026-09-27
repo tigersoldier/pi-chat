@@ -7,11 +7,22 @@ import (
 	"github.com/tigersoldier/pi-chat/internal/bot"
 )
 
-// ParseMessage turns a Socket Mode envelope into a core message. It reports
-// false for everything phase 0 does not answer: non-event envelopes, other
-// event types, the bot's own posts, and messages carrying nothing to act on.
+// ParseMessage turns one Socket Mode event envelope into a core message. It
+// reports false for everything pi-chat does not treat as a message: other
+// event types, the bot's own posts, edits and joins, and messages that do not
+// address the bot at all.
 //
-// botUserID is the bot's own member ID, from auth.test.
+// What counts as addressing it:
+//
+//   - a mention, anywhere (`@pi …`);
+//   - plain text in a DM thread, where the conversation is already the address;
+//   - plain text in a channel thread, which the core accepts only for threads
+//     it already owns — the bot sits in busy channels, and a stray reply must
+//     not start a session.
+//
+// A bare message in a channel or DM *root* is not a prompt: roots are
+// session-less by design (DESIGN.md §4), which is what keeps `@pi hello` in a
+// channel from making every later message in it a prompt.
 func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	if env.Type != "events_api" {
 		return bot.Message{}, false
@@ -21,15 +32,16 @@ func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 		TeamID  string `json:"team_id"`
 		EventID string `json:"event_id"`
 		Event   struct {
-			Type     string `json:"type"`
-			Subtype  string `json:"subtype"`
-			BotID    string `json:"bot_id"`
-			User     string `json:"user"`
-			Text     string `json:"text"`
-			TS       string `json:"ts"`
-			ThreadTS string `json:"thread_ts"`
-			Channel  string `json:"channel"`
-			Files    []struct {
+			Type        string `json:"type"`
+			Subtype     string `json:"subtype"`
+			BotID       string `json:"bot_id"`
+			User        string `json:"user"`
+			Text        string `json:"text"`
+			TS          string `json:"ts"`
+			ThreadTS    string `json:"thread_ts"`
+			Channel     string `json:"channel"`
+			ChannelType string `json:"channel_type"`
+			Files       []struct {
 				ID string `json:"id"`
 			} `json:"files"`
 		} `json:"event"`
@@ -40,17 +52,33 @@ func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 
 	event := callback.Event
 	switch {
-	case event.Type != "app_mention":
+	case event.Type != "app_mention" && event.Type != "message":
 		return bot.Message{}, false
 	case event.BotID != "" || event.Subtype != "":
-		// Our own message, or an edit of one.
+		// Our own post, an edit, a channel join: none of them is a prompt.
 		return bot.Message{}, false
 	case event.User == "", event.Channel == "", event.TS == "":
 		return bot.Message{}, false
 	}
 
-	// A mention at the top of a channel starts the thread pi-chat answers in;
-	// a mention inside a thread joins that thread's session (DESIGN.md §7).
+	// Slack renders a mention as <@U123>. Removing ours is also how we learn
+	// that we were addressed: a mention event may arrive for a message we were
+	// mentioned in alongside others.
+	text := stripMention(event.Text, botUserID)
+	mentioned := event.Type == "app_mention" || text != event.Text
+	direct := event.ChannelType == "im" || event.ChannelType == "mpim"
+
+	switch {
+	case mentioned:
+	case direct && event.ThreadTS != "":
+	case event.ThreadTS != "":
+	default:
+		return bot.Message{}, false
+	}
+
+	// A mention at the top of a channel, or in a DM root, starts the thread
+	// pi-chat answers in; the mention's own timestamp roots it. A mention
+	// inside a thread joins that thread's session (DESIGN.md §4).
 	threadTS := event.ThreadTS
 	if threadTS == "" {
 		threadTS = event.TS
@@ -63,10 +91,109 @@ func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 			Channel:   event.Channel,
 			ThreadTS:  threadTS,
 		},
-		UserID: event.User,
-		TeamID: callback.TeamID,
-		Text:   strings.TrimSpace(stripMention(event.Text, botUserID)),
-		Files:  len(event.Files),
+		UserID:    event.User,
+		TeamID:    callback.TeamID,
+		Text:      strings.TrimSpace(text),
+		Mentioned: mentioned,
+		Direct:    direct,
+		Files:     len(event.Files),
+	}, true
+}
+
+// ParseCommand turns a Socket Mode slash-command envelope into a core command.
+//
+// The two quirks of this payload shape are why the core takes a normalized
+// form: it carries no thread timestamp (so a root command is necessarily
+// session-less) and its text omits the slash the user typed.
+func ParseCommand(env Envelope) (bot.Command, bool) {
+	if env.Type != "slash_commands" {
+		return bot.Command{}, false
+	}
+	var payload struct {
+		TeamID      string `json:"team_id"`
+		ChannelID   string `json:"channel_id"`
+		UserID      string `json:"user_id"`
+		Text        string `json:"text"`
+		ResponseURL string `json:"response_url"`
+	}
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return bot.Command{}, false
+	}
+	if payload.ChannelID == "" || payload.UserID == "" {
+		return bot.Command{}, false
+	}
+	return bot.Command{
+		// A slash-command payload has no event id, so the envelope is the only
+		// thing to dedupe on. Slack only redelivers an envelope it did not see
+		// acknowledged, which is a narrower guarantee than event_id — and the
+		// widest one this payload shape offers.
+		EventID: env.EnvelopeID,
+		Channel: payload.ChannelID,
+		UserID:  payload.UserID,
+		TeamID:  payload.TeamID,
+		Text:    "/" + strings.TrimSpace(payload.Text),
+		ReplyTo: payload.ResponseURL,
+	}, true
+}
+
+// ParseAction turns a Socket Mode interactive envelope (a button press) into a
+// core action.
+func ParseAction(env Envelope) (bot.Action, bool) {
+	if env.Type != "interactive" {
+		return bot.Action{}, false
+	}
+	var payload struct {
+		Type string `json:"type"`
+		Team struct {
+			ID string `json:"id"`
+		} `json:"team"`
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
+		Channel struct {
+			ID string `json:"id"`
+		} `json:"channel"`
+		Message struct {
+			TS       string `json:"ts"`
+			ThreadTS string `json:"thread_ts"`
+		} `json:"message"`
+		ResponseURL string `json:"response_url"`
+		Actions     []struct {
+			ActionID string `json:"action_id"`
+			Value    string `json:"value"`
+		} `json:"actions"`
+	}
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return bot.Action{}, false
+	}
+	if payload.Type != "block_actions" || len(payload.Actions) == 0 {
+		return bot.Action{}, false
+	}
+	if payload.User.ID == "" || payload.Channel.ID == "" {
+		return bot.Action{}, false
+	}
+
+	// Buttons are pressed on a message, and that message may be in a thread —
+	// which is where an answer belongs, and which a later approval button will
+	// depend on.
+	var thread *bot.Thread
+	if payload.Message.ThreadTS != "" {
+		thread = &bot.Thread{
+			Workspace: payload.Team.ID,
+			Channel:   payload.Channel.ID,
+			ThreadTS:  payload.Message.ThreadTS,
+		}
+	}
+	return bot.Action{
+		EventID:   env.EnvelopeID,
+		Channel:   payload.Channel.ID,
+		Thread:    thread,
+		UserID:    payload.User.ID,
+		TeamID:    payload.Team.ID,
+		ActionID:  payload.Actions[0].ActionID,
+		Value:     payload.Actions[0].Value,
+		MessageTS: payload.Message.TS,
+		ReplyTo:   payload.ResponseURL,
 	}, true
 }
 

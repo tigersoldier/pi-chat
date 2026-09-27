@@ -119,7 +119,7 @@ func newTestPlatform(t *testing.T, stub *stubSlack, mode string) *Platform {
 	t.Helper()
 	cfg := config.Defaults()
 	cfg.Render.Mode = mode
-	return NewPlatform(newStubAPI(t, stub), cfg, discardLogger())
+	return NewPlatform(newStubAPI(t, stub), cfg, "T1", discardLogger())
 }
 
 func newTestRenderer(t *testing.T, stub *stubSlack, mode string) *renderer {
