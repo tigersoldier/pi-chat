@@ -4,8 +4,8 @@ Reference file for resuming work after a context reset. Design and rationale liv
 [`DESIGN.md`](./DESIGN.md); this file is the operational plan, the environment facts, and
 the current position. **Update the status block and checkboxes as work lands.**
 
-Last updated: 2026-09-26 · repo `/home/pi/code/pi-gchat` @ `d01ec9c` (DESIGN.md rewritten,
-uncommitted).
+Last updated: 2026-09-26 · repo `/home/pi/code/pi-gchat` @ `c0a8f87` + M0 work
+(`pi-gatewayd` installed and running; `DESIGN.md` amended from what the M0 probe learned).
 
 ---
 
@@ -14,37 +14,45 @@ uncommitted).
 | Item | State |
 |---|---|
 | Design | **Settled.** All 14 questions answered; `DESIGN.md` rewritten for the pi-gateway-based, Slack-first scope |
-| Code | **Old Google Chat spike still present.** `cmd/probe`, `scripts/setup-gcp.sh`, GCP/Pub/Sub deps — none of it survives. No Slack or gateway code written yet |
-| `pi-gatewayd` | **Not installed** (`command not found`). Blocks everything |
-| Slack app | **Not created** |
-| Repo rename | **Not done** (module is still `pi-gchat`) |
+| M0 — gateway running | **Done and verified** (see M0 below) |
+| Code | **Old Google Chat spike still present** in the parent module. `tools/gateway-probe/` is the new, working seam smoke test |
+| `pi-gatewayd` | **Installed and running** as a user unit; built from `~/code/pi-gateway` @ `119f0f2` (= tag `v0.1.2` content), self-reports `0.2.0` |
+| Slack app | **Not created** — this is what unblocks M3 |
+| Repo rename / gchat cleanup | **Not done** (M2, independent, can start now) |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: start at M0.**
+**Current position: M2 can start now; M3 waits for M1 (Slack app).**
 
 ---
 
 ## Milestones
 
-### M0 — Gateway running (blocking prerequisite)
+### M0 — Gateway running (blocking prerequisite) — ✅ DONE
 
 Prove the session plane end to end with no Slack code at all.
 
-- [ ] M0.1 Build + install `pi-gatewayd` from the existing clone `/tmp/pigw` (checked out
-      `v0.1.2`) into `~/.local/bin`; `pi-gatewayd --version` reports v0.1.2
-- [ ] M0.2 Provision two tokens into 0600 files: one `admin` (lifecycle), one with
-      `operator` + `control` and **no** `admin` (per-thread). Upstream doc example
-      `{"name":"slack","role":"operator"}` is **wrong** for this bot — `operator` alone
-      lacks `control`
-- [ ] M0.3 Start the daemon; confirm state dir (`~/.config/pi-gateway`), port and token
-      discovery
-- [ ] M0.4 Write `~/.config/pi-chat/config.toml` (shape: DESIGN §11)
-- [ ] M0.5 Scratch `gwclient` program (throwaway, e.g. `/tmp/gwtest*/`): `NewSession` →
-      `SwitchSession` → `Prompt` → print events. Verifies both tokens' capabilities
-      before any Slack work
+- [x] M0.1 Built and installed `pi-gatewayd` into `~/.local/bin` from `~/code/pi-gateway`
+      @ `119f0f2` (byte-identical to tag `v0.1.2`); `--version` prints
+      `pi-gatewayd 0.2.0 (gateway protocol 1)` — note the daemon's version const is
+      ahead of the last tag, so the string is not the release name
+- [x] M0.2 Provisioned two tokens into `~/.config/pi-gateway/tokens.json` and copied the
+      values to `~/.config/pi-chat/gateway-{admin,thread}.token` (0600): `pi-chat-admin`
+      (`role=admin`) and `pi-chat-thread` (`caps=observe,interject,prompt,ui,control`)
+- [x] M0.3 Installed the upstream user unit plus a drop-in forcing
+      `--pi %h/.local/bin/pi` and an explicit `PATH`; enabled at boot; running on
+      `127.0.0.1:7331`, debug listener on `127.0.0.1:7332`, pi `0.85.1`
+- [x] M0.4 Wrote `~/.config/pi-chat/config.toml` (0600) per DESIGN §11; `allowed_users`
+      still empty pending M1
+- [x] M0.5 `tools/gateway-probe` (`go run .` there) → **PASS**: admin token granted
+      `observe,interject,prompt,ui,control,admin` and started session-less; thread token
+      granted the five expected capabilities and `gw_new_session` was refused with
+      `forbidden`; `SwitchSession` + `Prompt` on the second connection worked;
+      `set_thinking_level` proved `control`; `gw_delete_session` (force=false) unbind both
+      connections and a later prompt was refused with `unknown_session`; catalog row gone
 
-**Exit:** a prompt driven entirely through `gwclient` prints a real pi turn.
-**Owner:** assistant (user confirms daemon config).
+**Incident during M0.3:** a leftover daemon from the earlier v0.1.2 e2e validation
+(`/tmp/e2e/bin/pi-gatewayd`, up for a day) held port 7331 and made the unit restart-loop.
+Killed it; no other instances remain.
 
 ### M1 — Slack app (user, browser, ~15 min)
 
@@ -144,12 +152,24 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 | Bot config | `~/.config/pi-chat/config.toml` (0600), state in `~/.local/state/pi-chat/` |
 | Scratch gwclient consumers | `/tmp/gwtest2` (earlier validation) |
 
-### Upstream facts to keep in mind (verified against v0.1.2)
+### Upstream facts to keep in mind (verified against v0.1.2, M0 probe)
 
 - Exported packages usable: `gwclient`, `protocol`, `config`, `piargs`.
 - `admin` required for `gw_new_session` / `gw_stop_session` / `gw_delete_session`;
-  `control` for `set_model`, `compact`, `set_session_name`. `operator` lacks `control`.
-- One connection binds to exactly one session; `SwitchSession` rebinds.
+  `control` for `set_model`, `compact`, `set_session_name`. `operator` lacks `control`,
+  so the thread token is minted from explicit capabilities, not the role.
+- One connection binds to exactly one session; `SwitchSession` rebinds, and
+  **`gw_new_session` rebinds the connection that issued it**. There is no unbind
+  command: only closing the connection drops the binding. **Consequence: the admin
+  connection must be throwaway, not pooled** — otherwise every session it created keeps
+  a phantom attached client and can never be evicted (`session_attached`).
+- `extension_ui_request` is one frame type with two meanings, split by `method`:
+  dialogs (`select`, `confirm`, `input`, `editor`) are routed to the turn's author
+  (`gw_turn.author`) with a fallback to the most recently active `ui` client and
+  `ui_stale` for non-owners; fire-and-forget (`notify`, `setStatus`, `setWidget`,
+  `setTitle`, `set_editor_text`) are broadcast and must never be answered. `--approve`
+  does **not** stop `setStatus`/`setWidget` frames. `statusText` carries raw ANSI SGR
+  sequences — strip them before rendering.
 - Delete tombstones the path for the daemon's lifetime; a repeat delete/attach answers
   `unknown_session`; session file removed after pi is reaped.
 - Stop/delete **unbind** connections rather than closing them; attached clients never
@@ -184,5 +204,13 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 ## Next action
 
-Start **M0.1** (build and install `pi-gatewayd`), then M0.2–M0.5, then **M2** while the
-user does **M1**. Ask before starting M3.
+1. **M2 now** (independent of Slack): rename the module, delete the Google Chat
+   artifacts, swap the dependency tree, and decide the fate of `tools/gateway-probe`
+   (keep it as the seam smoke test, replacing the `replace` directive with the
+   published module version).
+2. **M1 in the browser** (user): the Slack app, then paste the two token values into
+   `~/.config/pi-chat/slack-{app,bot}-token` and your member ID into `allowed_users`.
+3. **M3** once M1's tokens exist: the phase-0 vertical slice.
+
+The gateway side is ready: `pi-gatewayd` is running, both tokens work, and the seam is
+proven by `tools/gateway-probe`.

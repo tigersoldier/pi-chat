@@ -80,7 +80,7 @@ What this design relies on, all verified present in v0.1.2:
 | Stream progress | `Events()` / `Config.OnEvent`; daemon coalesces deltas (50 ms / 8 KB) |
 | Survive drops/restarts | `Cursor`/`LastSeq`/`LeafID` + `Reconnect`, replay or `gw_snapshot` |
 | Resume external sessions | `ListSessions(SessionFilter)`, `SwitchSession` |
-| Approvals | `Event.UIRequest`, `BlockingUIMethod`, `RespondUI` |
+| Approvals | `Event.UIRequest`, `BlockingUIMethod`, `RespondUI` (dialogs only, §6) |
 | Release / destroy a session | `StopSession`, `DeleteSession` (v0.1.2) |
 | Terminal notification | `gw_session_state{state:"deleted"}`, `stopped` + `reason` |
 | Session state / models | `GetState`, `SetModel`, `GetAvailableModels`, `SetThinkingLevel`, `Compact` |
@@ -90,14 +90,24 @@ Notable upstream behaviour this design must respect:
 - **`admin` is required** for `gw_new_session`, `gw_stop_session`, `gw_delete_session`;
   `control` is required for `set_model`, `compact`, `set_session_name`; `operator`
   alone lacks `control`.
-- **One connection binds to exactly one session.** `SwitchSession` rebinds it.
+- **One connection binds to exactly one session.** `SwitchSession` rebinds it, and
+  **`NewSession` rebinds the creating connection to the session it just created**.
+  There is no unbind command and no way to keep a connection while dropping its
+  binding — only `Close`/`Bye` releases it (§10).
 - **A delete tombstones the path** for the daemon's lifetime; a repeat delete or attach
   answers `unknown_session`. The session file is deleted after pi is reaped.
 - **A stop/delete unbinds the affected connections** (they survive; they are not
   closed). `gwclient` clears `Session()` on the terminal event.
 - **Attached clients never block a delete**; `gw_stop_session` refuses with
   `session_attached` unless forced. A running turn refuses with `session_busy` unless
-  forced (which aborts, then stops after a 5 s grace).
+  forced (which aborts, then stops after a 5 s grace). Since `NewSession` binds, a
+  long-lived creator connection is a **permanently attached client** and would make
+  every session it created unevictable (§8, §10).
+- **Extension UI is two different things on one frame type.** Dialog methods
+  (`select`, `confirm`, `input`, `editor`) are routed to the author of the running turn
+  (`gw_turn.author`), falling back to the most recently active `ui`-capable client; a
+  non-owner response is dropped with `ui_stale`. Fire-and-forget methods (`notify`,
+  `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) are broadcast to everyone.
 - **Open upstream gaps** — durable creator tags (in-memory, lost on daemon restart),
   prompt idempotency, and connection/session caps. Their mitigations are ours (§7, §8).
 
@@ -150,6 +160,9 @@ convenience.
    `deleted` and tell the user; a later message starts a *new* session deliberately.
 4. **pi is never stopped mid-turn by us.** Eviction and explicit stop use
    `force: false`.
+5. **Creation is a throwaway connection.** A session is created on a fresh admin
+   connection that is closed immediately afterwards, so the thread connection is the
+   only client attached to it (§10).
 
 ### Lifecycle
 
@@ -237,11 +250,26 @@ Constraints and behaviours:
   operation so the fallback stays inside the Slack adapter.
 - `assistant.threads.setStatus` for ambient state, `setTitle` for the derived thread
   title.
-- **Approvals:** `confirm`/`select` → Block Kit buttons carrying the dialog id;
-  `input`/`editor` → a modal via the interaction's `trigger_id`; `pending_ui` (§7) maps
-  a click back to `RespondUI`. With `approvals = "auto"` sessions are spawned with
-  `--approve` and no dialogs appear. An unanswered dialog falls back to pi's own
-  timeout — the bot marks it expired rather than letting the turn stall silently.
+- **`extension_ui_request` is two things on one frame type, and the adapter must split
+  them by `method`:**
+  - *Dialogs* — `select`, `confirm`, `input`, `editor` — need an answer and are routed
+    to the **author of the running turn**, so the bot receives the ones it caused.
+    `confirm`/`select` → Block Kit buttons carrying the dialog id; `input`/`editor` → a
+    modal via the interaction's `trigger_id`; `pending_ui` (§7) maps a click back to
+    `RespondUI`. If the same session is being driven from pilish, the dialog goes to
+    *that* author instead and the bot never sees it — so the bot must never assume it
+    owns approvals, and must treat `ui_stale` on a late response as normal.
+  - *Fire-and-forget* — `notify`, `setStatus`, `setWidget`, `setTitle`,
+    `set_editor_text` — are **broadcast and must never be answered**. Map `setStatus`
+    and `setTitle` onto the Slack status/title; drop the rest.
+- `approvals = "auto"` passes `--approve` and pi resolves dialogs itself. That does
+  **not** silence the frame type: sessions emit `setStatus`/`setWidget` regardless, so
+  the classification above is always required.
+- **Strip ANSI escapes** (and control characters) from every string a pi extension
+  supplies before it reaches Slack — observed `setStatus.statusText` carries raw SGR
+  sequences (`\x1b[38;5;241m…`), and Block Kit renders them literally.
+- An unanswered dialog eventually resolves through pi's own timeout; the bot marks it
+  expired rather than letting the thread stall silently.
 - **Admission notices** ("queued — waiting for a free slot") are posted in-thread; the
   Slack ack always happens inside 3 s, before any work.
 
@@ -294,6 +322,12 @@ counts warm sessions, not sockets; an unbound connection is nearly free.
      session with another client attached (checked via `gw_list_sessions`' `clients`) —
      the user may be driving it from pilish, and stopping pi under them is exactly what
      `gw_stop_session` refuses.
+
+  A session created by the bot must have exactly **one** attached client (its thread
+  connection). This is why session creation uses a throwaway admin connection (§10):
+  `gw_new_session` binds the connection that issued it, so a reused creator connection
+  would show up in `clients` forever and render every session it ever created
+  unevictable — a cap that silently never evicts.
   2. If nothing is evictable, queue the message for `admission_wait_seconds` (default
      120) with an in-thread notice; **re-check the allowlist at dequeue**; on expiry say
      so.
@@ -348,12 +382,19 @@ Two gateway tokens (§3) — never the daemon's default token:
 
 | Token | File | Capabilities | Where used |
 |---|---|---|---|
-| admin | `admin_token_file` | `admin` (+ everything) | one **session-less** connection, lifecycle only: `gw_new_session`, `gw_stop_session`, `gw_delete_session` |
-| thread | `thread_token_file` | `observe, prompt, interject, ui, control` — deliberately **no `admin`** | per-thread connections |
+| admin | `admin_token_file` | `admin` (+ everything) | **one throwaway connection per lifecycle operation** — dial → `gw_new_session` / `gw_stop_session` / `gw_delete_session` → `Close` |
+| thread | `thread_token_file` | `observe, prompt, interject, ui, control` — deliberately **no `admin`** | one long-lived connection per warm thread |
 
-Rationale: lifecycle operations travel on a connection that never binds or prompts, so
-they cannot be confused by a stale binding; and the many long-lived per-thread
-connections cannot destroy sessions even if a rendering or dispatch bug abuses them.
+Rationale: the many long-lived per-thread connections cannot destroy sessions even if a
+rendering or dispatch bug abuses them; and lifecycle operations, which are always
+issued with an explicit target, never depend on a connection's binding.
+
+The admin connection must be **short-lived, and never reused for creation**:
+`gw_new_session` rebinds the connection that issues it and there is no unbind command,
+so a pooled creator connection would remain an attached client of every session it
+ever created — pinning them warm and making them unevictable (§8). Dial, create,
+close; the loopback dial costs nothing.
+
 Mint with `pi-gatewayd --provision-token`; rotate via `tokens.json` + SIGHUP.
 
 ---
