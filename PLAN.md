@@ -4,8 +4,9 @@ Reference file for resuming work after a context reset. Design and rationale liv
 [`DESIGN.md`](./DESIGN.md); this file is the operational plan, the environment facts, and
 the current position. **Update the status block and checkboxes as work lands.**
 
-Last updated: 2026-09-26 · repo `/home/pi/code/pi-gchat` @ `c0a8f87` + M0 work
-(`pi-gatewayd` installed and running; `DESIGN.md` amended from what the M0 probe learned).
+Last updated: 2026-09-26 · repo `/home/pi/code/pi-gchat` (module now
+`github.com/tigersoldier/pi-chat`) — M0 and M2 done; the Slack app (M1) is what M3 waits
+for.
 
 ---
 
@@ -15,13 +16,14 @@ Last updated: 2026-09-26 · repo `/home/pi/code/pi-gchat` @ `c0a8f87` + M0 work
 |---|---|
 | Design | **Settled.** All 14 questions answered; `DESIGN.md` rewritten for the pi-gateway-based, Slack-first scope |
 | M0 — gateway running | **Done and verified** (see M0 below) |
-| Code | **Old Google Chat spike still present** in the parent module. `tools/gateway-probe/` is the new, working seam smoke test |
+| M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
+| Code | `internal/config` + `cmd/pi-chatd --check` (loads, validates, redacts). No Slack or gateway code yet; `tools/gateway-probe/` is the working seam smoke test |
 | `pi-gatewayd` | **Installed and running** as a user unit; built from `~/code/pi-gateway` @ `119f0f2` (= tag `v0.1.2` content), self-reports `0.2.0` |
-| Slack app | **Not created** — this is what unblocks M3 |
-| Repo rename / gchat cleanup | **Not done** (M2, independent, can start now) |
+| Slack app (M1) | **Not created** — this is what unblocks M3 |
+| GitHub repo rename | **Not done** — browser action; local `origin` still says `pi-gchat`, which keeps working through GitHub's redirect |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: M2 can start now; M3 waits for M1 (Slack app).**
+**Current position: M1 (Slack app) is the critical path; M3 follows it.**
 
 ---
 
@@ -68,24 +70,32 @@ Killed it; no other instances remain.
 **Exit:** tokens written to `~/.config/pi-chat/slack-{app,bot}-token`, bot reachable.
 **Owner:** user.
 
-### M2 — Repo prep (mechanical, independent of M0/M1)
+### M2 — Repo prep (mechanical, independent of M0/M1) — ✅ DONE
 
-- [ ] M2.1 Rename module `pi-gchat` → `github.com/tigersoldier/pi-chat` (no external
-      importers; also rename the GitHub repo and update the remote)
-- [ ] M2.2 Delete Google Chat artifacts: `cmd/probe`, `scripts/setup-gcp.sh`,
-      `scripts/render-assets.sh`, `docs/phase0.md`, `docs/chat-app-setup.md`,
-      `pi-gchat.toml.example`, `assets/` (Chat artwork),
-      `.github/workflows/static.yml`, `PRIVACY.md`, `TERMS.md` (no Marketplace listing
-      in v1 ⇒ no listing artifacts)
-- [ ] M2.3 Drop the GCP/Pub/Sub dependency tree; add `pi-gateway v0.1.2`; `go mod tidy`
-- [ ] M2.4 Rewrite `Makefile`, `README.md` (Slack-first, `pi-gatewayd` prerequisite),
-      `.gitignore`, and add a config example matching DESIGN §11
-- [ ] M2.5 `go build ./...` clean with zero Google dependencies
+- [x] M2.1 Module renamed to `github.com/tigersoldier/pi-chat`; the GitHub repo rename is
+      still **the user's browser action** — the local `origin` URL stays on `pi-gchat`,
+      which keeps working through GitHub's redirect after the rename
+- [x] M2.2 Deleted every Google Chat artifact: `cmd/probe`, `scripts/`,
+      `docs/`, `assets/`, `.github/workflows/static.yml`,
+      `pi-gchat.toml.example`, `PRIVACY.md`, `TERMS.md`
+- [x] M2.3 Dropped the GCP/Pub/Sub tree — `go.mod` now requires only
+      `BurntSushi/toml`, and `go.sum` has no Google entries. The `pi-gateway` require
+      is deferred to M3 on purpose: nothing imports `gwclient` yet and `go mod tidy`
+      would drop it again. `go.mod` carries the commented `replace` line to develop
+      against `~/code/pi-gateway`
+- [x] M2.4 Rewrote `Makefile`, `README.md` (Slack-first, prerequisites, the command
+      grammar), `.gitignore` (credentials and `*.token` are never committable) and
+      `pi-chat.toml.example`
+- [x] M2.5 `go build ./...`, `go vet ./...` and `go test ./...` are clean
 
-**Exit:** repo builds, nothing Google-Chat-specific remains outside DESIGN/history.
+**Beyond the spec:** the module would otherwise have held no packages, so M2 also added
+`internal/config` (loader, defaults, `~` expansion, strict validation, unknown-key
+rejection, redacted `Summary`) with unit tests, and `cmd/pi-chatd` with `--check` and
+`--version`. This is the config half of M3.1; `make check` already validates the live
+file. Runtime logging must still use `log/slog` in M3 — the `fmt` prints in `--check`
+output are the command's product, not daemon logs.
 
 ### M3 — Phase 0 vertical slice (DESIGN §13)
-
 One allowed user, one channel, **no database, no policy**. Thin on purpose: it touches
 both unknowns (Slack ingress/egress and the gateway seam) in one runnable path.
 
@@ -204,13 +214,16 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 ## Next action
 
-1. **M2 now** (independent of Slack): rename the module, delete the Google Chat
-   artifacts, swap the dependency tree, and decide the fate of `tools/gateway-probe`
-   (keep it as the seam smoke test, replacing the `replace` directive with the
-   published module version).
-2. **M1 in the browser** (user): the Slack app, then paste the two token values into
-   `~/.config/pi-chat/slack-{app,bot}-token` and your member ID into `allowed_users`.
-3. **M3** once M1's tokens exist: the phase-0 vertical slice.
+1. **M1 in the browser** (user) — the only thing gating M3: create the Slack app,
+   enable Socket Mode, generate the app-level token (`connections:write`), add the
+   phase-0 bot scopes (`app_mentions:read`, `chat:write`), install it, invite `@pi` to a
+   test channel, write the two token values to
+   `~/.config/pi-chat/slack-{app,bot}-token` (0600), and put your Slack member ID in
+   `allowed_users` (`make check` shows whether the files are seen).
+2. **M3** once those tokens exist: the phase-0 vertical slice.
+3. **Optionally, whenever you like:** rename the GitHub repo to `pi-chat`, and file the
+   upstream rebind fix (DESIGN §3) — neither blocks M3.
 
 The gateway side is ready: `pi-gatewayd` is running, both tokens work, and the seam is
-proven by `tools/gateway-probe`.
+proven by `tools/gateway-probe`. The repo side is ready: `make check` validates the live
+configuration, `make test` and `make vet` are clean.

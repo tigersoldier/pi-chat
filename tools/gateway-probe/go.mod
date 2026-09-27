@@ -1,4 +1,4 @@
-module github.com/tigersoldier/pi-gchat/tools/gateway-probe
+module github.com/tigersoldier/pi-chat/tools/gateway-probe
 
 go 1.22
 

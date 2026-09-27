@@ -1,0 +1,57 @@
+# Reference configuration for pi-chat (DESIGN.md §11).
+#
+# The live file is ~/.config/pi-chat/config.toml, mode 0600 — outside the repo,
+# never committed. Copy this file and adjust:
+#
+#   install -Dm600 pi-chat.toml.example ~/.config/pi-chat/config.toml
+#   $EDITOR ~/.config/pi-chat/config.toml
+#   make check
+#
+# Every key below is optional: the value shown is the default. "~" expands to
+# your home directory. Unknown keys are an error, not a warning.
+
+[slack]
+# xapp-… (Socket Mode app-level token) and xoxb-… (bot token), one per file.
+app_token_file = "~/.config/pi-chat/slack-app-token"
+bot_token_file = "~/.config/pi-chat/slack-bot-token"
+
+[access]
+# Deny by default: an empty list denies everyone. Slack member IDs (U…).
+allowed_users = []
+# Empty means any channel the bot is a member of.
+allowed_channels = []
+
+[gateway]
+state_dir         = "~/.config/pi-gateway"                  # port + token discovery
+admin_token_file  = "~/.config/pi-chat/gateway-admin.token"  # role admin; lifecycle only
+thread_token_file = "~/.config/pi-chat/gateway-thread.token" # operator + control, no admin
+
+# Passed to gw_new_session. --approve lets pi resolve its own approval dialogs;
+# "interactive" approvals in [behavior] needs this list without it.
+pi_args = ["--approve"]
+
+[paths]
+projects_root = "~/work"                                    # new sessions get a project dir
+repos_root    = "~/code"                                    # your git repositories
+db_path       = "~/.local/state/pi-chat/pi-chat.db"
+
+[concurrency]
+max_warm_sessions         = 8     # bound connections, i.e. warm pi processes
+thread_idle_close_minutes = 10    # close a thread's connection after this long idle
+admission_wait_seconds    = 120   # how long a message may wait for a free slot
+eviction                  = "evict-then-queue"  # evict idle LRU → queue → refuse
+
+[render]
+mode     = "stream"   # stream: chat.startStream | patch: postMessage + update
+flush_ms = 1000       # coalescing window for Slack message updates
+
+[behavior]
+approvals = "auto"    # auto: pi resolves dialogs (--approve) | interactive: Block Kit
+# injected_prompt = """
+# ...
+# """
+# Empty disables injection. Template keys: {reposRoot} {projectsRoot} {date} {slug}.
+
+[log]
+level  = "info"   # debug | info | warn | error
+format = "text"   # text | json

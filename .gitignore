@@ -1,20 +1,26 @@
-# Service account keys and credentials — never commit.
-*pi-gchat-sa*.json
+# Build output
+/bin/
+
+# Local configuration — the live file is ~/.config/pi-chat/config.toml, never here
+pi-chat.toml
+config.toml
+
+# Credentials — never commit
+*.token
+*-token
+*pi-chat-sa*.json
 credentials.json
 
-# Local config (normally lives in ~/.pi/agent)
-pi-gchat.toml
-
 # Go build artifacts
-/bin/
 *.test
 *.out
 
 # Runtime data
 *.db
+*.db-wal
+*.db-shm
 
 # Editor noise
 .idea/
 .vscode/
 *.swp
-/probe

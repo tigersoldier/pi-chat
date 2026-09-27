@@ -1,55 +1,89 @@
-# pi-gchat
+# pi-chat
 
-Control local [pi](https://pi.dev) coding-agent sessions from Google Chat.
+Chat integrations for [pi-gateway](https://github.com/tigersoldier/pi-gateway):
+drive local [pi](https://pi.dev) coding-agent sessions from a chat platform.
+Slack is the first integration; Google Chat is a planned second one.
 
-The daemon runs on your machine (fully outbound — no listening socket, no
-tunnel): it pulls Chat events from a Pub/Sub subscription, manages
-`pi --mode rpc` subprocesses per session, and replies through the Chat API.
-Architecture, data model, and build phasing: **[DESIGN.md](DESIGN.md)**.
+`pi-chatd` runs on your machine and is fully outbound: one WebSocket to Slack
+(Socket Mode) and one loopback connection to `pi-gatewayd`. No listening socket,
+no tunnel, no public URL, no certificate. It does **not** own pi processes —
+`pi-gatewayd` does, and is a prerequisite.
+
+Architecture, the thread/session model, the access rules and the build phases:
+**[DESIGN.md](DESIGN.md).** Current position and milestones: **[PLAN.md](PLAN.md).**
 
 ## Status
 
-**Phase 0 — Google plumbing spike** (the riskiest unknown, done first):
-a tiny Go probe pulls one Chat event from Pub/Sub and posts one reply,
-proving the round-trip before anything else is built.
+Design settled. M0 (the gateway seam) is done and verified; the Slack adapter is
+next. `pi-chatd` today loads and validates its configuration and nothing else.
 
-## Quick start (phase 0)
+## Prerequisites
 
-```bash
-./scripts/setup-gcp.sh <PROJECT_ID>   # topic, subscription, service account, config
-# …create the Chat app in the console (see docs/phase0.md)…
-make probe                            # or: go run ./cmd/probe
-# DM the bot in Google Chat → the probe replies to your message
-```
+1. **pi-gatewayd** running, with pi reachable:
 
-No project name is hard-coded anywhere; pass it as an argument (or `PROJECT_ID`
-env var — the script falls back to `gcloud config get-value project`).
+   ```bash
+   install -Dm644 ~/code/pi-gateway/packaging/pi-gatewayd.service \
+       ~/.config/systemd/user/pi-gatewayd.service
+   systemctl --user daemon-reload && systemctl --user enable --now pi-gatewayd
+   ```
+
+2. **Two tokens**, admin and thread, minted into `~/.config/pi-gateway/tokens.json`:
+
+   ```bash
+   pi-gatewayd --provision-token --token-name pi-chat-admin  --token-role admin \
+       > ~/.config/pi-chat/gateway-admin.token
+   pi-gatewayd --provision-token --token-name pi-chat-thread \
+       --token-caps observe,interject,prompt,ui,control \
+       > ~/.config/pi-chat/gateway-thread.token
+   chmod 600 ~/.config/pi-chat/gateway-*.token
+   ```
+
+   The thread token deliberately has **no** `admin`: only the lifecycle
+   operations use the admin token, and the long-lived per-thread connections
+   cannot destroy sessions.
+
+3. **A Slack app** (see PLAN.md M1) with Socket Mode enabled and its app-level
+   and bot tokens written to `~/.config/pi-chat/slack-{app,bot}-token`.
 
 ## Configuration
 
-The daemon reads `~/.pi/agent/pi-gchat.toml` (path configurable via the probe's
-`-config` flag). It is written locally by `scripts/setup-gcp.sh`, contains your
-service-account key path, and is **never checked into git** (`pi-gchat.toml` is
-gitignored). See **[pi-gchat.toml.example](pi-gchat.toml.example)** for a
-reference copy with placeholders.
+The live file is `~/.config/pi-chat/config.toml`, mode 0600. Every key and its
+defaults: **[pi-chat.toml.example](pi-chat.toml.example)**. Check it with:
+
+```bash
+make check          # loads, validates, prints a redacted summary
+```
+
+## Talking to the bot
+
+Two trigger tokens, one vocabulary. Slack forbids developer slash commands
+inside message threads, which is why the two forms differ.
+
+| Where | Form | Example |
+|---|---|---|
+| Channel or DM root | `/pi <command>` | `/pi status`, `/pi resume`, `/pi help` |
+| Channel or DM thread | `@pi /<command>` | `@pi /status`, `@pi /skill:grill-me` |
+| Channel root | `@pi <text>` | starts a thread and a session |
+| Channel thread | `@pi <text>` | continues that thread's session |
+| DM thread | plain text | continues that thread's session |
+
+A session is always thread-scoped; a root command never touches one. `/pi help`
+and `@pi /help` print the current list.
 
 ## Layout
 
 ```
-cmd/probe/              phase-0 spike: pull one event, reply, exit
-scripts/setup-gcp.sh    idempotent GCP provisioning (gcloud)
-docs/phase0.md          spike walkthrough, verification, troubleshooting
-docs/chat-app-setup.md  the one manual step: creating the Chat app
-pi-gchat.toml.example   reference config with placeholders (copy, don't commit)
-DESIGN.md               full high-level design
+cmd/pi-chatd/          the daemon
+internal/config/       configuration file loading and validation
+internal/bot/          platform-independent core (M3)
+internal/slack/        Slack adapter: Socket Mode, rendering, interactions (M3)
+tools/gateway-probe/   nested module: pi-gateway seam smoke test
 ```
 
-## Requirements
+## Development
 
-- Go ≥ 1.24
-- `gcloud` CLI, authenticated as owner/editor of the GCP project
-
-## Legal
-
-- [Privacy Policy](PRIVACY.md)
-- [Terms of Service](TERMS.md)
+```bash
+make test            # unit tests
+make vet             # go vet
+make probe           # exercise the gateway seam against a running pi-gatewayd
+```
