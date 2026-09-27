@@ -176,6 +176,30 @@ convenience.
 - **Deleted:** the session file is gone; the thread row is marked `deleted` and keeps
   the key reserved so the next message starts fresh.
 
+### Turn boundaries (verified against the live daemon)
+
+A turn is not over when a message ends. One prompt produced this sequence:
+
+```text
+agent_start, turn_start, message_start, message_end,   <- first message, no text
+message_start, message_update×4 (text_start, "P", "ONG", text_end), message_end,
+turn_end, agent_end, agent_settled, gw_turn(settled)
+```
+
+- **`message_end` ends a message, `turn_end` ends one turn of the agent loop.** A single
+  prompt can produce several of each, so neither marks the end of work. The terminal
+  signals are **`agent_settled`** (pi's own, and what the protocol docs nominate) or
+  **`gw_turn{state:"settled"}`**; `gw_session_state{state:"deleted"}` is terminal for a
+  different reason. Treating `message_end` as terminal stopped rendering before the
+  answer had streamed at all — a bug that only shows up on the second message of a turn.
+- **A whole answer can arrive between two flush ticks.** In the run above, all four
+  `message_update` frames landed inside 21 ms of a 2.4 s turn. A flusher that only
+  renders on its ticker drops that text, so it must also render **on the way out**
+  (turn done, or stopping for the finish).
+- **`agent_end` precedes `agent_settled`,** and pi emits `extension_ui_request` frames
+  (here: fire-and-forget `setStatus`) interleaved with the turn. Neither changes what is
+  rendered.
+
 ---
 
 ## 5. Interaction grammar
@@ -248,6 +272,16 @@ Constraints and behaviours:
 - **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, degrade to
   `chat.postMessage` + `chat.update` for that turn. The adapter seam has one method per
   operation so the fallback stays inside the Slack adapter.
+- **The recipient fields are sent defensively.** Slack documents
+  `recipient_user_id`/`recipient_team_id` as required "when streaming to channels",
+  while pi-chat always streams into a thread. The first attempt sends them, and a
+  refusal is retried **once without** them before falling back to patching; the refusal
+  is remembered per process so later turns do not repeat a doomed call.
+- **Text that has arrived is always rendered before the answer is finalised.** Streaming
+  is progress, not the record: `Finish` presents the authoritative answer
+  (`GetLastAssistantText`) and *corrects* the message when it differs from what streamed.
+  A turn that produced several messages therefore ends showing the final answer, not a
+  concatenation of intermediates.
 - **Status and title, two tiers:**
   - *Declared as an agent* (`slack/manifest-agent.yaml`, Slack's agent messaging
     experience): `agents.sessions.setStatus` takes real lifecycle values that map onto

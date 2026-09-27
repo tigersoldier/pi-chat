@@ -14,8 +14,11 @@ Architecture, the thread/session model, the access rules and the build phases:
 
 ## Status
 
-Design settled. M0 (the gateway seam) is done and verified; the Slack adapter is
-next. `pi-chatd` today loads and validates its configuration and nothing else.
+Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0) and M2 (repo prep)
+are done. **M3, the phase-0 vertical slice, is implemented and verified against the live
+gateway**: a mention becomes a pi session, the turn streams, and the answer lands in the
+thread. What is not built yet is the command grammar below beyond mentions — that is M4
+(`PLAN.md`), along with the database, admission control and approvals.
 
 ## Prerequisites
 
@@ -54,10 +57,26 @@ defaults: **[pi-chat.toml.example](pi-chat.toml.example)**. Check it with:
 make check          # loads, validates, prints a redacted summary
 ```
 
+## Running it
+
+```bash
+make install        # build and install ~/.local/bin/pi-chatd
+make install-unit   # install packaging/pi-chatd.service and daemon-reload
+systemctl --user enable --now pi-chatd
+journalctl --user -u pi-chatd -f
+```
+
+`pi-chatd` is deliberately single-instance: Socket Mode splits deliveries across
+connections, so a second copy would answer some messages twice. The unit restarts on
+failure and is safe to leave running.
+
 ## Talking to the bot
 
 Two trigger tokens, one vocabulary. Slack forbids developer slash commands
 inside message threads, which is why the two forms differ.
+
+> **Phase 0 (today) answers mentions only.** The command forms below are the designed
+grammar; `/pi …` and `@pi /…` commands arrive with M4.
 
 | Where | Form | Example |
 |---|---|---|
@@ -72,11 +91,12 @@ and `@pi /help` print the current list.
 
 ## Layout
 
-```
-cmd/pi-chatd/          the daemon
+```text
+cmd/pi-chatd/          the daemon: wiring, flags, logging, signals
 internal/config/       configuration file loading and validation
-internal/bot/          platform-independent core (M3)
-internal/slack/        Slack adapter: Socket Mode, rendering, interactions (M3)
+internal/bot/          platform-independent core: threads, sessions, turns
+internal/slack/        Slack adapter: Socket Mode, Web API, rendering
+packaging/             systemd user unit
 slack/                 Slack app manifests — the app's configuration as code
 tools/gateway-probe/   nested module: pi-gateway seam smoke test
 ```
@@ -86,5 +106,7 @@ tools/gateway-probe/   nested module: pi-gateway seam smoke test
 ```bash
 make test            # unit tests
 make vet             # go vet
+make fmt             # gofmt
+make live-test       # one real turn through a running pi-gatewayd (spends a few tokens)
 make probe           # exercise the gateway seam against a running pi-gatewayd
 ```

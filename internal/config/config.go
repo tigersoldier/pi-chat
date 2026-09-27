@@ -101,6 +101,22 @@ type Log struct {
 	Format string `toml:"format"` // text | json
 }
 
+// ReadToken reads a token file. Tokens are stored one per file so they never
+// appear in the configuration, in shell history, or in a process listing.
+// Surrounding whitespace is tolerated because it is easy to add by accident
+// and impossible to see.
+func ReadToken(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read token %s: %w", path, err)
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", fmt.Errorf("token %s is empty", path)
+	}
+	return token, nil
+}
+
 // DefaultPath is the configuration file's location, honouring XDG_CONFIG_HOME.
 func DefaultPath() string {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {

@@ -1,0 +1,37 @@
+# pi-chat as a systemd user unit.
+#
+# Install:
+#   make install
+#   cp packaging/pi-chatd.service ~/.config/systemd/user/   # or: make install-unit
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pi-chatd
+#
+# Inspect:
+#   systemctl --user status pi-chatd
+#   journalctl --user -u pi-chatd -f
+#
+# pi-chatd talks to Slack over Socket Mode and to pi-gatewayd over a local
+# socket, so it needs no ports and no privileges.
+[Unit]
+Description=pi-chat chat bridge (Slack to pi-gatewayd)
+Documentation=https://github.com/tigersoldier/pi-chat
+# Ordering only: pi-chatd tolerates a gateway that is not up yet, and fails the
+# turn that needed it, so this is not a hard dependency.
+After=default.target pi-gatewayd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pi-chatd
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+# Turns are abandoned on shutdown; their sessions stay alive in pi-gatewayd.
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+# A user unit's PATH is minimal; pi-chatd itself needs none, but this keeps
+# `ExecStart=` resolvable if you prefer `pi-chatd` over the full path.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
