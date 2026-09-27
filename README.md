@@ -100,7 +100,7 @@ channel or DM *root* is ignored: roots are session-less, which is what keeps a b
 channel from turning every later message into a prompt. Plain text in a **channel thread**
 is a prompt only if that thread already has a session.
 
-State lives in SQLite at `paths.db_path` (created on first run, mode 0600 directory). It
+State lives in SQLite at `paths.db_path` (created on first run, inside a 0700 directory). It
 holds thread keys, session identities, cursors and handled event IDs — never
 transcripts, prompts, or answers.
 

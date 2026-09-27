@@ -135,7 +135,7 @@ func newTestMessage(eventID, text string) Message {
 		EventID:   eventID,
 		Thread:    Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"},
 		UserID:    "U1",
-		TeamID:    "T1",
+		Workspace: "T1",
 		Text:      text,
 		Mentioned: true,
 	}

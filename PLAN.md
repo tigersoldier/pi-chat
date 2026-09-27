@@ -223,6 +223,47 @@ envelope), and never mistakes a failure for a success.
 **Exit:** the slice runs against the real daemon and a real `pi`.
 **Depends on:** M0, M1, M2, M3.
 
+### M4 review findings — what they changed
+
+Four independent reviews (design gap, correctness, tests, structure) ran against the M4
+commit. They converged on the same two session-identity bugs, which is what made them
+worth fixing before M5 builds `/delete` on top of this base.
+
+**Fixed (each with a regression test):**
+
+| Finding | Why it mattered |
+|---|---|
+| `ensure` trusted a connection that was alive but **unbound** | After an external `gw_stop_session`/delete the daemon unbinds clients without failing the connection, so the next prompt created a **second session** — the exact defect DESIGN §3 documents, and what invariant 1 exists to prevent. It now checks the binding, not just the connection |
+| The 429 retry re-sent a **drained body** | An `http.Request` consumes its reader, so every retry posted no parameters, turning a rate limit into a failure |
+| `threadFor` could **overwrite a row** it failed to read, and two concurrent new-thread turns could clobber each other's session identity | A lost row means a second session plus an orphaned worktree the next sweep would delete. A failed read is now an error, and new rows are written through the thread under its lock |
+| The channel half of the allowlist refusal was **dead code** | A listed user in a disallowed channel was told to join the allowlist, and the journal recorded the wrong reason |
+| `deleted` was never written | DESIGN §4 invariant 3 had no implementation: the row kept pointing at a tombstoned session. `forgetSession` now marks the thread deleted, keeps the key, and leaves the working directory alone |
+| `/status` could **end a running turn early** | `get_state` also pokes gwclient's turn latch, which wakes `AwaitSettled`; the model is now read only between turns |
+| Replay frames could leak into the first turn after a re-dial | The turn marks itself prompted before prompting, and anything earlier is dropped as a previous turn's |
+| A failed session creation left its **project directory** behind | Only the next startup sweep would have found it |
+| `update` flushed outside its lock | Two writes could land out of order, leaving the database with an older snapshot than memory |
+| Dead code, two loaders for one row, `TeamID` vs `Workspace`, a hardcoded platform name, duplicated rune trimming | Structure findings; all removed or unified |
+| Docs claiming unbuilt features (`files:read`, `reactions:write`, the agent events, `setStatus`/`rename`/`Abort`) | Now marked phase 3 in both manifests, the tutorial and DESIGN |
+
+**Accepted, not fixed (with the reason):**
+
+- **`cmd/pi-chatd` has no tests** (0% coverage) and the startup order — open store, reset
+  warm markers, sweep, then socket — is verified only by running it. Worth a stub-`pi`
+  harness (the approach in DESIGN §13) so the socket and the wiring are testable without
+  a workspace.
+- **No concurrency test drives two turns through one thread.** `-race` covers the code
+  that runs, but nothing runs two goroutines against one thread; the lock discipline is
+  documented and reviewed, not exercised.
+- **Slack payload fixtures are invented, not recorded.** The shapes match the docs and the
+  interactions seen so far, but a captured `app_mention`/`block_actions` sample would lock
+  them to Slack rather than to our reading of it.
+- **`progress_ts` is written and never read.** Re-attaching to a half-written reply needs a
+  policy decision (a restarted process cannot resume a stream it never held), so the
+  column waits for phase 3; DESIGN §7 says so.
+- **The transport acks before `seen` is written.** Socket Mode demands an ack within three
+  seconds, so the claim cannot precede it; a crash in that window loses a message Slack
+  will not redeliver. DESIGN §7 records the trade-off.
+
 ### M5 — Phase 2
 
 - [ ] `@pi /delete` with button confirm → `DeleteSession` → worktree/branch cleanup → row

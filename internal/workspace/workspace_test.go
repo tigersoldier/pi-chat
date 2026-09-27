@@ -171,6 +171,24 @@ func TestSweepRemovesOnlyOrphansThatLookOurs(t *testing.T) {
 	}
 }
 
+func TestProvisionCreatesAMissingProjectsRoot(t *testing.T) {
+	// The first run on a fresh machine has no projects root yet, and the daemon
+	// must not need one created by hand before it can answer anything.
+	projects := filepath.Join(t.TempDir(), "not", "created", "yet")
+	p := New(Config{ProjectsRoot: projects}, discardLogger())
+
+	project, err := p.Provision("the first ever session")
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if _, err := os.Stat(project.Dir); err != nil {
+		t.Fatalf("the project directory was not created: %v", err)
+	}
+	if !strings.HasPrefix(project.Dir, projects+string(filepath.Separator)) {
+		t.Errorf("project dir %s is outside %s", project.Dir, projects)
+	}
+}
+
 func TestIsProjectName(t *testing.T) {
 	tests := []struct {
 		name string

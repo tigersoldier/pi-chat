@@ -9,6 +9,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -59,7 +60,7 @@ func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, v
 			ReposRoot:      cfg.Paths.ReposRoot,
 			InjectedPrompt: cfg.Behavior.InjectedPrompt,
 		}, log),
-		gw:      &connector{cfg: cfg, log: log},
+		gw:      &connector{cfg: cfg},
 		threads: make(map[string]*thread),
 	}
 }
@@ -89,26 +90,37 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	// somebody else's conversation must not start a session. A mention always
 	// starts one, and a DM thread needs neither, because there the conversation
 	// is already the address (DESIGN.md §5).
-	th, ours := b.tracked(m.Thread)
+	var th *thread
 	switch {
 	case m.Mentioned || m.Direct:
-		th = b.threadFor(m.Thread)
-	case ours:
-		// The thread has a session; plain text continues it.
+		created, err := b.threadFor(m.Thread)
+		if err != nil {
+			// Without the stored state a prompt could create a second session for
+			// a thread that already has one, so this is a refusal, not a risk to
+			// take.
+			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
+				Text: "I cannot read this thread's state right now, so I will not start anything: " + err.Error()})
+			return
+		}
+		th = created
 	default:
-		b.log.Debug("ignoring plain text in a thread that is not ours", "thread", m.Thread.Key())
-		return
+		ours, ok := b.tracked(m.Thread)
+		if !ok {
+			b.log.Debug("ignoring plain text in a thread that is not ours", "thread", m.Thread.Key())
+			return
+		}
+		th = ours
 	}
 
 	// `@pi /status` is a command, not a prompt: the vocabulary is resolved
 	// before anything reaches the agent (DESIGN.md §5).
 	if m.Mentioned && strings.HasPrefix(strings.TrimSpace(m.Text), "/") {
 		b.dispatch(ctx, Command{
-			Thread:  &m.Thread,
-			Channel: m.Thread.Channel,
-			UserID:  m.UserID,
-			TeamID:  m.TeamID,
-			Text:    strings.TrimSpace(m.Text),
+			Thread:    &m.Thread,
+			Channel:   m.Thread.Channel,
+			UserID:    m.UserID,
+			Workspace: m.Workspace,
+			Text:      strings.TrimSpace(m.Text),
 		})
 		return
 	}
@@ -267,15 +279,23 @@ func (b *Bot) closeIdle(ctx context.Context) {
 	if closed > 0 {
 		b.log.Info("closed idle thread connections", "count", closed, "window", window)
 	}
-	b.reportCap()
+	b.reportCap(ctx)
 }
 
-// reportCap warns when the warm set has reached the cap. Phase 1 does not
-// evict yet, so the count is the whole story; phase 2 adds the queue.
-func (b *Bot) reportCap() {
+// reportCap warns when the warm set has reached the cap. Phase 1 does not evict
+// yet, so the count is the whole story; phase 2 adds the queue.
+func (b *Bot) reportCap(ctx context.Context) {
+	// Counted from the persisted rows, which is the same source /pi status
+	// reads: a marker that failed to write must not make the two disagree about
+	// how close the cap is.
+	rows, err := b.store.Threads(ctx)
+	if err != nil {
+		b.log.Warn("cannot count the warm sessions", "error", err)
+		return
+	}
 	warm := 0
-	for _, th := range b.allThreads() {
-		if th.snapshot().State == store.StateWarm {
+	for _, row := range rows {
+		if row.State == store.StateWarm {
 			warm++
 		}
 	}
@@ -298,35 +318,37 @@ func (b *Bot) pruneEvents(ctx context.Context) {
 	}
 }
 
-// threadFor returns the thread's agent, loading its row from the database the
-// first time this process sees it and creating one when the thread is new.
-func (b *Bot) threadFor(t Thread) *thread {
-	key := t.Key()
+// threadFor returns the thread's agent, creating it when the thread is new.
+//
+// It fails when the thread's stored state cannot be read. Continuing with a
+// blank row would be worse than failing: the row holds the session identity, and
+// the next prompt would create a second session and orphan the first one's
+// working directory.
+func (b *Bot) threadFor(t Thread) (*thread, error) {
 	if th, ok := b.tracked(t); ok {
-		return th
+		return th, nil
 	}
-
-	// Database work happens outside the lock, so one slow write cannot block
-	// every other thread.
-	row, found := b.loadRow(key, t)
-	th := b.register(t, row)
-	if !found {
-		ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
-		defer cancel()
-		if err := b.store.PutThread(ctx, row); err != nil {
-			b.log.Error("cannot record a new thread", "thread", key, "error", err)
-		}
+	row, found, err := b.readRow(t.Key(), t)
+	if err != nil {
+		return nil, err
 	}
-	b.log.Debug("tracking a thread", "thread", key, "session", t.SessionName())
-	return th
+	th, created := b.register(t, row)
+	if created && !found {
+		// The new row is written through the thread, under rowMu, so it cannot
+		// overwrite session identity that a concurrent turn added in between.
+		th.update(func(*store.ThreadRow) {})
+		b.log.Debug("tracking a thread", "thread", th.key, "session", t.SessionName())
+	}
+	return th, nil
 }
 
 // tracked returns the thread's agent, loading its row if this process has not
 // seen the thread since it started. It creates nothing: a read-only command
 // must not write a row or open a session as a side effect.
 func (b *Bot) tracked(t Thread) (*thread, bool) {
+	key := t.Key()
 	b.mu.Lock()
-	th, ok := b.threads[t.Key()]
+	th, ok := b.threads[key]
 	b.mu.Unlock()
 	if ok {
 		return th, true
@@ -334,46 +356,47 @@ func (b *Bot) tracked(t Thread) (*thread, bool) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
-	row, found, err := b.store.Thread(ctx, t.Key())
+	row, found, err := b.store.Thread(ctx, key)
 	if err != nil {
-		b.log.Error("cannot read the thread state", "thread", t.Key(), "error", err)
+		b.log.Error("cannot read the thread state", "thread", key, "error", err)
 		return nil, false
 	}
 	if !found {
 		return nil, false
 	}
-	return b.register(t, row), true
+	th, _ = b.register(t, row)
+	return th, true
 }
 
 // register adds this process's agent for a row, or returns the one another
-// goroutine added first.
-func (b *Bot) register(t Thread, row store.ThreadRow) *thread {
+// goroutine added first. The flag reports whether this call created it.
+func (b *Bot) register(t Thread, row store.ThreadRow) (*thread, bool) {
 	key := t.Key()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if th, ok := b.threads[key]; ok {
-		return th
+		return th, false
 	}
 	th := &thread{key: key, t: t, b: b, log: b.log.With("thread", key), row: row}
 	b.threads[key] = th
-	return th
+	return th, true
 }
 
-// loadRow reads the thread's row, or builds the row a new thread starts with.
-func (b *Bot) loadRow(key string, t Thread) (store.ThreadRow, bool) {
+// readRow reads a thread's row, or builds the row a new thread starts with. A
+// failed read is an error rather than a blank row: writing a blank row over a
+// real one would lose the session binding.
+func (b *Bot) readRow(key string, t Thread) (store.ThreadRow, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 	row, found, err := b.store.Thread(ctx, key)
 	if err != nil {
-		// A thread without a row still works for this process; it will be
-		// written on the next change.
 		b.log.Error("cannot read the thread state", "thread", key, "error", err)
-		return newRow(key, t), false
+		return store.ThreadRow{}, false, fmt.Errorf("read the thread state: %w", err)
 	}
 	if found {
-		return row, true
+		return row, true, nil
 	}
-	return newRow(key, t), false
+	return newRow(key, t), false, nil
 }
 
 // newRow is the row of a thread that has not been used before: the key and the
@@ -431,7 +454,7 @@ func (b *Bot) claim(ctx context.Context, eventID string) bool {
 
 // startTurn builds a renderer and runs the turn in the background.
 func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
-	th.touch(ctx)
+	th.touch()
 	go func() {
 		r, err := b.plat.StartTurn(ctx, m)
 		if err != nil {
@@ -460,9 +483,11 @@ func (b *Bot) reply(ctx context.Context, n Notice) {
 // were. The reply names the fact, not the configuration: the list is the
 // owner's business.
 func (b *Bot) refuse(ctx context.Context, userID, channel string, thread *Thread, replyTo string) {
-	allowedUser := b.allowed(userID, channel)
+	// Whichever rule actually failed decides the text: "your workspace owner has
+	// to add you" is a useless thing to tell a listed user who happened to type
+	// in a channel that is not on the list.
 	reason, text := "user is not on the allowlist", deniedUserText
-	if allowedUser {
+	if slices.Contains(b.cfg.Slack.Access.AllowedUsers, userID) {
 		reason, text = "channel is not on the allowlist", deniedChannelText
 	}
 	b.log.Warn("refused a request from outside the allowlist",

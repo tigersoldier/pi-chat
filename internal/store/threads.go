@@ -170,18 +170,6 @@ func (s *Store) SetProgressTS(ctx context.Context, key, ts string) error {
 	return nil
 }
 
-// TouchThread records activity without changing anything else.
-func (s *Store) TouchThread(ctx context.Context, key string, at time.Time) error {
-	// Unused result, as in SetThreadCursor: the row exists on every path that
-	// calls this, and a missing one needs no error.
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE threads SET last_active = ? WHERE thread_key = ?`, at.Unix(), key)
-	if err != nil {
-		return fmt.Errorf("store: touch thread %s: %w", key, err)
-	}
-	return nil
-}
-
 // MarkThreadsCold clears the warm marker for every thread and reports how many
 // rows it changed.
 //

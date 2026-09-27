@@ -82,7 +82,7 @@ func TestCommandScope(t *testing.T) {
 
 // commandRequest builds the root or thread form of a command.
 func commandRequest(threadTS, text string) Command {
-	c := Command{EventID: "Ev-" + text, Channel: "C1", UserID: "U1", TeamID: "T1", Text: text}
+	c := Command{EventID: "Ev-" + text, Channel: "C1", UserID: "U1", Workspace: "T1", Text: text}
 	if threadTS != "" {
 		c.Thread = &Thread{Workspace: "T1", Channel: "C1", ThreadTS: threadTS}
 	}
@@ -235,7 +235,7 @@ func TestResumeSessionAdoptsTheChosenSession(t *testing.T) {
 	}}
 
 	b.HandleAction(context.Background(), Action{
-		EventID: "Ev-action", Channel: "C1", UserID: "U1", TeamID: "T1",
+		EventID: "Ev-action", Channel: "C1", UserID: "U1", Workspace: "T1",
 		ActionID: ActionResume, Value: "/sessions/theirs.jsonl", MessageTS: "1700000000.000900",
 	})
 
@@ -270,7 +270,7 @@ func TestResumeSessionRefusesAValueThatIsNotInTheCatalog(t *testing.T) {
 	b.gw = &fakeGateway{}
 
 	b.HandleAction(context.Background(), Action{
-		EventID: "Ev-action", Channel: "C1", UserID: "U1", TeamID: "T1",
+		EventID: "Ev-action", Channel: "C1", UserID: "U1", Workspace: "T1",
 		ActionID: ActionResume, Value: "/sessions/forged.jsonl",
 	})
 
@@ -405,6 +405,42 @@ func TestPiArgsWithoutApprovals(t *testing.T) {
 	project := workspaceProject(t, b, "fix the tests")
 	if args := b.piArgs(project); len(args) != 0 {
 		t.Errorf("piArgs = %v, want none", args)
+	}
+}
+
+func TestHandleActionRefusesOutsideTheAllowlist(t *testing.T) {
+	b, platform, _ := newTestBot(t)
+
+	b.HandleAction(context.Background(), Action{
+		EventID: "Ev1", Channel: "C1", UserID: "U2", Workspace: "T1",
+		ActionID: ActionResume, Value: "/sessions/a.jsonl",
+	})
+
+	waitFor(t, "the refusal", func() bool { return len(platform.postedNotices()) == 1 })
+	if !platform.postedNotices()[0].Ephemeral {
+		t.Error("a refusal should be visible only to the sender")
+	}
+	if opened := platform.openedThreads(); len(opened) != 0 {
+		t.Errorf("a refused button opened a thread: %v", opened)
+	}
+}
+
+func TestHandleActionIgnoresAnUnknownButton(t *testing.T) {
+	b, platform, _ := newTestBot(t)
+
+	b.HandleAction(context.Background(), Action{
+		EventID: "Ev1", Channel: "C1", UserID: "U1", Workspace: "T1",
+		ActionID: "not-a-button-this-build-knows", Value: "x",
+	})
+
+	// Nothing to send, nothing to open: an unknown button is old furniture from
+	// a previous build, and answering it would be noise.
+	time.Sleep(20 * time.Millisecond)
+	if n := len(platform.postedNotices()); n != 0 {
+		t.Errorf("posted %d notices for an unknown button", n)
+	}
+	if opened := platform.openedThreads(); len(opened) != 0 {
+		t.Errorf("an unknown button opened a thread: %v", opened)
 	}
 }
 

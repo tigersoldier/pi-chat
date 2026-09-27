@@ -232,8 +232,10 @@ commands inside message threads** and its slash-command payload carries no `thre
    with an ephemeral hint pointing at the thread form. A root invocation never creates
    or touches a session as a side effect.
 2. **Resolution order:** bot control command → agent command → prompt. Agent commands
-   are validated against `GetCommands()` (extensions, prompt templates, skills);
-   an unknown `/X` is forwarded to pi verbatim so pi's own error is authoritative.
+   are the ones pi reports through `GetCommands()` (extensions, prompt templates,
+   skills); they are **not** validated against that list before being forwarded, so
+   an unknown `/X` reaches pi verbatim and pi's own error is the authoritative one.
+   `GetCommands()` is used to *list* them in `@pi /help`.
 3. **Near-miss guard:** a message that is *exactly* a control name without its slash
    (`@pi status`) gets an ephemeral `did you mean @pi /status?` instead of burning a
    turn. Only the whole message counts: "delete the old branch" is a prompt, and
@@ -320,9 +322,7 @@ Constraints and behaviours:
 - **Status and title, two tiers:**
   - *Declared as an agent* (`slack/manifest-agent.yaml`, Slack's agent messaging
     experience): `agents.sessions.setStatus` takes real lifecycle values that map onto
-    our states exactly — `processing` while a turn runs (Slack shows a loading UX and a
-    stop button when we subscribe to `agent_session_stopped`, which we wire to `Abort`),
-    `suspended` while we wait for an approval, `active` when idle, `closed` on delete.
+    our states exactly — `processing` while a turn runs (Slack shows a loading UX), `suspended` while we wait for an approval, `active` when idle, `closed` on delete.
     Titles use `agents.sessions.rename`. Subscribing to `agent_session_stopped` (scope
     `chat:write`, which we already hold) is what makes the loading indicator
     **interactive** — without the subscription `setStatus` returns a
@@ -330,7 +330,9 @@ Constraints and behaviours:
     non-interactive spinner instead. Two details the adapter must honour: the event
     arrives with `streaming_message_ts`, the streams Slack has *already* stopped, so we
     must not stop them again; and the status does **not** change on its own when the user
-    presses stop, so we transition off `processing` ourselves. The scope is
+    presses stop, so we transition off `processing` ourselves. **Phase 3 work:** neither
+    `setStatus` nor `rename` nor the stop button's `Abort` is wired up yet — the scope and
+    the events are declared now so that adding them needs no reinstall. The scope is
     `chat:write`; declaring the app as
     an agent is what adds `assistant:write`, which covers suggested prompts and
     `app_context_changed`. Caveats: the workspace must have the agent feature enabled
@@ -400,8 +402,11 @@ Rules:
   open, so this is the only guard against a Slack retry producing a double turn. A
   failure to *write* the claim blocks the turn: running the prompt once, late, beats
   running it twice.
-- **`progress_ts` is persisted** so a bot restart can re-attach and keep updating the
-  same message instead of posting a duplicate.
+- **`progress_ts` is persisted** (with the reply's timestamp) so that a later phase
+  can recognize the message a restart left half-written. Nothing reads it back yet:
+  a restarted process cannot resume a stream it was not holding, so the next turn
+  writes a new message. The column is there so the recovery path is a change of
+  policy rather than a migration.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
 - **Phase 1 writes `threads` and `seen`.** `pending_ui` and `admissions` are created with
   the rest of the schema — one artifact, one migration — and are written from phase 2,
@@ -534,7 +539,9 @@ allowed_channels = []              # optional; empty = any channel the bot is in
 state_dir         = "~/.config/pi-gateway"
 admin_token_file  = "~/.config/pi-chat/gateway-admin.token"
 thread_token_file = "~/.config/pi-chat/gateway-thread.token"
-pi_args           = ["--approve"]
+# Passed to gw_new_session, on top of what pi-chat adds itself: the injected
+# prompt, and --approve when [behavior] approvals is "auto".
+pi_args           = []
 
 [paths]
 projects_root = "~/work"

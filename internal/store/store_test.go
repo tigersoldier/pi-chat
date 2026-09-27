@@ -119,9 +119,6 @@ func TestSetThreadStateAndCursor(t *testing.T) {
 	if err := s.SetProgressTS(ctx, row.ThreadKey, "1700000000.000300"); err != nil {
 		t.Fatalf("SetProgressTS: %v", err)
 	}
-	if err := s.TouchThread(ctx, row.ThreadKey, time.Unix(1_800_000_000, 0)); err != nil {
-		t.Fatalf("TouchThread: %v", err)
-	}
 
 	got, _, err := s.Thread(ctx, row.ThreadKey)
 	if err != nil {
@@ -133,8 +130,8 @@ func TestSetThreadStateAndCursor(t *testing.T) {
 	if got.ProgressTS != "1700000000.000300" {
 		t.Errorf("progress ts = %q", got.ProgressTS)
 	}
-	if !got.LastActive.Equal(time.Unix(1_800_000_000, 0).UTC()) {
-		t.Errorf("last_active = %v", got.LastActive)
+	if !got.LastActive.After(row.LastActive) {
+		t.Errorf("a state change should count as activity: %v", got.LastActive)
 	}
 	// The session identity must survive a state change.
 	if got.SessionPath != row.SessionPath || got.ProjectDir != row.ProjectDir {
@@ -239,6 +236,47 @@ func TestPruneEvents(t *testing.T) {
 	// The fresh event survives, so a late retry is still deduped.
 	if claim, err := s.ClaimEvent(ctx, "new"); err != nil || claim {
 		t.Errorf("the surviving event = (%v, %v), want (false, nil)", claim, err)
+	}
+}
+
+func TestDedupeAndCursorSurviveAReopen(t *testing.T) {
+	// The claim is the only guard against a platform retry running a prompt
+	// twice, and the cursor is what makes a restart resume instead of replaying,
+	// so both have to outlive the process that wrote them (DESIGN.md §7).
+	ctx := context.Background()
+	s, path := newStore(t)
+	row := sampleThread()
+	if err := s.PutThread(ctx, row); err != nil {
+		t.Fatalf("PutThread: %v", err)
+	}
+	if claimed, err := s.ClaimEvent(ctx, "Ev-reopen"); err != nil || !claimed {
+		t.Fatalf("ClaimEvent = (%v, %v), want (true, nil)", claimed, err)
+	}
+	if err := s.SetThreadCursor(ctx, row.ThreadKey, 99, "leaf-99"); err != nil {
+		t.Fatalf("SetThreadCursor: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	again, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = again.Close() })
+
+	if claimed, err := again.ClaimEvent(ctx, "Ev-reopen"); err != nil || claimed {
+		t.Fatalf("a claim did not survive the reopen: (%v, %v)", claimed, err)
+	}
+	got, found, err := again.Thread(ctx, row.ThreadKey)
+	if err != nil || !found {
+		t.Fatalf("the thread did not survive the reopen: found=%v err=%v", found, err)
+	}
+	if got.LastSeq != 99 || got.LeafID != "leaf-99" {
+		t.Errorf("the cursor did not survive the reopen: seq=%d leaf=%q", got.LastSeq, got.LeafID)
+	}
+	if got.SessionPath != row.SessionPath || got.ProgressTS != row.ProgressTS {
+		t.Errorf("the session identity did not survive the reopen: %+v", got)
 	}
 }
 

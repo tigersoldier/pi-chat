@@ -204,8 +204,8 @@ Reference for what you just applied. Nothing here needs action.
 | `groups:history` | read private-channel messages | the same, in a private channel |
 | `im:history` | read direct messages | DMs with the bot, including DM threads |
 | `mpim:history` | read group direct messages | a multi-person DM that includes the bot |
-| `files:read` | download files shared with the app | handing an attached image to the agent |
-| `reactions:write` | add emoji reactions | a 👀 receipt while the agent is working |
+| `files:read` | download files shared with the app | handing an attached image to the agent (**phase 3**; the scope is requested now so enabling it needs no reinstall) |
+| `reactions:write` | add emoji reactions | a 👀 receipt while the agent is working (**phase 3**) |
 | `assistant:write` | act as a Slack agent | **agent variant only** — `setTitle`, suggested prompts, agent context events |
 
 ### Bot events
@@ -254,7 +254,7 @@ What that buys pi-chat:
 | Capability | Instead of |
 |---|---|
 | `agents.sessions.setStatus` with real values — `processing` while a turn runs, `suspended` while waiting for your approval, `active` when idle, `closed` after a delete | no status at all, or a free-form string with a two-minute timeout |
-| a **stop button** while the agent works (via the `agent_session_stopped` event), which pi-chat wires to abort the turn | `/abort` typed by hand |
+| a **stop button** while the agent works (via the `agent_session_stopped` event), which a later phase wires to abort the turn | `/abort` typed by hand |
 | `agents.sessions.rename` titles, suggested prompts in the composer | untitled threads |
 
 Before choosing it, know the caveats:

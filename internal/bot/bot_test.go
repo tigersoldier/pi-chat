@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -105,6 +107,14 @@ func TestHandleMessageRefusesAnUnlistedChannel(t *testing.T) {
 	}
 	if platform.startedTurns() != 0 {
 		t.Error("a message from an unlisted channel reached the agent")
+	}
+	// The listed user must not be told to join the allowlist: the channel is
+	// what is not allowed, and the wrong explanation sends them to the wrong fix.
+	if text := notices[0].Text; !strings.Contains(text, "channel") {
+		t.Errorf("the refusal does not name the channel: %q", text)
+	}
+	if text := notices[0].Text; strings.Contains(text, "add you to my allowlist") {
+		t.Errorf("a listed user was told to join the allowlist: %q", text)
 	}
 }
 
@@ -225,6 +235,111 @@ func TestHandleMessageAnswersABareMention(t *testing.T) {
 	}
 	if row.SessionPath != "" {
 		t.Errorf("a greeting created a session: %q", row.SessionPath)
+	}
+}
+
+func TestThreadForRefusesAThreadItCannotRead(t *testing.T) {
+	// Carrying on with a blank row would be worse than failing: the row names the
+	// session, so a prompt on top of a failed read would create a second session
+	// and orphan the first one's working directory.
+	ctx := context.Background()
+	b, _, st := newTestBot(t)
+	key := "T1:C1:1700000000.000100"
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: key, WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "1700000000.000100",
+		SessionName: "slack-t1-c1-1700000000-000100", SessionPath: "/sessions/x.jsonl",
+		ProjectDir: "/work/2026-09-27-fix", Cwd: "/work/2026-09-27-fix", State: store.StateCold,
+	})
+	if err := st.Close(); err != nil {
+		t.Fatalf("close the store: %v", err)
+	}
+
+	if _, err := b.threadFor(Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}); err == nil {
+		t.Fatal("threadFor accepted a thread whose row could not be read")
+	}
+
+	// The row must still be intact afterwards: a failed read must not write.
+	reopened, err := store.Open(ctx, b.cfg.Paths.DBPath)
+	if err != nil {
+		t.Fatalf("reopen the store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	row, found, err := reopened.Thread(ctx, key)
+	if err != nil || !found {
+		t.Fatalf("the row is gone: found=%v err=%v", found, err)
+	}
+	if row.SessionPath != "/sessions/x.jsonl" || row.ProjectDir != "/work/2026-09-27-fix" {
+		t.Errorf("a failed read overwrote the row: %+v", row)
+	}
+}
+
+func TestSweepWorkspacesKeepsWhatThreadsOwn(t *testing.T) {
+	ctx := context.Background()
+	b, _, st := newTestBot(t)
+	mkdir := func(name string) string {
+		dir := filepath.Join(b.cfg.Paths.ProjectsRoot, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		return dir
+	}
+	owned := mkdir("2026-01-01-owned")
+	viaCwd := mkdir("2026-01-02-via-cwd")
+	orphan := mkdir("2026-01-03-orphan")
+
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: "T1:C1:1", WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "1",
+		ProjectDir: owned, Cwd: owned, State: store.StateCold,
+	})
+	// A row whose session was never created names only its cwd: the crash path.
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: "T1:C1:2", WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "2",
+		Cwd: viaCwd, State: store.StateCold,
+	})
+
+	removed, err := b.SweepWorkspaces(ctx)
+	if err != nil {
+		t.Fatalf("SweepWorkspaces: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != orphan {
+		t.Errorf("swept %v, want only the orphan", removed)
+	}
+	for _, dir := range []string{owned, viaCwd} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("a thread's directory was swept: %s", dir)
+		}
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("the orphan survived: %v", err)
+	}
+}
+
+func TestCloseIdleSkipsAThreadWithATurnInFlight(t *testing.T) {
+	// The sweep takes turnMu before it may close anything, so a held turnMu is
+	// what guarantees a running turn is never cut off by maintenance — including
+	// the state repair, which would otherwise mark a busy thread cold.
+	b, _, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: thread.Key(), WorkspaceID: "T1", ChannelID: "C1", ThreadTS: thread.ThreadTS,
+		SessionPath: "/sessions/x.jsonl", State: store.StateWarm,
+		LastActive: time.Now().Add(-time.Hour),
+	})
+	th, ok := b.tracked(thread)
+	if !ok {
+		t.Fatal("the seeded thread did not load")
+	}
+
+	th.turnMu.Lock()
+	defer th.turnMu.Unlock()
+	b.closeIdle(context.Background())
+
+	row, _, err := st.Thread(context.Background(), thread.Key())
+	if err != nil {
+		t.Fatalf("read the row: %v", err)
+	}
+	if row.State != store.StateWarm {
+		t.Errorf("state = %q: the sweep touched a thread with a turn in flight", row.State)
 	}
 }
 

@@ -30,7 +30,11 @@ const ActionResume = "resume"
 // Limits on what the bot lists, so an answer stays a message rather than a
 // dump.
 const (
-	resumeLimit  = 5
+	// resumeLimit is how many sessions /pi resume offers. It must not exceed the
+	// adapter's buttonLimit (internal/slack/blocks.go): the adapter caps the
+	// buttons it renders, so a longer list would silently lose its tail.
+	resumeLimit = 5
+	// commandLimit is how many of the session's own commands /help lists.
 	commandLimit = 20
 )
 
@@ -151,24 +155,24 @@ func (b *Bot) cmdResume(ctx context.Context, r request, _ string) error {
 // request is one inbound interaction after the allowlist, normalized across
 // the three entry points so the command and turn paths share one shape.
 type request struct {
-	thread  *Thread // nil, or without a timestamp, at a root
-	channel string
-	userID  string
-	teamID  string
-	replyTo string
-	text    string // the command as written, slash included
+	thread    *Thread // nil, or without a timestamp, at a root
+	channel   string
+	userID    string
+	workspace string
+	replyTo   string
+	text      string // the command as written, slash included
 }
 
 // dispatch resolves one command: a control command of ours, an agent command
 // of pi's, or text pi-chat does not recognize.
 func (b *Bot) dispatch(ctx context.Context, c Command) {
 	r := request{
-		thread:  c.Thread,
-		channel: c.Channel,
-		userID:  c.UserID,
-		teamID:  c.TeamID,
-		replyTo: c.ReplyTo,
-		text:    c.Text,
+		thread:    c.Thread,
+		channel:   c.Channel,
+		userID:    c.UserID,
+		workspace: c.Workspace,
+		replyTo:   c.ReplyTo,
+		text:      c.Text,
 	}
 	name, arg := splitCommand(c.Text)
 	if name == "" {
@@ -204,16 +208,24 @@ func (b *Bot) forward(ctx context.Context, r request) {
 		b.answer(ctx, r, rootCommandHint)
 		return
 	}
+	// A command must not fall back to a blank thread: the row that could not be
+	// read is what names the session, and starting one anyway is how a thread
+	// ends up with two.
+	th, err := b.threadFor(*r.thread)
+	if err != nil {
+		b.answer(ctx, r, "I cannot read this thread's state right now: "+err.Error())
+		return
+	}
 	// The text goes as written, slash and all: pi's own resolver decides
 	// whether it is a command, a template or a skill.
 	m := Message{
 		Thread:    *r.thread,
 		UserID:    r.userID,
-		TeamID:    r.teamID,
+		Workspace: r.workspace,
 		Text:      r.text,
 		Mentioned: true,
 	}
-	b.startTurn(ctx, b.threadFor(*r.thread), m)
+	b.startTurn(ctx, th, m)
 }
 
 // helpText answers /pi help and @pi /help. The two contexts list what is legal
@@ -302,14 +314,17 @@ func (b *Bot) statusThread(ctx context.Context, r request) error {
 		lines = append(lines, "state: cold (the next message reopens it)")
 	}
 	if client := th.live(); client != nil {
-		if state, err := client.GetState(ctx); err == nil {
+		// get_state is read only between turns: it also pokes the client's own
+		// turn latch, and gwclient wakes AwaitSettled when that latch says the
+		// turn stopped. Asking mid-turn could therefore end the turn early, and
+		// the answer would be whatever the previous turn left behind.
+		if client.TurnRunning() || th.busy() {
+			lines = append(lines, "a turn is running")
+		} else if state, err := client.GetState(ctx); err == nil {
 			lines = append(lines, fmt.Sprintf("model: %s/%s, thinking: %s",
 				state.Model.Provider, state.Model.ID, state.ThinkingLevel))
 		} else {
 			b.log.Debug("cannot read the session state", "thread", r.key(), "error", err)
-		}
-		if client.TurnRunning() {
-			lines = append(lines, "a turn is running")
 		}
 	}
 	lines = append(lines, "last active: "+humanSince(row.LastActive))
@@ -381,7 +396,7 @@ func (b *Bot) pickResumable(ctx context.Context, r request) error {
 
 // resumeSession adopts the session a /pi resume button named.
 func (b *Bot) resumeSession(ctx context.Context, a Action) {
-	r := request{channel: a.Channel, userID: a.UserID, teamID: a.TeamID, replyTo: a.ReplyTo}
+	r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo}
 	// The button's value travelled through the platform, so it comes back as
 	// input rather than as fact: it is checked against a fresh catalog read
 	// before anything is adopted.
@@ -411,7 +426,11 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		return
 	}
 
-	th := b.threadFor(thread)
+	th, err := b.threadFor(thread)
+	if err != nil {
+		b.answer(ctx, r, "I found that session but cannot record it: "+err.Error())
+		return
+	}
 	th.update(func(row *store.ThreadRow) {
 		row.SessionName, row.SessionPath, row.SessionID = chosen.Name, chosen.Path, chosen.ID
 		row.Cwd = chosen.Cwd

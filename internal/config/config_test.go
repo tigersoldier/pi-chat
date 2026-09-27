@@ -52,8 +52,9 @@ func TestLoadAppliesDefaultsForMissingKeys(t *testing.T) {
 	if cfg.Render.Mode != "stream" {
 		t.Errorf("render.mode = %q, want \"stream\"", cfg.Render.Mode)
 	}
-	if got, want := len(cfg.Gateway.PiArgs), 1; got != want || cfg.Gateway.PiArgs[0] != "--approve" {
-		t.Errorf("pi_args = %v, want [--approve]", cfg.Gateway.PiArgs)
+	if len(cfg.Gateway.PiArgs) != 0 {
+		// --approve comes from the approvals policy, not from this list.
+		t.Errorf("pi_args = %v, want empty by default", cfg.Gateway.PiArgs)
 	}
 	if len(cfg.Slack.Access.AllowedUsers) != 1 {
 		t.Errorf("allowed_users = %v, want one entry", cfg.Slack.Access.AllowedUsers)

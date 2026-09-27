@@ -141,7 +141,9 @@ func Defaults() *Config {
 			StateDir:        DefaultGatewayStateDir,
 			AdminTokenFile:  DefaultAdminTokenFile,
 			ThreadTokenFile: DefaultThreadTokenFile,
-			PiArgs:          []string{"--approve"},
+			// PiArgs starts empty: --approve is added by the approvals policy in
+			// [behavior], so a default here would duplicate it (and hard-code a
+			// policy into a list meant for the user's own arguments).
 		},
 		Paths: Paths{
 			ProjectsRoot: DefaultProjectsRoot,

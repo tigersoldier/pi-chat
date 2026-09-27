@@ -21,7 +21,7 @@ func TestParseMessageRootMentionStartsTheThread(t *testing.T) {
 	env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> hello there",` +
 		`"ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
 
-	message, ok := ParseMessage(env, botUser)
+	message, ok := parseMessage(env, botUser)
 	if !ok {
 		t.Fatal("a root mention should be answered")
 	}
@@ -32,7 +32,7 @@ func TestParseMessageRootMentionStartsTheThread(t *testing.T) {
 	if message.Text != "hello there" {
 		t.Fatalf("text = %q, want %q", message.Text, "hello there")
 	}
-	if message.UserID != "U1" || message.TeamID != "T1" || message.EventID != "Ev1" {
+	if message.UserID != "U1" || message.Workspace != "T1" || message.EventID != "Ev1" {
 		t.Fatalf("unexpected message: %+v", message)
 	}
 	if !message.Mentioned || message.Direct {
@@ -44,7 +44,7 @@ func TestParseMessageMentionInsideAThreadJoinsIt(t *testing.T) {
 	env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> again",` +
 		`"ts":"1721609700.000200","thread_ts":"1721609600.000100","channel":"C1"}`)
 
-	message, ok := ParseMessage(env, botUser)
+	message, ok := parseMessage(env, botUser)
 	if !ok {
 		t.Fatal("a mention in a thread should be answered")
 	}
@@ -61,7 +61,7 @@ func TestParseMessagePlainTextInAThread(t *testing.T) {
 	env := eventsAPI(`{"type":"message","user":"U1","text":"and another thing",` +
 		`"ts":"1721609800.000300","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
 
-	message, ok := ParseMessage(env, botUser)
+	message, ok := parseMessage(env, botUser)
 	if !ok {
 		t.Fatal("plain text in a channel thread should reach the core")
 	}
@@ -75,7 +75,7 @@ func TestParseMessagePlainTextInAThread(t *testing.T) {
 	// Somebody else's mention does not address the bot.
 	other := eventsAPI(`{"type":"message","user":"U1","text":"<@UOTHER> hi",` +
 		`"ts":"1721609800.000400","thread_ts":"1721609600.000100","channel":"C1"}`)
-	message, ok = ParseMessage(other, botUser)
+	message, ok = parseMessage(other, botUser)
 	if !ok {
 		t.Fatal("a message in a thread should still reach the core")
 	}
@@ -92,7 +92,7 @@ func TestParseMessageDirectMessages(t *testing.T) {
 		env := eventsAPI(`{"type":"message","user":"U1","text":"carry on",` +
 			`"ts":"1721609900.000400","thread_ts":"1721609600.000100","channel":"D1","channel_type":"im"}`)
 
-		message, ok := ParseMessage(env, botUser)
+		message, ok := parseMessage(env, botUser)
 		if !ok {
 			t.Fatal("plain text in a DM thread should reach the core without a mention")
 		}
@@ -107,7 +107,7 @@ func TestParseMessageDirectMessages(t *testing.T) {
 		env := eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> hello",` +
 			`"ts":"1721609950.000500","channel":"D1","channel_type":"im"}`)
 
-		message, ok := ParseMessage(env, botUser)
+		message, ok := parseMessage(env, botUser)
 		if !ok {
 			t.Fatal("a mention in a DM root should start a session")
 		}
@@ -139,7 +139,7 @@ func TestParseMessageRejectsWhatIsNotAddressedToTheBot(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if message, ok := ParseMessage(test.env, botUser); ok {
+			if message, ok := parseMessage(test.env, botUser); ok {
 				t.Fatalf("should not have been answered: %+v", message)
 			}
 		})
@@ -150,7 +150,7 @@ func TestParseMessageCountsFiles(t *testing.T) {
 	env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> look",` +
 		`"ts":"1","channel":"C1","files":[{"id":"F1"},{"id":"F2"}]}`)
 
-	message, ok := ParseMessage(env, botUser)
+	message, ok := parseMessage(env, botUser)
 	if !ok {
 		t.Fatal("a mention with files should still parse")
 	}
@@ -159,7 +159,7 @@ func TestParseMessageCountsFiles(t *testing.T) {
 	}
 }
 
-func TestParseCommand(t *testing.T) {
+func TestParseCommandEnvelope(t *testing.T) {
 	env := Envelope{
 		EnvelopeID: "e9",
 		Type:       "slash_commands",
@@ -167,7 +167,7 @@ func TestParseCommand(t *testing.T) {
 			`"user_id":"U1","command":"/pi","text":" status ","response_url":"https://hooks.example/1"}`),
 	}
 
-	command, ok := ParseCommand(env)
+	command, ok := parseCommand(env)
 	if !ok {
 		t.Fatal("a slash command should parse")
 	}
@@ -181,7 +181,7 @@ func TestParseCommand(t *testing.T) {
 	if command.Thread != nil {
 		t.Errorf("a root command got a thread: %+v", command.Thread)
 	}
-	if command.Channel != "C1" || command.UserID != "U1" || command.TeamID != "T1" {
+	if command.Channel != "C1" || command.UserID != "U1" || command.Workspace != "T1" {
 		t.Errorf("unexpected command: %+v", command)
 	}
 	if command.ReplyTo != "https://hooks.example/1" {
@@ -206,14 +206,14 @@ func TestParseCommandRejectsOtherEnvelopes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if command, ok := ParseCommand(test.env); ok {
+			if command, ok := parseCommand(test.env); ok {
 				t.Fatalf("should not have parsed: %+v", command)
 			}
 		})
 	}
 }
 
-func TestParseAction(t *testing.T) {
+func TestParseActionEnvelope(t *testing.T) {
 	t.Run("a button in a thread", func(t *testing.T) {
 		env := Envelope{
 			EnvelopeID: "e10",
@@ -224,7 +224,7 @@ func TestParseAction(t *testing.T) {
 				`"actions":[{"action_id":"resume","value":"/sessions/a.jsonl"}]}`),
 		}
 
-		action, ok := ParseAction(env)
+		action, ok := parseAction(env)
 		if !ok {
 			t.Fatal("a block_actions payload should parse")
 		}
@@ -237,7 +237,7 @@ func TestParseAction(t *testing.T) {
 		if action.MessageTS != "1721609600.000200" {
 			t.Errorf("message ts = %q", action.MessageTS)
 		}
-		if action.Channel != "C1" || action.UserID != "U1" || action.TeamID != "T1" {
+		if action.Channel != "C1" || action.UserID != "U1" || action.Workspace != "T1" {
 			t.Errorf("unexpected action: %+v", action)
 		}
 	})
@@ -253,7 +253,7 @@ func TestParseAction(t *testing.T) {
 				`"actions":[{"action_id":"resume","value":"/sessions/a.jsonl"}]}`),
 		}
 
-		action, ok := ParseAction(env)
+		action, ok := parseAction(env)
 		if !ok {
 			t.Fatal("a root button should parse")
 		}
@@ -275,7 +275,7 @@ func TestParseActionRejectsOtherPayloads(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if action, ok := ParseAction(test.env); ok {
+			if action, ok := parseAction(test.env); ok {
 				t.Fatalf("should not have parsed: %+v", action)
 			}
 		})

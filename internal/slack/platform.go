@@ -53,7 +53,7 @@ func (p *Platform) StartTurn(_ context.Context, m bot.Message) (bot.Renderer, er
 		channel:       m.Thread.Channel,
 		threadTS:      m.Thread.ThreadTS,
 		recipientUser: m.UserID,
-		recipientTeam: m.TeamID,
+		recipientTeam: m.Workspace,
 		wantStream:    p.cfg.Render.Mode == "stream",
 	}, nil
 }
@@ -267,13 +267,7 @@ func (r *renderer) patch(ctx context.Context) error {
 func chunk(s string, n int) []string {
 	var pieces []string
 	for len(s) > n {
-		cut := n
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		if cut == 0 {
-			cut = n
-		}
+		cut := cutAtRune(s, n)
 		pieces = append(pieces, s[:cut])
 		s = s[cut:]
 	}
@@ -288,9 +282,22 @@ func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	cut := max
+	return s[:cutAtRune(s, max)] + "\n\n… _(truncated)_"
+}
+
+// cutAtRune returns the largest cut at or below n that does not split a rune.
+// When there is no boundary to find — the first n bytes are one long character —
+// it cuts at n anyway: something has to be sent, and an empty chunk is worse.
+func cutAtRune(s string, n int) int {
+	if n >= len(s) {
+		return len(s)
+	}
+	cut := n
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + "\n\n… _(truncated)_"
+	if cut == 0 {
+		return n
+	}
+	return cut
 }

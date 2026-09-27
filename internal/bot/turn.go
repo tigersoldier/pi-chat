@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
@@ -47,6 +48,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	stopFlush := th.flush(ctx, st, r)
 	defer stopFlush()
 
+	// Only now do the session's events belong to this turn, and only now may the
+	// flusher render them.
+	st.prompted.Store(true)
 	if _, err := client.Prompt(ctx, trimPrompt(m.Text)); err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
@@ -58,7 +62,12 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	}
 
 	// The turn is over, wherever it ended: remember how far this connection
-	// got, so reopening the thread resumes here instead of replaying it.
+	// got, so reopening the thread resumes here instead of replaying it. A
+	// deleted session has nothing left to resume, so it is handled first.
+	if st.sessionDeleted() {
+		th.forgetSession()
+		return fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
+	}
 	th.saveCursor(ctx, client)
 
 	final, err := client.GetLastAssistantText(ctx)
@@ -78,7 +87,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if err := r.Finish(ctx, final); err != nil {
 		return fmt.Errorf("finish the reply: %w", err)
 	}
-	th.touch(ctx)
+	th.touch()
 	return nil
 }
 
@@ -93,6 +102,15 @@ type turnState struct {
 	pending strings.Builder // text not yet rendered
 	all     strings.Builder // everything produced so far
 	work    bool
+
+	// prompted is set once this turn has issued its prompt. Until then the
+	// stream belongs to something else: a resumed connection replays from the
+	// saved cursor, and a long replay can still be arriving while the turn is
+	// being set up. Rendering those frames would show a previous answer as this
+	// turn's work.
+	prompted atomic.Bool
+	// deleted records that the session was deleted under this turn.
+	deleted atomic.Bool
 
 	workOnce sync.Once
 	doneOnce sync.Once
@@ -148,6 +166,10 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	case "gw_session_state":
 		state, err := ev.SessionState()
 		if err == nil && state.State == protocol.SessionStateDeleted {
+			// The session file is gone: the thread has to stop pointing at it
+			// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
+			// because the read goroutine must not write to the database.
+			s.deleted.Store(true)
 			s.markDone()
 		}
 
@@ -205,6 +227,9 @@ func (s *turnState) markWork() {
 func (s *turnState) markDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
+
+// sessionDeleted reports that the session was deleted while this turn ran.
+func (s *turnState) sessionDeleted() bool { return s.deleted.Load() }
 
 func (s *turnState) sawWork() bool {
 	s.mu.Lock()
@@ -278,6 +303,13 @@ func (th *thread) onEvent(ev gwclient.Event) {
 		// finished. A resumed connection replays here, and replay is
 		// deliberately dropped — the thread shows live turns, not history.
 		th.log.Debug("gateway event outside a turn", "type", ev.Type)
+		return
+	}
+	if !cur.prompted.Load() {
+		// The turn exists but has not prompted yet, so the stream still belongs
+		// to a previous turn — a long replay can outlast the dial. Rendering it
+		// would present an old answer as this turn's work.
+		th.log.Debug("gateway event before the prompt; dropping it", "type", ev.Type)
 		return
 	}
 	th.log.Debug("gateway event", "type", ev.Type)

@@ -3,7 +3,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -36,10 +35,11 @@ type gateway interface {
 // It dials with the thread token, not the admin one — reading the catalog
 // needs only `observe`, and it deliberately issues nothing that would bind a
 // session, because an extra attached client is what makes a session
-// unevictable (DESIGN.md §8, §10).
+// unevictable (DESIGN.md §8, §10). Failures are returned for the caller to log;
+// a status message that cannot say "unreachable" is not much of a status
+// message, so Status reports them in its string instead.
 type connector struct {
 	cfg *config.Config
-	log *slog.Logger
 }
 
 // connect opens one session-less connection; the caller closes it.

@@ -56,21 +56,24 @@ func IsCode(err error, code string) bool {
 // call posts one Web API method and decodes the response into out. A nil out
 // discards the response body beyond its status.
 func (a *API) call(ctx context.Context, method string, params map[string]any, out any) error {
-	contentType := "application/json; charset=utf-8"
-	var body io.Reader = strings.NewReader("")
+	// The request body is kept as bytes rather than as a reader: an http.Request
+	// consumes its body, so a retry built on the same reader would send no
+	// parameters at all — which is exactly how the rate-limit retry used to fail.
+	contentType := "application/x-www-form-urlencoded"
+	var raw []byte
 	if params != nil {
-		raw, err := json.Marshal(params)
+		encoded, err := json.Marshal(params)
 		if err != nil {
 			return fmt.Errorf("slack %s: encode request: %w", method, err)
 		}
-		body = bytes.NewReader(raw)
-	} else {
-		// Methods that take no arguments are documented as form requests; an
-		// empty form body is what the reference curl invocations send.
-		contentType = "application/x-www-form-urlencoded"
+		raw, contentType = encoded, "application/json; charset=utf-8"
 	}
 
 	for attempt := 0; ; attempt++ {
+		var body io.Reader = strings.NewReader("")
+		if raw != nil {
+			body = bytes.NewReader(raw)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, APIBase+method, body)
 		if err != nil {
 			return fmt.Errorf("slack %s: %w", method, err)
@@ -82,7 +85,7 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 		if err != nil {
 			return fmt.Errorf("slack %s: %w", method, err)
 		}
-		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if readErr != nil {
 			return fmt.Errorf("slack %s: read response: %w", method, readErr)
@@ -105,7 +108,7 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 			OK    bool   `json:"ok"`
 			Error string `json:"error"`
 		}
-		if err := json.Unmarshal(raw, &status); err != nil {
+		if err := json.Unmarshal(respBody, &status); err != nil {
 			return fmt.Errorf("slack %s: HTTP %d: %w", method, resp.StatusCode, err)
 		}
 		if !status.OK {
@@ -117,7 +120,7 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 		if out == nil {
 			return nil
 		}
-		if err := json.Unmarshal(raw, out); err != nil {
+		if err := json.Unmarshal(respBody, out); err != nil {
 			return fmt.Errorf("slack %s: decode response: %w", method, err)
 		}
 		return nil

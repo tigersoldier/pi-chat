@@ -109,9 +109,9 @@ func newStubAPI(t *testing.T, stub *stubSlack) *API {
 // testMessage is the inbound message a renderer needs: a channel thread.
 func testMessage() bot.Message {
 	return bot.Message{
-		Thread: bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"},
-		UserID: "U1",
-		TeamID: "T1",
+		Thread:    bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"},
+		UserID:    "U1",
+		Workspace: "T1",
 	}
 }
 
@@ -456,8 +456,18 @@ func TestRateLimitedRequestIsRetried(t *testing.T) {
 	if ts == "" {
 		t.Fatal("no timestamp returned")
 	}
-	if got := len(stub.recorded()); got != 2 {
-		t.Fatalf("%d requests, want a retry after the 429", got)
+	calls := stub.recorded()
+	if len(calls) != 2 {
+		t.Fatalf("%d requests, want a retry after the 429", len(calls))
+	}
+	// The retry must carry the request again: a reused reader would have been
+	// drained by the first attempt, so the second request would arrive with no
+	// parameters at all — a 429 turned into an invalid_arguments failure.
+	if got := calls[1].params["channel"]; got != "C1" {
+		t.Errorf("the retried request lost its parameters: %#v", calls[1].params)
+	}
+	if got := calls[1].params["text"]; got != "hi" {
+		t.Errorf("the retried request lost its text: %#v", calls[1].params)
 	}
 }
 

@@ -56,9 +56,9 @@ oauth_config:
       - groups:history
       - im:history
       - mpim:history
-      - assistant:write      # setTitle, suggested prompts, agent context events
-      - files:read
-      - reactions:write
+      - assistant:write      # setTitle, prompts, agent context (phase 3)
+      - files:read           # phase 3: attachments
+      - reactions:write      # phase 3: a 👀 receipt while the agent works
 
 settings:
   event_subscriptions:
@@ -69,6 +69,9 @@ settings:
       - message.im
       - message.mpim
       - app_home_opened      # how a DM open is detected in the agent experience
+      # Phase 3: no agent event below is handled yet. They are declared now
+      # because subscribing is what makes Slack's loading indicator
+      # interactive, and a scope or event change forces a reinstall.
       - app_context_changed  # the user edited the agent's context
       - agent_session_stopped  # the user pressed stop while we were working
       - agent_session_title_changed  # the user renamed a session; optional

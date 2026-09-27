@@ -67,8 +67,8 @@ oauth_config:
       - groups:history      # plain text in private channels
       - im:history          # direct messages
       - mpim:history        # group direct messages
-      - files:read          # download attachments sent to the agent
-      - reactions:write     # a 👀 receipt while the agent works
+      - files:read          # download attachments sent to the agent (phase 3)
+      - reactions:write     # a 👀 receipt while the agent works (phase 3)
 
 settings:
   event_subscriptions:

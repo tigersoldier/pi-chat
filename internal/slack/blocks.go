@@ -9,8 +9,10 @@ import (
 // become Slack's JSON.
 type block map[string]any
 
-// buttonLimit is Slack's cap on the elements of one actions block, which is
-// also the number of sessions /pi resume offers.
+// buttonLimit is Slack's cap on the elements of one actions block, and therefore
+// the number of sessions /pi resume may offer (bot.resumeLimit). The two must not
+// drift: the adapter drops the buttons past its cap, so a longer list would lose
+// its tail without an error.
 const buttonLimit = 5
 
 // blocksFor renders a notice's buttons, or nothing when it has none: an empty

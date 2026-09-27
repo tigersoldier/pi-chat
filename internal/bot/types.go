@@ -5,6 +5,12 @@ import (
 	"strings"
 )
 
+// platformName is the platform this build speaks. It names the sessions
+// pi-chat creates and tags its connections with; it is the core's only
+// Slack-specific value, and a second adapter moves it into configuration
+// (DESIGN.md §12).
+const platformName = "slack"
+
 // Thread identifies one conversation. A session is always thread-scoped, so a
 // thread is also a session's identity (DESIGN.md §4, §7).
 type Thread struct {
@@ -23,7 +29,7 @@ func (t Thread) Key() string {
 // (DESIGN.md §4): the same thread always maps to the same session, so a lost
 // database can be rebuilt by scanning the catalog.
 func (t Thread) SessionName() string {
-	return "slack-" + slugName(t.Workspace) + "-" + slugName(t.Channel) + "-" + slugName(t.ThreadTS)
+	return platformName + "-" + slugName(t.Workspace) + "-" + slugName(t.Channel) + "-" + slugName(t.ThreadTS)
 }
 
 // slugName reduces a platform identifier to the alphabet session names are
@@ -51,9 +57,11 @@ type Message struct {
 	EventID string // platform event ID, used to drop redeliveries
 	Thread  Thread
 	UserID  string // the human who sent it
-	TeamID  string // workspace ID, needed when streaming to a channel
-	Text    string // the prompt, with the bot's own mention removed
-	Files   int    // attachments
+	// Workspace is the workspace (Slack team) ID. It is the same identifier
+	// Thread.Workspace carries, and streaming to a channel needs it.
+	Workspace string
+	Text      string // the prompt, with the bot's own mention removed
+	Files     int    // attachments
 
 	// Mentioned records that the sender addressed the bot by name. It is what
 	// separates `@pi status` (which earns a "did you mean @pi /status?") from
@@ -70,11 +78,11 @@ type Message struct {
 // `@pi /<command>` inside a thread (DESIGN.md §5). A root command has no
 // Thread, and is therefore session-less.
 type Command struct {
-	EventID string
-	Channel string
-	Thread  *Thread // nil at a channel or DM root
-	UserID  string
-	TeamID  string
+	EventID   string
+	Channel   string
+	Thread    *Thread // nil at a channel or DM root
+	UserID    string
+	Workspace string
 
 	// Text is the command as written, slash included: "/status", "/skill:x".
 	// Adapters normalize their platform's shape into this one form — Slack's
@@ -90,13 +98,13 @@ type Command struct {
 
 // Action is one press of a button the bot posted.
 type Action struct {
-	EventID  string
-	Channel  string
-	Thread   *Thread
-	UserID   string
-	TeamID   string
-	ActionID string // which button, as the core named it
-	Value    string // the button's payload, which comes back through the platform
+	EventID   string
+	Channel   string
+	Thread    *Thread
+	UserID    string
+	Workspace string
+	ActionID  string // which button, as the core named it
+	Value     string // the button's payload, which comes back through the platform
 	// MessageTS is the message the button was attached to, so the bot can
 	// replace it instead of leaving a stale picker behind.
 	MessageTS string

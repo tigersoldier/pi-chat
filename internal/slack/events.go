@@ -7,7 +7,7 @@ import (
 	"github.com/tigersoldier/pi-chat/internal/bot"
 )
 
-// ParseMessage turns one Socket Mode event envelope into a core message. It
+// parseMessage turns one Socket Mode event envelope into a core message. It
 // reports false for everything pi-chat does not treat as a message: other
 // event types, the bot's own posts, edits and joins, and messages that do not
 // address the bot at all.
@@ -23,7 +23,7 @@ import (
 // A bare message in a channel or DM *root* is not a prompt: roots are
 // session-less by design (DESIGN.md §4), which is what keeps `@pi hello` in a
 // channel from making every later message in it a prompt.
-func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
+func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	if env.Type != "events_api" {
 		return bot.Message{}, false
 	}
@@ -92,7 +92,7 @@ func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 			ThreadTS:  threadTS,
 		},
 		UserID:    event.User,
-		TeamID:    callback.TeamID,
+		Workspace: callback.TeamID,
 		Text:      strings.TrimSpace(text),
 		Mentioned: mentioned,
 		Direct:    direct,
@@ -100,12 +100,12 @@ func ParseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	}, true
 }
 
-// ParseCommand turns a Socket Mode slash-command envelope into a core command.
+// parseCommand turns a Socket Mode slash-command envelope into a core command.
 //
 // The two quirks of this payload shape are why the core takes a normalized
 // form: it carries no thread timestamp (so a root command is necessarily
 // session-less) and its text omits the slash the user typed.
-func ParseCommand(env Envelope) (bot.Command, bool) {
+func parseCommand(env Envelope) (bot.Command, bool) {
 	if env.Type != "slash_commands" {
 		return bot.Command{}, false
 	}
@@ -127,18 +127,18 @@ func ParseCommand(env Envelope) (bot.Command, bool) {
 		// thing to dedupe on. Slack only redelivers an envelope it did not see
 		// acknowledged, which is a narrower guarantee than event_id — and the
 		// widest one this payload shape offers.
-		EventID: env.EnvelopeID,
-		Channel: payload.ChannelID,
-		UserID:  payload.UserID,
-		TeamID:  payload.TeamID,
-		Text:    "/" + strings.TrimSpace(payload.Text),
-		ReplyTo: payload.ResponseURL,
+		EventID:   env.EnvelopeID,
+		Channel:   payload.ChannelID,
+		UserID:    payload.UserID,
+		Workspace: payload.TeamID,
+		Text:      "/" + strings.TrimSpace(payload.Text),
+		ReplyTo:   payload.ResponseURL,
 	}, true
 }
 
-// ParseAction turns a Socket Mode interactive envelope (a button press) into a
+// parseAction turns a Socket Mode interactive envelope (a button press) into a
 // core action.
-func ParseAction(env Envelope) (bot.Action, bool) {
+func parseAction(env Envelope) (bot.Action, bool) {
 	if env.Type != "interactive" {
 		return bot.Action{}, false
 	}
@@ -189,7 +189,7 @@ func ParseAction(env Envelope) (bot.Action, bool) {
 		Channel:   payload.Channel.ID,
 		Thread:    thread,
 		UserID:    payload.User.ID,
-		TeamID:    payload.Team.ID,
+		Workspace: payload.Team.ID,
 		ActionID:  payload.Actions[0].ActionID,
 		Value:     payload.Actions[0].Value,
 		MessageTS: payload.Message.TS,

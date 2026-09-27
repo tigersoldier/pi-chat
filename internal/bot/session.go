@@ -59,6 +59,14 @@ type thread struct {
 	cur atomic.Pointer[turnState]
 }
 
+// errSessionGone reports that the session this thread owns is not in the
+// gateway any more: it was deleted outside pi-chat (pilish, another client, the
+// operator). The thread keeps its key and starts a new session when the user
+// asks again (DESIGN.md §4 invariant 3).
+var errSessionGone = errors.New("the session is gone")
+
+// isGone reports whether the gateway answered `unknown_session`.
+
 // snapshot returns a copy of the thread's durable row.
 func (th *thread) snapshot() store.ThreadRow {
 	th.rowMu.Lock()
@@ -67,26 +75,28 @@ func (th *thread) snapshot() store.ThreadRow {
 }
 
 // update applies fn to the row, keeps the in-memory copy in step, and writes
-// it back. A write failure is logged rather than returned: the database is
-// how the bot remembers, but a thread must keep working when it hiccups, and
-// the row is rewritten on the next change.
+// it back. A write failure is logged rather than returned: the database is how
+// the bot remembers, but a thread must keep working when it hiccups, and the
+// row is rewritten on the next change.
+//
+// The write happens under rowMu. Releasing the lock first would let two updates
+// be flushed out of order, leaving the database with an older snapshot than
+// memory (a warm marker landing after a close, for instance).
 func (th *thread) update(fn func(*store.ThreadRow)) {
 	th.rowMu.Lock()
-	row := th.row
-	fn(&row)
-	th.row = row
-	th.rowMu.Unlock()
+	defer th.rowMu.Unlock()
+	fn(&th.row)
 
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
-	if err := th.b.store.PutThread(ctx, row); err != nil {
+	if err := th.b.store.PutThread(ctx, th.row); err != nil {
 		th.log.Error("cannot record the thread state", "error", err)
 	}
 }
 
 // touch records that the thread was active now, which is what keeps the idle
 // sweep away from it.
-func (th *thread) touch(ctx context.Context) {
+func (th *thread) touch() {
 	now := time.Now()
 	th.update(func(row *store.ThreadRow) { row.LastActive = now })
 }
@@ -102,27 +112,80 @@ func (th *thread) live() *gwclient.Client {
 	return th.client
 }
 
-// busy reports whether a turn is running. It is a hint for the maintenance
-// loop: turnMu is what actually guarantees a connection is not closed mid-turn.
+// busy reports whether a turn is running in this process. It is the signal the
+// status command reads before touching the client: see statusThread.
 func (th *thread) busy() bool { return th.cur.Load() != nil }
+
+// bound reports whether a connection is still attached to the session this
+// thread owns. gwclient keeps Err() nil when the daemon unbinds a client, so
+// the binding itself is what has to be checked.
+func (th *thread) bound(client *gwclient.Client) bool {
+	session := client.Session()
+	path := th.snapshot().SessionPath
+	return session != nil && (path == "" || session.Path == path)
+}
+
+// isGone reports whether the gateway answered `unknown_session`: the session
+// the thread pointed at is not there any more.
+func isGone(err error) bool {
+	var response *gwclient.ResponseError
+	return errors.As(err, &response) && response.Code == protocol.CodeUnknownSession
+}
+
+// forgetSession records that the thread's session is gone and releases the
+// connection that was bound to it.
+func (th *thread) forgetSession() {
+	th.connMu.Lock()
+	client := th.client
+	th.client = nil
+	th.connMu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
+	th.forgetSessionLocked()
+}
+
+// forgetSessionLocked records that the session is gone. The caller holds connMu
+// and has already cleared th.client.
+//
+// The key stays reserved and the working directory is left alone — the session
+// file is what was deleted, and anything the agent wrote is still on disk — but
+// the thread stops owning a session, so the next message starts a fresh one
+// deliberately instead of re-attaching a tombstone.
+func (th *thread) forgetSessionLocked() {
+	th.update(func(row *store.ThreadRow) {
+		row.State = store.StateDeleted
+		row.SessionName, row.SessionPath, row.SessionID = "", "", ""
+		row.LastSeq, row.LeafID, row.ProgressTS = 0, "", ""
+	})
+	th.log.Warn("the session was deleted outside pi-chat", "thread", th.key)
+}
 
 // ensure returns a connection bound to the thread's session, creating the
 // session on first use, re-dialing after an idle close, and replacing a
-// connection that died. prompt seeds the project directory's name when a
-// session has to be created.
+// connection that died or lost its binding. prompt seeds the project
+// directory's name when a session has to be created.
 //
-// Switching (not assuming) is invariant 1 in DESIGN.md §4: a connection that
-// silently lost its binding would otherwise make the next prompt create a
-// second session.
+// Attaching rather than assuming is invariant 1 in DESIGN.md §4. The subtle
+// half of that is the connection that is alive but unbound: the daemon unbinds
+// clients when a session is stopped or deleted, and gwclient reports that by
+// clearing Session() rather than by failing the connection, so Err() alone
+// would let the next prompt create a second session — the exact defect §3
+// documents.
 func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, error) {
 	th.connMu.Lock()
 	defer th.connMu.Unlock()
 
 	if th.client != nil {
-		if err := th.client.Err(); err == nil {
+		switch {
+		case th.client.Err() != nil:
+			th.log.Warn("the gateway connection is gone; opening another", "error", th.client.Err())
+		case !th.bound(th.client):
+			th.log.Warn("the gateway connection lost its binding; re-attaching",
+				"session", th.snapshot().SessionName)
+		default:
 			return th.client, nil
 		}
-		th.log.Warn("the gateway connection is gone; opening another", "error", th.client.Err())
 		_ = th.client.Close()
 		th.client = nil
 	}
@@ -139,6 +202,10 @@ func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, 
 	path := th.snapshot().SessionPath
 	if _, err := client.SwitchSession(ctx, path); err != nil {
 		_ = client.Close()
+		if isGone(err) {
+			th.forgetSessionLocked()
+			return nil, fmt.Errorf("%w: %s", errSessionGone, path)
+		}
 		return nil, fmt.Errorf("bind session %s: %w", path, err)
 	}
 	th.client = client
@@ -160,6 +227,21 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 	if err != nil {
 		return err
 	}
+	// The directory has no row yet, so only the next startup sweep would find
+	// it: a failure below must not leave it behind. Cleanup is the same
+	// worktree-aware path /delete uses, so nothing but an empty fresh directory
+	// can go.
+	created := false
+	defer func() {
+		if created {
+			return
+		}
+		if _, err := th.b.work.Cleanup(context.WithoutCancel(ctx), project.Dir); err != nil {
+			th.log.Warn("cannot clean up the project directory of a failed session",
+				"dir", project.Dir, "error", err)
+		}
+	}()
+
 	piArgs := th.b.piArgs(project)
 
 	ctx, cancel := context.WithTimeout(ctx, sessionCreateTimeout)
@@ -180,7 +262,7 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 		Name:   th.t.SessionName(),
 		Cwd:    project.Dir,
 		PiArgs: piArgs,
-		Tags:   map[string]string{"platform": "slack", "thread": th.key},
+		Tags:   map[string]string{"platform": platformName, "thread": th.key},
 	})
 	if err != nil {
 		return fmt.Errorf("create the session: %w", err)
@@ -195,6 +277,7 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 	th.log.Info("created session",
 		"session", ref.Name, "path", ref.Path,
 		"cwd", project.Dir, "project", project.Name(), "pi_args", piArgs)
+	created = true
 	return nil
 }
 
@@ -208,7 +291,7 @@ func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
 		TokenFile: th.b.cfg.Gateway.ThreadTokenFile,
 		Name:      "pi-chat " + th.t.SessionName(),
 		Kind:      kind,
-		Tags:      map[string]string{"platform": "slack", "thread": th.key},
+		Tags:      map[string]string{"platform": platformName, "thread": th.key},
 		OnEvent:   th.onEvent,
 	}
 	// A thread that has been driven before resumes from its cursor, so the

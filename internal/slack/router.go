@@ -37,7 +37,7 @@ func NewRouter(core Core, botUserID string, log *slog.Logger) *Router {
 // Handle processes one envelope. Socket calls it on its own goroutine per
 // envelope, so a command that takes seconds delays nothing else.
 func (r *Router) Handle(ctx context.Context, env Envelope) {
-	if message, ok := ParseMessage(env, r.botUserID); ok {
+	if message, ok := parseMessage(env, r.botUserID); ok {
 		r.log.Debug("inbound message",
 			"channel", message.Thread.Channel,
 			"user", message.UserID,
@@ -47,13 +47,13 @@ func (r *Router) Handle(ctx context.Context, env Envelope) {
 		r.core.HandleMessage(ctx, message)
 		return
 	}
-	if command, ok := ParseCommand(env); ok {
+	if command, ok := parseCommand(env); ok {
 		r.log.Debug("inbound command",
 			"channel", command.Channel, "user", command.UserID, "text", command.Text)
 		r.core.HandleCommand(ctx, command)
 		return
 	}
-	if action, ok := ParseAction(env); ok {
+	if action, ok := parseAction(env); ok {
 		r.log.Debug("inbound action",
 			"channel", action.Channel, "user", action.UserID, "action", action.ActionID)
 		r.core.HandleAction(ctx, action)

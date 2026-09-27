@@ -63,7 +63,10 @@ func TestLiveTurnThroughGateway(t *testing.T) {
 		Channel:   "C-LIVE",
 		ThreadTS:  strconv.FormatInt(time.Now().Unix(), 10),
 	}
-	th := b.threadFor(thread)
+	th, err := b.threadFor(thread)
+	if err != nil {
+		t.Fatalf("track the live thread: %v", err)
+	}
 	t.Cleanup(func() { cleanupLiveSession(t, cfg, th, debugLog) })
 
 	// A first turn: this is where the session is created, so it is also where
@@ -76,6 +79,11 @@ func TestLiveTurnThroughGateway(t *testing.T) {
 		t.Fatalf("rendered %d final answers, want 1", len(first.finals))
 	}
 	t.Logf("first turn: %d delta(s), answer %q", len(first.deltas), first.finals[0])
+	// "deltas streamed" is the promise the renderer makes; a turn that produced
+	// no delta at all would still pass the answer check below.
+	if len(first.deltas) == 0 {
+		t.Error("the first turn streamed no deltas")
+	}
 	if !strings.Contains(first.finals[0], "PONG") {
 		t.Fatalf("the answer %q does not contain PONG", first.finals[0])
 	}
@@ -112,6 +120,9 @@ func TestLiveTurnThroughGateway(t *testing.T) {
 	}
 	t.Logf("resumed turn: %d delta(s), answer %q, cursor seq %d",
 		len(second.deltas), second.finals[0], th.snapshot().LastSeq)
+	if len(second.deltas) == 0 {
+		t.Error("the resumed turn streamed no deltas")
+	}
 	if !strings.Contains(second.finals[0], "PONG2") {
 		t.Fatalf("the resumed answer %q does not contain PONG2", second.finals[0])
 	}
@@ -133,7 +144,7 @@ func liveMessage(thread Thread, text string) Message {
 		EventID:   "live-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 		Thread:    thread,
 		UserID:    "U-LIVE",
-		TeamID:    thread.Workspace,
+		Workspace: thread.Workspace,
 		Text:      text,
 		Mentioned: true,
 	}
