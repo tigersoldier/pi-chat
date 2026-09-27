@@ -129,6 +129,17 @@ message that distinguishes *stopped* (file exists, attach again) from *deleted*
 (gone). Until it ships, §4's attach-before-prompt rule is a hard invariant, not a
 convenience.
 
+**Session context injection, and spawn configuration that survives a restart** — see
+[`docs/pi-gateway-session-context.md`](docs/pi-gateway-session-context.md). Two asks: an
+`inject` command that appends a non-turn message to a live session (pi has the primitive
+behind its extension API only), and persistence plus introspection of the spawn
+configuration a session was created with. **Until they ship, the Slack instruction is not
+installed at all** — §4's decisions below are agreed but not built, and building the
+thread observation without it would send the agent an unexplained transcript format. P2
+of that proposal also fixes a defect of ours that exists today: sessions are created with
+the project's `--append-system-prompt`, but the thread connection dials without `piArgs`,
+so the first respawn after a `pi-gatewayd` restart loses it.
+
 ---
 
 ## 4. Sessions and threads
@@ -165,6 +176,34 @@ convenience.
    only client attached to it (§10).
 
 ### Lifecycle
+
+**Agreed, not built (interview of 2026-09-27).** These change the rules above and are
+held until the upstream proposal in §3 lands; the tables in this section still describe
+what ships today.
+
+1. **A DM thread is a session, and a top-level DM message starts a new one**, with a
+   one-line notice when the DM already had a session (so a reset is visible rather than
+   silent). Replying inside a thread continues it.
+2. **Plain text in a channel thread is never a turn trigger** — it is conversation to
+   observe. Only a mention turns. The first mention in a channel thread is what starts
+   the session, whether the thread began with the mention or already had people talking.
+3. **A mention registers the thread as a session but does not provision anything.** The
+   worktree and the pi process are created by the first turn, so a bare `@pi` or
+   `@pi /help` costs a row and nothing else.
+4. **Observation is fetched, not buffered**: at turn time, `conversations.replies` with
+   `oldest` set to the previous turn's trigger, so nothing said while the daemon was down
+   is lost and no message text is stored at rest.
+5. **Observed messages ride in the trigger prompt**, as a transcript block whose lines are
+   `[Name (U123)] text` (names need `users:read`, so a reinstall), bounded to ~10k
+   characters keeping the newest, with the omitted text written to a per-thread file under
+   the state dir and referenced in the block.
+
+**Still open from the same interview:** how a message that arrives *while* a turn is
+running is handled (the default is the next turn's transcript; steering it into the
+running turn is the alternative), what `@pi /new` does precisely — whether it takes effect
+on the next mention or immediately, and what happens to the session it replaces — whether
+the first turn in a thread that already had a human conversation includes that history,
+and whether a group DM behaves like a channel or like a DM.
 
 - **Warm:** the thread has a bound connection; the daemon holds a pi process.
 - **Cold:** the connection is closed after `thread_idle_close_minutes` of inactivity
