@@ -332,17 +332,23 @@ Constraints and behaviours:
     must not stop them again; and the status does **not** change on its own when the user
     presses stop, so we transition off `processing` ourselves. **Phase 3 work:** neither
     `setStatus` nor `rename` nor the stop button's `Abort` is wired up yet — the scope and
-    the events are declared now so that adding them needs no reinstall. The scope is
-    `chat:write`; declaring the app as
-    an agent is what adds `assistant:write`, which covers suggested prompts and
-    `app_context_changed`. Caveats: the workspace must have the agent feature enabled
+    the events are declared now so that adding them needs no reinstall.
+
+    The scopes, precisely: `agents.sessions.setStatus` and `agents.sessions.rename` need
+    **`chat:write` alone** — the agent surface is not what buys `assistant:write`.
+    `assistant:write` is the required scope of `app_context_changed` and of the legacy
+    `assistant.threads.*` methods, and pi-chat uses neither, so in the agent manifest it
+    is declared only because Slack's agent feature asks for it and a scope change forces
+    a reinstall. Caveats: the workspace must have the agent feature enabled
     (`feature_disabled` otherwise), and switching an app from the legacy assistant view
     to the agent view cannot be reversed.
   - *Plain bot* (the default `slack/manifest.yaml`): the only status primitives are
     `assistant.threads.setStatus` (a free-form string with a two-minute timeout) and
-    `assistant.threads.setTitle`, which needs `assistant:write`. Nothing breaks without
-    them; the thread simply shows no status. Slack is migrating these methods to the
-    `agents.sessions.*` names above, so treat both spellings as current, not settled.
+    `assistant.threads.setTitle`, both of which need `assistant:write` — a scope the
+    default manifest deliberately does **not** request, so today this tier shows no
+    status at all and *cannot*: adding it means adding the scope and reinstalling. Slack
+    is migrating these methods to the `agents.sessions.*` names above, so treat both
+    spellings as current, not settled.
 - **`extension_ui_request` is two things on one frame type, and the adapter must split
   them by `method`:**
   - *Dialogs* — `select`, `confirm`, `input`, `editor` — need an answer and are routed

@@ -206,7 +206,7 @@ Reference for what you just applied. Nothing here needs action.
 | `mpim:history` | read group direct messages | a multi-person DM that includes the bot |
 | `files:read` | download files shared with the app | handing an attached image to the agent (**phase 3**; the scope is requested now so enabling it needs no reinstall) |
 | `reactions:write` | add emoji reactions | a 👀 receipt while the agent is working (**phase 3**) |
-| `assistant:write` | act as a Slack agent | **agent variant only** — `setTitle`, suggested prompts, agent context events |
+| `assistant:write` | act as a Slack agent | **agent variant only** — required by `app_context_changed` and the legacy `assistant.threads.*` methods. The agent status and title methods pi-chat uses (`agents.sessions.setStatus`/`rename`) need `chat:write` alone |
 
 ### Bot events
 
@@ -223,8 +223,11 @@ including conversations pi-chat does not care about. That is inherent to the Eve
 the daemon ignores anything that is not a thread it owns, and only responds when
 mentioned or addressed in a thread it already has a session for.
 
-The agent manifest adds `app_home_opened` (how a DM open is detected in that surface),
-`app_context_changed`, `agent_session_stopped`, and `agent_session_title_changed`.
+The agent manifest adds four events: `app_home_opened` (how a DM open is detected in
+that surface — **no scope required**), `agent_session_stopped` (`chat:write`; subscribing is
+what makes the loading indicator's stop button real), `agent_session_title_changed`, and
+`app_context_changed` (the only one of the four that needs `assistant:write`, and the one
+pi-chat does not use — it is about tracking what the user is looking at).
 
 ### Settings
 
@@ -249,6 +252,22 @@ control is `@pi /status`.
 agent and enables Slack's agent messaging experience. Instead of a plain DM, the bot's
 Messages tab becomes a conversation timeline, and Slack renders a real agent status.
 
+### What each piece is for
+
+Three fields come up whenever someone asks what an agent app needs. Only the first is
+about being an agent at all; the other two are optional, and one of them is routinely
+credited with work it does not do:
+
+| Field | Required? | What it does |
+|---|---|---|
+| `features.agent_view` | optional in the schema, but it **is** the agent experience | turns the DM into an agent timeline. Including the group makes `agent_description` (300 chars max) required; `suggested_prompts` and `actions` are optional |
+| `assistant:write` | no — not for agent status or titles | `agents.sessions.setStatus` and `agents.sessions.rename` need `chat:write` only; `assistant:write` is required by `app_context_changed` and the legacy `assistant.threads.*` methods |
+| `app_home_opened` | no, and **no scope is required** | the DM-open signal (`tab == "messages"`), which replaces the retired `assistant_thread_started`. Only useful if you act on a DM being opened |
+
+Without `features.agent_view` the app is just a bot that happens to be chatty: no
+timeline, no status, no stop button. That is exactly what
+[`slack/manifest.yaml`](../slack/manifest.yaml) is, and why the two manifests exist.
+
 What that buys pi-chat:
 
 | Capability | Instead of |
@@ -266,7 +285,11 @@ Before choosing it, know the caveats:
 - The agent container is **thread-only by construction**, so a slash command cannot be
   used inside it. There, everything is the `@pi …` form. pi-chat's grammar already
   accounts for this: DM content is plain text.
-- Declaring the app as an agent is what grants `assistant:write`.
+- The agent feature adds `assistant:write` for you when you enable it in the app
+  settings; in a manifest you declare it yourself. It is not what makes the agent
+  surface work: the status and title methods (`agents.sessions.*`) need only `chat:write`,
+  and `assistant:write` is there for `app_context_changed` and the legacy
+  `assistant.threads.*` methods.
 
 To switch an existing app: paste `slack/manifest-agent.yaml` into **Settings → App
 Manifest** and save. Slack will ask you to reinstall.

@@ -20,9 +20,9 @@ display_information:
   description: Drive local pi coding-agent sessions from Slack
 
 features:
-  # Declaring the app as an agent is what enables the agent experience, and it
-  # is what grants the assistant:write scope. New apps can only use agent_view;
-  # the older assistant_view is deprecated.
+  # Declaring the app as an agent is what enables the agent experience. New apps
+  # can only use agent_view; the older assistant_view is deprecated. The
+  # assistant:write scope below is not what makes this work; see its comment.
   agent_view:
     # 300 characters max
     agent_description: Run local pi coding-agent sessions from Slack.
@@ -56,7 +56,7 @@ oauth_config:
       - groups:history
       - im:history
       - mpim:history
-      - assistant:write      # setTitle, prompts, agent context (phase 3)
+      - assistant:write      # app_context_changed + legacy methods
       - files:read           # phase 3: attachments
       - reactions:write      # phase 3: a 👀 receipt while the agent works
 
@@ -68,7 +68,7 @@ settings:
       - message.groups
       - message.im
       - message.mpim
-      - app_home_opened      # how a DM open is detected in the agent experience
+      - app_home_opened      # a DM open; no scope required
       # Phase 3: no agent event below is handled yet. They are declared now
       # because subscribing is what makes Slack's loading indicator
       # interactive, and a scope or event change forces a reinstall.
