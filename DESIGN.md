@@ -254,7 +254,15 @@ Constraints and behaviours:
     our states exactly — `processing` while a turn runs (Slack shows a loading UX and a
     stop button when we subscribe to `agent_session_stopped`, which we wire to `Abort`),
     `suspended` while we wait for an approval, `active` when idle, `closed` on delete.
-    Titles use `agents.sessions.rename`. The scope is `chat:write`; declaring the app as
+    Titles use `agents.sessions.rename`. Subscribing to `agent_session_stopped` (scope
+    `chat:write`, which we already hold) is what makes the loading indicator
+    **interactive** — without the subscription `setStatus` returns a
+    `missing_agent_session_stopped_event_subscription` warning and Slack shows a
+    non-interactive spinner instead. Two details the adapter must honour: the event
+    arrives with `streaming_message_ts`, the streams Slack has *already* stopped, so we
+    must not stop them again; and the status does **not** change on its own when the user
+    presses stop, so we transition off `processing` ourselves. The scope is
+    `chat:write`; declaring the app as
     an agent is what adds `assistant:write`, which covers suggested prompts and
     `app_context_changed`. Caveats: the workspace must have the agent feature enabled
     (`feature_disabled` otherwise), and switching an app from the legacy assistant view

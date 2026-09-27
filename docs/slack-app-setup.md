@@ -199,6 +199,7 @@ Reference for what you just applied. Nothing here needs action.
 |---|---|---|
 | `app_mentions:read` | receive `app_mention` events | the `@pi …` form, in channels and threads |
 | `chat:write` | post, update, stream as the app | every reply, streamed turn, and status update |
+| `commands` | register slash commands and shortcuts | the `/pi` root command. Declaring `features.slash_commands` in a manifest **requires** this scope — without it Slack rejects the paste with `commands requires the commands bot scope` |
 | `channels:history` | read public-channel messages | plain text in a public thread the bot is in |
 | `groups:history` | read private-channel messages | the same, in a private channel |
 | `im:history` | read direct messages | DMs with the bot, including DM threads |
@@ -282,7 +283,7 @@ Slack's own pages, or who need to check what the manifest applied.
 |---|---|
 | Create New App → From scratch | App name `pi`, pick the workspace |
 | Features → **Socket Mode** | enable; app-level token with `connections:write` |
-| Features → **OAuth & Permissions** → Bot Token Scopes | add the eight (or nine) scopes in [the table above](#bot-token-scopes) |
+| Features → **OAuth & Permissions** → Bot Token Scopes | add the nine (or ten) scopes in [the table above](#bot-token-scopes) |
 | Features → **Event Subscriptions** | enable; add the five (or nine) bot events; leave the Request URL empty |
 | Features → **App Home** → Show Tabs | Messages Tab on, "allow users to send messages" on |
 | Features → **Interactivity & Shortcuts** | enable; no Request URL needed |
@@ -306,7 +307,8 @@ Then continue at [Step 2](#step-2--generate-the-app-level-token).
 | `/pi` worked once, then stopped | A scope or event change disabled the install. Reinstall |
 | `invalid_url` / `dispatch_failed` on `/pi` | The placeholder Request URL is unparseable. Slack validates it even though Socket Mode never calls it; use a real-looking HTTPS URL |
 | The socket drops overnight | Socket Mode is a long-lived connection and is sensitive to network churn; the app reconnects, and the unit restarts it on failure |
-| Manifest paste rejected | Slack reports the offending field. The usual cause is editing a load-bearing value — re-paste the file from this repository and customize only the fields listed in Step 1 |
+| Manifest paste rejected | Slack reports the offending field. The usual causes: editing a load-bearing value, or declaring a feature whose scope is missing — re-paste the file from this repository and customize only the fields listed in Step 1 |
+| `commands requires the commands bot scope` | The manifest declares `features.slash_commands` but not the `commands` scope. Both manifests in this repository include it; a hand-edited copy may have dropped it |
 | Cannot install the app | The workspace restricts app installation — an admin must approve it, or you need a workspace where you can install apps |
 | Want to be listed in the Marketplace | Not possible with Socket Mode; that requires a public HTTP endpoint, which this project deliberately avoids |
 

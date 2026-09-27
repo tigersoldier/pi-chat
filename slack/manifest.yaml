@@ -62,6 +62,7 @@ oauth_config:
     bot:
       - app_mentions:read   # receive @pi mentions
       - chat:write          # post, update and stream messages
+      - commands            # the /pi slash command
       - channels:history    # plain text in public threads
       - groups:history      # plain text in private channels
       - im:history          # direct messages
