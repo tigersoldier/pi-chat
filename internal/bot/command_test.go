@@ -239,7 +239,14 @@ func TestResumeSessionAdoptsTheChosenSession(t *testing.T) {
 		ActionID: ActionResume, Value: "/sessions/theirs.jsonl", MessageTS: "1700000000.000900",
 	})
 
-	waitFor(t, "the adoption", func() bool { return len(platform.openedThreads()) == 1 })
+	waitFor(t, "the adoption", func() bool {
+		row, found, err := b.store.Thread(context.Background(), "T1:C1:900.000001")
+		return err == nil && found && row.SessionPath == "/sessions/theirs.jsonl"
+	})
+
+	if opened := platform.openedThreads(); len(opened) != 1 {
+		t.Errorf("opened %d threads, want 1 for a root command", len(opened))
+	}
 
 	// A root command has no thread of its own, so one is opened and bound to the
 	// adopted session.
