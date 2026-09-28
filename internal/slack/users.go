@@ -9,10 +9,13 @@ import (
 // labeler resolves user IDs to the names shown beside their messages in a
 // transcript, one call per person per process.
 //
-// Names need `users:read`, which the plain-bot manifest does not request at all.
-// When the call is refused the cache stops asking and transcripts fall back to
-// bare IDs: a name is a nicety, and a missing scope must not cost one failed
-// request per message per turn (DESIGN.md §4).
+// Names need `users:read`. Reading the thread needs the `*:history` scopes
+// instead, so a transcript arrives either way: without the name scope its lines
+// read `[U123] text`, which is what the mention form `<@U123>` is made of, and
+// the instruction says so. That fallback is the design rather than an accident —
+// a name is a nicety, and it must not cost a failed request per message per
+// turn, so the first refusal stops the asking for the life of the process
+// (DESIGN.md §4).
 type labeler struct {
 	api *API
 	log *slog.Logger
