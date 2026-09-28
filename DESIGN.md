@@ -786,6 +786,25 @@ extraction, allowlist input, mention stripping, rendering and chunking, streamin
 fallback, interactive components and modals, file download → `protocol.ImageContent`,
 slash-command registration.
 
+**One message, one delivery.** Slack reports a mention twice — as `app_mention` and as
+the `message` event for the same `ts` — so which delivery answers is decided by where the
+message was sent, and the other one is dropped rather than deduped:
+
+- **A DM (`im`)** is answered by `message.im`. The conversation is the address, so every
+  message in it is a request; `app_mention` is not what Slack sends for a DM at all.
+- **A channel or group DM** is answered by `app_mention`, which is Slack's own statement
+  that the message mentions the bot rather than our reading of its text — and that is what
+  makes it right to trust for a mention composed in rich text. The `message` event with
+  the same `ts` is that request arriving again; everything else in a room — plain text, a
+  reply in a thread — is conversation the next turn fetches as context, which is why no
+  event is needed for it.
+
+The core still claims a turn by the message's own identity (`msg:<workspace>:<channel>:<ts>`):
+the drop is the mechanism, the claim is the net under it, for a redelivery or a platform
+that sends one message twice in a way an adapter cannot see. The subscriptions stay as
+they are — the manifest says what the app *may* receive, the adapter says what pi-chat
+*answers*, and a workspace that subscribes to more does not change that.
+
 **Arguments travel form-encoded**, and that is a requirement rather than a preference:
 Slack reads a JSON body for some Web API methods and ignores it for others, where the
 arguments then look absent instead of malformed — `conversations.replies` answers

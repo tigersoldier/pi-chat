@@ -400,6 +400,25 @@ use found, all of them in paths the stubs could not see:
 - [x] Also fixed while in there: the core filters the observation boundary itself, because
       Slack's `oldest` is inclusive and the message a previous prompt carried could
       otherwise return as a remark somebody made. 2 new tests.
+- [x] **One path per message, in the adapter** (decided 2026-09-28, in place of "dedupe the
+      two deliveries after the fact"): a DM is answered by `message.im` — the conversation
+      is the address, and Slack does not send `app_mention` for a DM at all — and a channel
+      or group DM by `app_mention`, which is Slack's own statement that the bot was
+      mentioned and therefore right to trust where reading `text` for `<@U…>` is our
+      inference. Everything else in a room — plain text, a reply in a thread — is
+      conversation, dropped in the parser because the next turn fetches it. The two events
+      still *arrive*: the manifest says what the app may receive, the adapter says what
+      pi-chat answers, so a workspace that subscribes to more cannot change the routing.
+      The core's identity claim stays as the net under the drop, and an unaddressed message
+      now costs neither a claim nor a turn. Tests: the four contexts, plus the two events
+      that used to double-answer.
+      **The assumption this rests on, checked with the first message after deploying:**
+      that `app_mention` fires for a mention *inside a thread*. Our own evidence says yes (a
+      thread mention produced two event ids in one second, and Slack's only documented
+      pairing for one message is `app_mention` + `message`); one third-party report says
+      no; Slack's docs do not say. If it is wrong, a thread mention goes unanswered —
+      visible immediately in Slack and in the journal, where the turn would leave no
+      `bound the thread to its session` line — and the fix is two lines.
 
 - [ ] The workspace's app answers `not_agent_app` for
       `assistant.threads.setSuggestedPrompts`, and it latched `feature_disabled` for

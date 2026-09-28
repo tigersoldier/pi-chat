@@ -53,37 +53,30 @@ func TestParseMessageMentionInsideAThreadJoinsIt(t *testing.T) {
 	}
 }
 
-func TestParseMessagePlainTextInAThread(t *testing.T) {
-	// Plain text is a prompt in a thread the bot may already own; the core
-	// decides that, because only it knows which threads have sessions. A
-	// mention of somebody else is in the same category: it is not addressed to
-	// the bot.
-	env := eventsAPI(`{"type":"message","user":"U1","text":"and another thing",` +
+func TestParseMessageAMessageEventInARoomIsNotAnswered(t *testing.T) {
+	// In a room only a mention turns, and app_mention owns that: Slack sends both
+	// events for one mention, so the message event would be the same request over
+	// again. What is left in a room is conversation, which the next turn fetches
+	// as context from its watermark (DESIGN.md §4, §5).
+	plain := eventsAPI(`{"type":"message","user":"U1","text":"and another thing",` +
 		`"ts":"1721609800.000300","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
-
-	message, ok := parseMessage(env, botUser)
-	if !ok {
-		t.Fatal("plain text in a channel thread should reach the core")
-	}
-	if message.Mentioned || message.Direct {
-		t.Errorf("mentioned/direct = %v/%v, want false/false", message.Mentioned, message.Direct)
-	}
-	if message.Text != "and another thing" {
-		t.Errorf("text = %q", message.Text)
+	if _, ok := parseMessage(plain, botUser); ok {
+		t.Error("a plain message in a channel thread was answered as a request")
 	}
 
-	// Somebody else's mention does not address the bot.
+	// The same message with the bot mentioned is the app_mention event's to answer:
+	// this copy must not become a second turn (which is what it used to be).
+	mention := eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> again",` +
+		`"ts":"1721609800.000400","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
+	if _, ok := parseMessage(mention, botUser); ok {
+		t.Error("a channel message event carrying a mention was answered; its app_mention copy owns it")
+	}
+
+	// A mention of somebody else is not addressed to the bot either way.
 	other := eventsAPI(`{"type":"message","user":"U1","text":"<@UOTHER> hi",` +
-		`"ts":"1721609800.000400","thread_ts":"1721609600.000100","channel":"C1"}`)
-	message, ok = parseMessage(other, botUser)
-	if !ok {
-		t.Fatal("a message in a thread should still reach the core")
-	}
-	if message.Mentioned {
-		t.Error("a mention of somebody else counted as addressing the bot")
-	}
-	if message.Text != "<@UOTHER> hi" {
-		t.Errorf("text = %q, want it untouched", message.Text)
+		`"ts":"1721609800.000500","thread_ts":"1721609600.000100","channel":"C1"}`)
+	if _, ok := parseMessage(other, botUser); ok {
+		t.Error("a mention of somebody else in a room was answered")
 	}
 }
 
@@ -121,30 +114,26 @@ func TestParseMessageDirectMessages(t *testing.T) {
 
 	t.Run("a group DM is a room, not an address", func(t *testing.T) {
 		// Two or more people are in it and they talk to each other, so it behaves
-		// like a channel (DESIGN.md §5). A bare top-level message is not addressed
-		// to the bot at all, exactly as in a channel root...
+		// like a channel (DESIGN.md §5): a bare message is not addressed to the bot,
+		// and app_mention is the event that answers a mention there.
 		root := eventsAPI(`{"type":"message","user":"U1","text":"what changed?",` +
 			`"ts":"1721609960.000600","channel":"G1","channel_type":"mpim"}`)
 		if _, ok := parseMessage(root, botUser); ok {
 			t.Error("a bare top-level message in a group DM is not addressed to the bot")
 		}
 
-		// ...while a reply inside one of its threads reaches the core, which is
-		// where the decision lives that it is context rather than a request.
+		// A reply inside one of its threads is conversation too: the next turn reads
+		// it as context, and only a mention turns here.
 		reply := eventsAPI(`{"type":"message","user":"U1","text":"I think so too",` +
 			`"ts":"1721609960.000700","thread_ts":"1721609960.000600",` +
 			`"channel":"G1","channel_type":"mpim"}`)
-		message, ok := parseMessage(reply, botUser)
-		if !ok {
-			t.Fatal("a reply in a group DM thread should reach the core as context")
-		}
-		if message.Direct {
-			t.Error("a group DM should not count as direct: only a mention turns there")
+		if _, ok := parseMessage(reply, botUser); ok {
+			t.Error("a reply in a group DM thread was answered as a request")
 		}
 	})
 
 	t.Run("a mention in a group DM turns", func(t *testing.T) {
-		env := eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> what changed?",` +
+		env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> what changed?",` +
 			`"ts":"1721609960.000600","channel":"G1","channel_type":"mpim"}`)
 
 		message, ok := parseMessage(env, botUser)
@@ -153,6 +142,16 @@ func TestParseMessageDirectMessages(t *testing.T) {
 		}
 		if !message.Mentioned || message.Direct {
 			t.Errorf("mentioned/direct = %v/%v, want true/false", message.Mentioned, message.Direct)
+		}
+	})
+
+	t.Run("an app_mention in a DM is not answered", func(t *testing.T) {
+		// Slack does not deliver app_mention for a DM at all — and if it ever did,
+		// message.im is the copy that owns the conversation.
+		env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> hello",` +
+			`"ts":"1721609955.000480","channel":"D1","channel_type":"im"}`)
+		if _, ok := parseMessage(env, botUser); ok {
+			t.Error("an app_mention event in a DM was answered; message.im owns a DM")
 		}
 	})
 
@@ -184,6 +183,8 @@ func TestParseMessageRejectsWhatIsNotAddressedToTheBot(t *testing.T) {
 		env  Envelope
 	}{
 		{"plain text in a channel root", eventsAPI(`{"type":"message","user":"U1","text":"hi","ts":"1","channel":"C1"}`)},
+		{"a channel message event carrying a mention, which app_mention owns", eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> hi","ts":"1","channel":"C1"}`)},
+		{"an app_mention in a DM, which message.im owns", eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> hi","ts":"1","channel":"D1","channel_type":"im"}`)},
 		{"the bot's own post", eventsAPI(`{"type":"app_mention","bot_id":"B1","text":"<@U0BOT> hi","ts":"1","channel":"C1"}`)},
 		{"an edited message", eventsAPI(`{"type":"app_mention","subtype":"message_changed","user":"U1","text":"<@U0BOT> hi","ts":"1","channel":"C1"}`)},
 		{"no channel", eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> hi","ts":"1"}`)},

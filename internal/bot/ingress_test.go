@@ -110,6 +110,38 @@ func TestTwoMessagesInOneThreadAreTwoTurns(t *testing.T) {
 	}
 }
 
+// A message nobody addressed leaves no trace at all: no row, no notice, and —
+// because it is not work — no dedupe record either. That is what keeps the table
+// about requests while the bot sits in busy rooms (DESIGN.md §5, §7).
+func TestOnlyAddressedMessagesAreClaimed(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	ctx := context.Background()
+
+	unaddressed := newTestMessage("Ev1", "just talking to a colleague")
+	unaddressed.Mentioned = false
+	b.HandleMessage(ctx, unaddressed)
+
+	if claimed, err := st.ClaimEvent(ctx, messageClaim(unaddressed)); err != nil {
+		t.Fatalf("ClaimEvent: %v", err)
+	} else if !claimed {
+		t.Error("an unaddressed message was recorded, so ambient chatter would fill the dedupe table")
+	}
+	if platform.startedTurns() != 0 || len(platform.postedNotices()) != 0 {
+		t.Fatalf("an unaddressed message did something: turns=%d notices=%d",
+			platform.startedTurns(), len(platform.postedNotices()))
+	}
+
+	// The claim still happens for a message that is a request, and it happens
+	// before the turn, so a redelivery cannot run it twice.
+	addressed := newTestMessage("Ev2", "what changed?")
+	b.HandleMessage(ctx, addressed)
+	if claimed, err := st.ClaimEvent(ctx, messageClaim(addressed)); err != nil {
+		t.Fatalf("ClaimEvent: %v", err)
+	} else if claimed {
+		t.Error("an answered message was not claimed")
+	}
+}
+
 // A reply nobody addressed to the bot is not a request, so there is nothing to
 // refuse — and an unlisted person answering their colleague in a thread the bot
 // happens to be in must not draw a visible reply about somebody's allowlist.

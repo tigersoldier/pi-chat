@@ -8,23 +8,33 @@ import (
 )
 
 // parseMessage turns one Socket Mode event envelope into a core message. It
-// reports false for everything pi-chat does not treat as a message: other
-// event types, the bot's own posts, edits and joins, and messages that do not
-// address the bot at all.
+// reports false for everything pi-chat does not treat as a message: other event
+// types, the bot's own posts, edits and joins, and the *delivery* of a message
+// that another delivery already owns.
 //
-// What counts as addressing it:
+// Slack sends both `app_mention` and a `message` event for the same mention, so
+// which one answers is decided by where the message was sent:
 //
-//   - a mention, anywhere (`@pi …`);
-//   - plain text in a one-to-one DM, where the conversation is already the
-//     address;
-//   - plain text in a channel thread or a group DM, which is conversation to
-//     observe rather than a request: the bot sits in busy rooms, a reply meant
-//     for somebody else must not start a session, and a group DM is a room with
-//     several people in it rather than a private address (DESIGN.md §5).
+//	DM                message.im owns it. The conversation is the address, so
+//	                  every message in it is a request — and Slack does not
+//	                  deliver app_mention for a DM at all.
+//	channel, group DM app_mention owns it. In a room only a mention turns, and
+//	                  app_mention is Slack's own statement that this message
+//	                  mentions the bot, rather than our reading of its text. The
+//	                  message event carrying the same ts is that same request
+//	                  arriving a second time; everything else in a room — plain
+//	                  text, a reply in a thread — is conversation, which the next
+//	                  turn fetches as context (DESIGN.md §4, §5).
 //
-// A bare message in a channel or DM *root* is not a prompt: roots are
-// session-less by design (DESIGN.md §4), which is what keeps `@pi hello` in a
-// channel from making every later message in it a prompt.
+// Dropping the other delivery is what makes one message one turn, instead of two
+// turns deduped after the fact. The core still claims a turn by the message's
+// own identity, so a redelivery — or a platform that sends something else twice
+// — is still one turn: that is the net, not the mechanism.
+//
+// A bare message in a channel *root* is not a prompt: channel roots are
+// session-less by design, which is what keeps `@pi hello` in a channel from
+// making every later message in it a prompt. A DM root is different — plain text
+// there starts a session, rooted at that message (DESIGN.md §4).
 func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	if env.Type != "events_api" {
 		return bot.Message{}, false
@@ -63,27 +73,24 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 		return bot.Message{}, false
 	}
 
-	// Slack renders a mention as <@U123>. Removing ours is also how we learn
-	// that we were addressed: a mention event may arrive for a message we were
-	// mentioned in alongside others.
+	// Slack renders a mention as <@U123>. Removing ours is also how a DM learns it
+	// was addressed: an app_mention event is Slack's own statement, and in a DM the
+	// text is the only other place a mention can appear.
 	text := stripMention(event.Text, botUserID)
 	mentioned := event.Type == "app_mention" || text != event.Text
+
 	// A group DM is not a one-to-one conversation: two or more people are in it
 	// and they talk to each other, so it behaves like a channel — only a mention
-	// turns (DESIGN.md §5).
+	// turns (DESIGN.md §5). That is why "direct" is only `im`: it decides both the
+	// delivery that owns the message and whether the core needs a mention at all.
 	direct := event.ChannelType == "im"
 
+	// One message, one delivery (see above): the event that owns this context
+	// answers it, and the other carries the same request again.
 	switch {
-	case mentioned:
-	case direct:
-		// Anything in a DM is addressed to the bot. In a one-to-one conversation
-		// the conversation *is* the address — and this is the shape Slack's agent
-		// experience is built around: the user types in the DM's composer, the bot
-		// answers in a thread rooted at that message. Channel roots are not in
-		// this category: the bot sits in busy channels, and a stray message must
-		// not start a session.
-	case event.ThreadTS != "":
-	default:
+	case direct && event.Type == "app_mention":
+		return bot.Message{}, false
+	case !direct && event.Type != "app_mention":
 		return bot.Message{}, false
 	}
 

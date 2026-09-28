@@ -69,10 +69,6 @@ func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, v
 // background, so the caller can acknowledge the platform immediately
 // (DESIGN.md §7: the ack budget is three seconds).
 func (b *Bot) HandleMessage(ctx context.Context, m Message) {
-	if !b.claim(ctx, messageClaim(m)) {
-		return
-	}
-
 	// The adapter drops messages that address neither the bot nor a thread it
 	// owns, so a root without a thread timestamp here is a platform that sent
 	// one anyway — and a thread key without a timestamp is not an identity.
@@ -88,13 +84,21 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	// spend one. Nothing is lost by dropping it, because the next turn reads the
 	// thread back from its watermark (DESIGN.md §4, §5).
 	//
-	// This is checked before the allowlist on purpose. A message nobody addressed
-	// to the bot is not a request, so there is nothing to refuse — and a stranger
-	// answering their colleague in a thread the bot happens to be in must not draw
-	// a visible reply about somebody's allowlist (DESIGN.md §5, §10).
+	// This is checked before the allowlist *and* before the dedupe record, on
+	// purpose. A message nobody addressed to the bot is not a request: there is
+	// nothing to refuse, and nothing to protect by claiming it first, because a
+	// duplicate of a message that does nothing is nothing. Claiming first would
+	// record every message in every room the bot sits in, which is the one thing
+	// the dedupe table is not for (DESIGN.md §5, §7, §10).
 	if !m.Mentioned && !m.Direct {
 		b.log.Debug("not addressed to the bot; the next turn will read it as context",
 			"thread", m.Thread.Key(), "user", m.UserID)
+		return
+	}
+
+	// The claim comes before the allowlist, so a refused request is recorded as
+	// handled too and a redelivery of it is not refused a second time.
+	if !b.claim(ctx, messageClaim(m)) {
 		return
 	}
 
