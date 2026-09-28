@@ -107,7 +107,8 @@ func run(cfg *config.Config) error {
 		log.Info("reset threads that a previous run left warm", "count", n)
 	}
 
-	core := bot.New(cfg, log, slack.NewPlatform(api, cfg, me.TeamID, log), st, version)
+	core := bot.New(cfg, log, slack.NewPlatform(api, cfg,
+		slack.Identity{TeamID: me.TeamID, UserID: me.UserID, BotID: me.BotID}, log), st, version)
 	defer core.Close()
 
 	// Startup GC: a directory with no thread row is the remains of a crash or

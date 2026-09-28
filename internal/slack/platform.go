@@ -25,12 +25,22 @@ const (
 	maxMessage = 38000
 )
 
+// Identity is who this install is on Slack, from auth.test: the workspace, the
+// bot user whose mentions are stripped from messages, and the bot ID its own
+// posts carry.
+type Identity struct {
+	TeamID string
+	UserID string
+	BotID  string
+}
+
 // Platform renders turns and posts notices with Slack's Web API.
 type Platform struct {
 	api    *API
 	cfg    *config.Config
 	log    *slog.Logger
-	teamID string // this install's workspace, from auth.test
+	id     Identity
+	labels *labeler
 
 	// recipientRefused records that this install rejects the recipient fields
 	// on chat.startStream, so later turns do not repeat a doomed attempt.
@@ -48,10 +58,48 @@ type Platform struct {
 	promptsRefused atomic.Bool
 }
 
-// NewPlatform builds the Slack adapter. teamID is the workspace the bot token
-// belongs to, which is what a thread key starts with.
-func NewPlatform(api *API, cfg *config.Config, teamID string, log *slog.Logger) *Platform {
-	return &Platform{api: api, cfg: cfg, log: log, teamID: teamID}
+// NewPlatform builds the Slack adapter. id is the install's own identity, which
+// is what a thread key starts with and what marks the bot's own messages in a
+// transcript.
+func NewPlatform(api *API, cfg *config.Config, id Identity, log *slog.Logger) *Platform {
+	return &Platform{api: api, cfg: cfg, log: log, id: id, labels: newLabeler(api, log)}
+}
+
+// Conversation reads a thread back: what was said in it, in order, so the core
+// can put the conversation in front of the next prompt (DESIGN.md §4).
+//
+// The bot's own messages are marked rather than dropped, and joins, edits and
+// the like are dropped rather than marked: the core decides what a transcript
+// contains, while only this side knows which messages are the bot's own.
+func (p *Platform) Conversation(ctx context.Context, t bot.Thread, oldest string) ([]bot.Said, error) {
+	replies, err := p.api.Replies(ctx, t.Channel, t.ThreadTS, oldest)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]bot.Said, 0, len(replies))
+	for _, r := range replies {
+		if r.Subtype != "" || r.TS == "" {
+			continue
+		}
+		// An edited message arrives as its current text with no subtype, so it is
+		// simply the newest version of something already in the transcript.
+		said := bot.Said{TS: r.TS, UserID: r.User, Text: r.Text}
+		switch {
+		case r.User != "" && r.User == p.id.UserID, r.BotID != "" && r.BotID == p.id.BotID:
+			said.FromBot = true
+		case r.User == "":
+			// Another app: there is no user to resolve, and its bot ID is what
+			// there is to name it by.
+			said.Name = "bot"
+			if r.BotID != "" {
+				said.Name = "bot " + r.BotID
+			}
+		default:
+			said.Name = p.labels.name(ctx, r.User)
+		}
+		out = append(out, said)
+	}
+	return out, nil
 }
 
 // StartTurn builds the renderer for a reply to m. It has no side effect: the
@@ -102,7 +150,7 @@ func (p *Platform) OpenThread(ctx context.Context, channel, text string) (bot.Th
 	if err != nil {
 		return bot.Thread{}, err
 	}
-	return bot.Thread{Workspace: p.teamID, Channel: channel, ThreadTS: ts}, nil
+	return bot.Thread{Workspace: p.id.TeamID, Channel: channel, ThreadTS: ts}, nil
 }
 
 // threadTS is the thread a notice belongs to, and "" for a channel root.

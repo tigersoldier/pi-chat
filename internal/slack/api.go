@@ -307,6 +307,90 @@ func (a *API) Respond(ctx context.Context, responseURL, text string, blocks []bl
 	return fmt.Errorf("slack response_url: unexpected answer %q", answer)
 }
 
+// Reply is one message `conversations.replies` returned.
+type Reply struct {
+	TS      string `json:"ts"`
+	User    string `json:"user"`
+	BotID   string `json:"bot_id"`
+	Subtype string `json:"subtype"`
+	Text    string `json:"text"`
+}
+
+// Bounds on reading a thread back. The page size is Slack's maximum, and the
+// fetch limit is a sanity cap: a thread longer than this is a conversation the
+// prompt cannot carry anyway, and the newest messages are the ones that matter.
+const (
+	replyPageSize   = 200
+	replyFetchLimit = 600
+)
+
+// Replies reads a thread's conversation in order, following Slack's cursor
+// until the thread ends or replyFetchLimit messages have arrived.
+//
+// `oldest` is the exclusive lower bound in intent — it is the message a previous
+// prompt already carried — but Slack treats it as the start of a range, so the
+// caller filters the boundary rather than trusting it.
+func (a *API) Replies(ctx context.Context, channel, threadTS, oldest string) ([]Reply, error) {
+	var out []Reply
+	cursor := ""
+	for {
+		params := map[string]any{"channel": channel, "ts": threadTS, "limit": replyPageSize}
+		if oldest != "" {
+			params["oldest"] = oldest
+		}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var page struct {
+			Messages []Reply `json:"messages"`
+			HasMore  bool    `json:"has_more"`
+			Metadata struct {
+				NextCursor string `json:"next_cursor"`
+			} `json:"response_metadata"`
+		}
+		if err := a.call(ctx, "conversations.replies", params, &page); err != nil {
+			return nil, err
+		}
+		out = append(out, page.Messages...)
+		if !page.HasMore || page.Metadata.NextCursor == "" || len(out) >= replyFetchLimit {
+			return out, nil
+		}
+		cursor = page.Metadata.NextCursor
+	}
+}
+
+// UserInfo resolves a user ID to the name to show beside their messages in a
+// transcript. It needs `users:read`; an install without the scope gets an error
+// here and bare IDs in the transcript, which is the deliberate fallback.
+func (a *API) UserInfo(ctx context.Context, userID string) (string, error) {
+	var out struct {
+		User struct {
+			Name     string `json:"name"`
+			RealName string `json:"real_name"`
+			Profile  struct {
+				DisplayName string `json:"display_name"`
+				RealName    string `json:"real_name"`
+			} `json:"profile"`
+		} `json:"user"`
+	}
+	if err := a.call(ctx, "users.info", map[string]any{"user": userID}, &out); err != nil {
+		return "", err
+	}
+	// Slack's own preference order: what the person chose to be called, then
+	// their account name.
+	for _, name := range []string{
+		out.User.Profile.DisplayName,
+		out.User.Profile.RealName,
+		out.User.RealName,
+		out.User.Name,
+	} {
+		if name = strings.TrimSpace(name); name != "" {
+			return name, nil
+		}
+	}
+	return "", nil
+}
+
 // suggestion is one suggested prompt, in the shape Slack takes.
 type suggestion struct {
 	Title   string `json:"title"`

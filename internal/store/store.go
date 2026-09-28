@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS threads (
     last_seq     INTEGER NOT NULL DEFAULT 0,     -- replay cursor
     leaf_id      TEXT NOT NULL DEFAULT '',
     progress_ts  TEXT NOT NULL DEFAULT '',       -- reply being streamed/patched
+    observed_ts  TEXT NOT NULL DEFAULT '',       -- observation watermark
     created_at   INTEGER NOT NULL,
     last_active  INTEGER NOT NULL
 );
@@ -79,6 +80,25 @@ CREATE TABLE IF NOT EXISTS admissions (
     queued_at  INTEGER NOT NULL
 );
 `
+
+// migrations bring an older database up to schemaVersion, one step at a time.
+// A fresh database skips them: `schema` is written whole, so it already carries
+// every column a step would add.
+//
+// A step stamps its version only after all of its statements succeed, so a
+// failure leaves the database at the version the next start will retry rather
+// than half-migrated and claiming to be current.
+var migrations = []struct {
+	to   int
+	stmt []string
+}{
+	{to: 2, stmt: []string{
+		// The observation watermark (DESIGN.md §4): the newest message of the
+		// thread's conversation that a prompt has already carried, so the next
+		// turn fetches what came after it and nothing twice.
+		`ALTER TABLE threads ADD COLUMN observed_ts TEXT NOT NULL DEFAULT ''`,
+	}},
+}
 
 // Store is the open database.
 type Store struct {
@@ -121,7 +141,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return s, nil
 }
 
-// init creates the schema and checks the version.
+// init creates the schema, migrates an older one, and checks the version.
 func (s *Store) init(ctx context.Context) error {
 	var version int
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
@@ -134,14 +154,84 @@ func (s *Store) init(ctx context.Context) error {
 	case version == schemaVersion:
 		return nil
 	}
+
+	// user_version alone cannot tell a fresh database from one written before
+	// the version was stamped, and only one of them needs migrating. The tables
+	// decide.
+	existing, err := s.tableExists(ctx, "threads")
+	if err != nil {
+		return err
+	}
+	if existing {
+		if err := s.migrate(ctx, version); err != nil {
+			return err
+		}
+	}
+	// Every statement in the schema is IF NOT EXISTS, so running it after a
+	// migration creates whatever a migration did not — a table a later version
+	// added — and leaves existing tables alone.
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("apply the schema: %w", err)
 	}
-	// user_version does not accept a bound parameter.
-	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+	return s.setVersion(ctx, schemaVersion)
+}
+
+// migrate applies every migration newer than the database's version.
+func (s *Store) migrate(ctx context.Context, from int) error {
+	for _, m := range migrations {
+		if m.to <= from {
+			continue
+		}
+		for _, stmt := range m.stmt {
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("migrate the schema to %d: %w", m.to, err)
+			}
+		}
+		if err := s.setVersion(ctx, m.to); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// versionStatements is every schema version this build can stamp, as statements
+// rather than as formats.
+//
+// SQLite does not accept a bound parameter as a PRAGMA value (`PRAGMA
+// user_version = ?` is a syntax error), so the version has to reach the
+// statement as text. It reaches it as one of these literals and never as
+// something assembled, which is what keeps the one interpolated-looking corner
+// of this package reviewable. TestVersionStatementsCoverEverySchema fails when a
+// new schema version forgets its entry.
+var versionStatements = map[int]string{
+	1: "PRAGMA user_version = 1",
+	2: "PRAGMA user_version = 2",
+}
+
+// setVersion stamps the schema version.
+func (s *Store) setVersion(ctx context.Context, version int) error {
+	stmt, ok := versionStatements[version]
+	if !ok {
+		return fmt.Errorf("no statement records schema version %d", version)
+	}
+	if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("record the schema version: %w", err)
 	}
 	return nil
+}
+
+// tableExists reports whether a table is part of the schema.
+func (s *Store) tableExists(ctx context.Context, name string) (bool, error) {
+	var found string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("look for the %s table: %w", name, err)
+	}
+	return true, nil
 }
 
 // Close closes the database.

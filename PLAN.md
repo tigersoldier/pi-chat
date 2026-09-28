@@ -310,14 +310,27 @@ for.
       builds for sessions we create, and prefix it to the first prompt we send in an
       adopted session inside `<slack-specific-instructions>` markers — re-sent after an
       observed `compaction_end`, never per turn
-- [ ] Observation: fetch the thread with `conversations.replies` from the previous turn's
+- [x] Observation: fetch the thread with `conversations.replies` from the previous turn's
       trigger, fold the labelled transcript into the prompt, bound it, and write the
       omitted text to a per-thread file (DESIGN §4, decisions 4 and 5)
+      — built: `internal/bot/observe.go` (fetch, `[Name (U123)]` lines, ~10k budget keeping
+      the newest, a message cut at ~2k, the omitted text written to
+      `<state dir>/threads/<session>/observed-<ts>.md` and named in the block, at most 20
+      files per thread), `internal/slack/replies_test.go`'s `API.Replies` (paginated, capped
+      at 600) and `Platform.Conversation` (drops joins, marks the bot's own messages,
+      resolves names through a cached, latching `users.info`), the `observed_ts` watermark
+      with its schema migration (`store` schema 2), and the turn wiring in `runTurn`
+      (fetch after the session exists, advance the watermark only after `Prompt` is
+      accepted). 17 new tests, including the bounding, the file, the failure paths and the
+      migration.
+- [x] `users:read`-driven labels in the transcript, with the ID-only fallback when the
+      scope is missing (the adapter latches after the first refusal, so a plain-bot install
+      pays for one failed call, not one per message)
+- [ ] `users:read` in both manifests, so labels carry names: **the app must be reinstalled
+      for the scope change** (the code side above is done and works without it)
 - [ ] Grammar: DM messages turn, channel-thread plain text is observed only, mentions
       register a thread without provisioning, and a top-level DM message starts a new
       session with a visible notice
-- [ ] `users:read` in both manifests for `[Name (U123)]` labels; the app must be
-      reinstalled for the scope change
 - [ ] Use the new client surface where it simplifies what exists: `unbound: true` from
       stop/delete (gwclient now clears its binding), and `spawn` from the catalog to tell
       whether a session already carries our instruction
@@ -362,7 +375,7 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 | Module | `pi-gchat` (to become `github.com/tigersoldier/pi-chat`), Go 1.26.4 |
 | Design | `DESIGN.md` (14 sections + decision log §15) |
 | `pi` binary | `~/.local/bin/pi` |
-| `pi-gatewayd` | **not installed**; build source `/tmp/pigw` @ `v0.1.2` |
+| `pi-gatewayd` | installed at `~/.local/bin/pi-gatewayd`, **v0.1.3** (`a47e0ad`), protocol 1; rollback binary kept as `pi-gatewayd.v0.1.2.bak`. Clone `/home/pi/code/pi-gateway` |
 | Gateway state | `~/.config/pi-gateway` (port + tokens + `tokens.json`) |
 | Bot config | `~/.config/pi-chat/config.toml` (0600), state in `~/.local/state/pi-chat/` |
 | Scratch gwclient consumers | `/tmp/gwtest2` (earlier validation) |

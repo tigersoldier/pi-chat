@@ -36,6 +36,14 @@ type fakePlatform struct {
 
 	prompts        []Suggestion
 	promptsChannel string
+
+	// said is what the fake reports for a thread's conversation, and observeErr
+	// what it fails with; the zero value is "nobody said anything". Being an
+	// Observer is what makes the observation path testable without a gateway.
+	said       []Said
+	observeErr error
+	oldest     string // the watermark the core asked from
+	fetches    int
 }
 
 // SetSuggestedPrompts records suggestions, making the fake a PromptReporter.
@@ -87,6 +95,28 @@ func (p *fakePlatform) startedTurns() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.turns)
+}
+
+// Conversation reports what a test put in the thread, making the fake an
+// Observer. It records the watermark it was asked from, which is what a test
+// about observation is usually asserting.
+func (p *fakePlatform) Conversation(_ context.Context, _ Thread, oldest string) ([]Said, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.oldest = oldest
+	p.fetches++
+	if p.observeErr != nil {
+		return nil, p.observeErr
+	}
+	return append([]Said(nil), p.said...), nil
+}
+
+// conversationCall reports the watermark the core last read from, and how many
+// times it read.
+func (p *fakePlatform) conversationCall() (string, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.oldest, p.fetches
 }
 
 // SetStatus records a lifecycle state, making the fake a StatusReporter.

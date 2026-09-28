@@ -48,12 +48,21 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	stopFlush := th.flush(ctx, st, r)
 	defer stopFlush()
 
+	// What the thread has been saying since the last turn rides in front of this
+	// request (DESIGN.md §4). The fetch happens here — after the session exists,
+	// before the prompt — because the prompt is the only place a transcript can
+	// go, and because the reply is already on screen while it is read.
+	obs := th.observe(ctx, m)
+
 	// Only now do the session's events belong to this turn, and only now may the
 	// flusher render them.
 	st.prompted.Store(true)
-	if _, err := client.Prompt(ctx, trimPrompt(m.Text)); err != nil {
+	if _, err := client.Prompt(ctx, trimPrompt(obs.prompt(trimPrompt(m.Text)))); err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
+	// The prompt is where those messages went, so this is the first moment the
+	// watermark may move past them.
+	th.rememberObserved(ctx, obs)
 	if err := st.waitStarted(ctx, startGrace); err != nil {
 		return err
 	}

@@ -192,9 +192,40 @@ it is still an invariant.
 
 ### Lifecycle
 
-**Agreed, not built (interview of 2026-09-27).** These change the rules above and are
-held until the upstream proposal in §3 lands; the tables in this section still describe
-what ships today.
+### Observation (built, 2026-09-27)
+
+A session should not be blind to the room it is in, so a turn now reads the conversation
+and puts it in front of the request.
+
+- **Fetched, not buffered.** At turn time the core asks the platform for the thread with
+  `conversations.replies`, `oldest` set to the watermark it remembers (§7). Nothing said
+  while the daemon was down is lost, no message is buffered while the bot is idle, and no
+  message text is stored at rest — the watermark is a timestamp.
+- **The watermark moves only after a prompt is accepted**, and never backwards. A turn
+  whose prompt failed leaves the conversation for the next turn to read again; a replayed
+  turn cannot make the bot read the same messages twice.
+- **The transcript rides in the prompt**, as a block between `<thread-conversation>`
+  markers whose lines are `[Name (U123)] text`. The request follows the block, and the
+  instruction installed once (§3, and the milestone that adds it) is what tells the agent
+  that only the text after the block is addressed to it.
+- **Bounded to ~10k characters, newest kept**, with a single message cut at ~2k. Every
+  message the block dropped or shortened is in the file the block names:
+  `<state dir>/threads/<session name>/observed-<ts>.md`, at most 20 of them per thread (§7).
+- **The bot's own messages are left out** (its history already has them) and the trigger is
+  not repeated as somebody's remark. A message that arrives while a turn is running is
+  covered by the next turn's fetch, because the watermark only ever reaches what a prompt
+  actually carried.
+- **Names need `users:read`** and are resolved lazily, one `users.info` per person per
+  process, cached both ways. Without the scope the transcript falls back to bare IDs —
+  which is what the mention form `<@U123>` is built from, so the agent can still address
+  somebody — and the adapter stops asking after the first refusal.
+- **The first turn in a thread that already had a human conversation reads that
+  conversation too** (an empty watermark means "from the beginning"), bounded the same way.
+  That is the open question below, settled this way in the code: the mention usually refers
+  to what was just said.
+
+**Agreed, not built (interview of 2026-09-27).** The grammar half of that interview is
+still ahead of the code; the tables in this section still describe what ships today.
 
 1. **A DM thread is a session, and a top-level DM message starts a new one**, with a
    one-line notice when the DM already had a session (so a reset is visible rather than
@@ -202,23 +233,19 @@ what ships today.
 2. **Plain text in a channel thread is never a turn trigger** — it is conversation to
    observe. Only a mention turns. The first mention in a channel thread is what starts
    the session, whether the thread began with the mention or already had people talking.
+   (Observation is built; what is missing is the other half — plain text still triggers a
+   turn today.)
 3. **A mention registers the thread as a session but does not provision anything.** The
    worktree and the pi process are created by the first turn, so a bare `@pi` or
    `@pi /help` costs a row and nothing else.
-4. **Observation is fetched, not buffered**: at turn time, `conversations.replies` with
-   `oldest` set to the previous turn's trigger, so nothing said while the daemon was down
-   is lost and no message text is stored at rest.
-5. **Observed messages ride in the trigger prompt**, as a transcript block whose lines are
-   `[Name (U123)] text` (names need `users:read`, so a reinstall), bounded to ~10k
-   characters keeping the newest, with the omitted text written to a per-thread file under
-   the state dir and referenced in the block.
 
 **Still open from the same interview:** how a message that arrives *while* a turn is
-running is handled (the default is the next turn's transcript; steering it into the
-running turn is the alternative), what `@pi /new` does precisely — whether it takes effect
-on the next mention or immediately, and what happens to the session it replaces — whether
-the first turn in a thread that already had a human conversation includes that history,
-and whether a group DM behaves like a channel or like a DM.
+running is handled (the default, and what the code does, is the next turn's transcript;
+steering it into the running turn is the alternative), what `@pi /new` does precisely —
+whether it takes effect on the next mention or immediately, and what happens to the session
+it replaces — whether the first turn in a thread that already had a human conversation
+includes that history (the code currently includes it, see above), and whether a group DM
+behaves like a channel or like a DM.
 
 - **Warm:** the thread has a bound connection; the daemon holds a pi process.
 - **Cold:** the connection is closed after `thread_idle_close_minutes` of inactivity
@@ -477,6 +504,7 @@ threads(thread_key PK,            -- workspace:channel:thread_ts
         state,                    -- warm | cold | deleted
         last_seq, leaf_id,        -- replay cursor (persist on settle and periodically)
         progress_ts,              -- Slack message being streamed/patched
+        observed_ts,              -- newest message a prompt has already carried
         created_at, last_active)
 
 seen(event_id PK, received_at)    -- Slack retry dedupe (TTL sweep)
@@ -489,6 +517,13 @@ Rules:
 - **No conversation content is stored** — no transcripts, no assistant text, no tool
   output. `admissions` holds text only until dispatch. (This is what the privacy note
   will claim, and it must stay true.)
+- **The one exception is deliberate and bounded**: when a prompt had to drop or shorten
+  part of a conversation, the whole of it is written to
+  `<state dir>/threads/<session name>/observed-<ts>.md` and the prompt names the file.
+  It is the agent's way to read what the prompt could not carry, it is capped at
+  `transcriptKeep` files per thread, and it belongs to the session's directory, so
+  deleting the session can take it with it. `observed_ts` itself is a timestamp, not
+  text: the database stores how far the conversation has been read, never what it said.
 - **Persist before acking** anything that mutates state, so a crash cannot lose an acked
   message.
 - **`seen` is mandatory**, not an optimisation: upstream prompt idempotency is still
@@ -505,6 +540,16 @@ Rules:
   the rest of the schema — one artifact, one migration — and are written from phase 2,
   when there are dialogs and a queue to put in them. The database carries a schema
   version and refuses to open one written by a newer pi-chat.
+- **Schema changes are migrations**, not a new schema: `init` migrates a database whose
+  `user_version` is behind, stamping each step's version only after its statements
+  succeed, so a failure is retried on the next start rather than half-applied. A fresh
+  database gets the whole schema and skips the steps. The version statements are
+  literals in an allowlist (SQLite takes no bound parameter there), and a test fails
+  when a new version forgets its entry.
+- **`observed_ts` is the observation watermark** (§4): the newest message a prompt has
+  already carried. It advances only after a prompt was accepted, so a failed prompt
+  leaves the conversation to be read again, and it never moves backwards, so a replayed
+  turn cannot make the bot read the same messages twice.
 
 ---
 

@@ -42,6 +42,13 @@ type ThreadRow struct {
 
 	ProgressTS string // the reply being streamed or patched, for restart recovery
 
+	// ObservedTS is the observation watermark (DESIGN.md §4): the newest message
+	// of the thread's conversation that a prompt has already carried. The next
+	// turn fetches what came after it, so nothing is shown twice and nothing said
+	// while the daemon was down is lost. Empty means the conversation has not
+	// been read yet.
+	ObservedTS string
+
 	CreatedAt  time.Time
 	LastActive time.Time
 }
@@ -100,8 +107,9 @@ func (s *Store) PutThread(ctx context.Context, row ThreadRow) error {
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO threads (thread_key, workspace_id, channel_id, thread_ts,
                              session_name, session_path, session_id, cwd, project_dir,
-                             state, last_seq, leaf_id, progress_ts, created_at, last_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             state, last_seq, leaf_id, progress_ts, observed_ts,
+                             created_at, last_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_key) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             channel_id   = excluded.channel_id,
@@ -115,10 +123,11 @@ func (s *Store) PutThread(ctx context.Context, row ThreadRow) error {
             last_seq     = excluded.last_seq,
             leaf_id      = excluded.leaf_id,
             progress_ts  = excluded.progress_ts,
+            observed_ts  = excluded.observed_ts,
             last_active  = excluded.last_active`,
 		row.ThreadKey, row.WorkspaceID, row.ChannelID, row.ThreadTS,
 		row.SessionName, row.SessionPath, row.SessionID, row.Cwd, row.ProjectDir,
-		row.State, row.LastSeq, row.LeafID, row.ProgressTS,
+		row.State, row.LastSeq, row.LeafID, row.ProgressTS, row.ObservedTS,
 		row.CreatedAt.Unix(), row.LastActive.Unix())
 	if err != nil {
 		return fmt.Errorf("store: write thread %s: %w", row.ThreadKey, err)
@@ -170,6 +179,19 @@ func (s *Store) SetProgressTS(ctx context.Context, key, ts string) error {
 	return nil
 }
 
+// SetThreadObservedTS records how far the thread's conversation has been read
+// into a prompt (DESIGN.md §4). Like the cursor, it is written after the fact:
+// a prompt that failed must not move the watermark past messages the agent
+// never saw.
+func (s *Store) SetThreadObservedTS(ctx context.Context, key, ts string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE threads SET observed_ts = ? WHERE thread_key = ?`, ts, key)
+	if err != nil {
+		return fmt.Errorf("store: save the observation watermark of %s: %w", key, err)
+	}
+	return nil
+}
+
 // MarkThreadsCold clears the warm marker for every thread and reports how many
 // rows it changed.
 //
@@ -197,7 +219,7 @@ var ErrNoThread = errors.New("no such thread")
 const selectThread = `
     SELECT thread_key, workspace_id, channel_id, thread_ts,
            session_name, session_path, session_id, cwd, project_dir,
-           state, last_seq, leaf_id, progress_ts, created_at, last_active
+           state, last_seq, leaf_id, progress_ts, observed_ts, created_at, last_active
     FROM threads`
 
 // scanner is what *sql.Row and *sql.Rows have in common.
@@ -210,7 +232,8 @@ func scanThread(src scanner) (ThreadRow, error) {
 	)
 	err := src.Scan(&row.ThreadKey, &row.WorkspaceID, &row.ChannelID, &row.ThreadTS,
 		&row.SessionName, &row.SessionPath, &row.SessionID, &row.Cwd, &row.ProjectDir,
-		&row.State, &row.LastSeq, &row.LeafID, &row.ProgressTS, &createdAt, &lastActive)
+		&row.State, &row.LastSeq, &row.LeafID, &row.ProgressTS, &row.ObservedTS,
+		&createdAt, &lastActive)
 	if err != nil {
 		return ThreadRow{}, err
 	}

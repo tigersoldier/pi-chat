@@ -40,6 +40,11 @@ type stubSlack struct {
 	// policy, when set, decides per request which error to answer with; it
 	// takes precedence over failed.
 	policy func(method string, params map[string]any) string
+
+	// bodies, when it returns a non-empty answer for a method, is the body sent
+	// instead of the fixed shapes below. It is what tests that need data back
+	// (conversations.replies, users.info) use.
+	bodies func(method string, params map[string]any) string
 }
 
 func (s *stubSlack) handler() http.HandlerFunc {
@@ -59,6 +64,7 @@ func (s *stubSlack) handler() http.HandlerFunc {
 		}
 		status := s.status
 		s.status = 0
+		bodies := s.bodies
 		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -71,6 +77,14 @@ func (s *stubSlack) handler() http.HandlerFunc {
 		if code != "" {
 			fmt.Fprintf(w, `{"ok":false,"error":%q}`, code)
 			return
+		}
+		// Called outside the lock: a test's body builder is its own code, and it
+		// may look at what the stub has recorded so far.
+		if bodies != nil {
+			if body := bodies(method, params); body != "" {
+				fmt.Fprint(w, body)
+				return
+			}
 		}
 		switch method {
 		case "chat.postMessage", "chat.startStream":
@@ -119,7 +133,7 @@ func newTestPlatform(t *testing.T, stub *stubSlack, mode string) *Platform {
 	t.Helper()
 	cfg := config.Defaults()
 	cfg.Render.Mode = mode
-	return NewPlatform(newStubAPI(t, stub), cfg, "T1", discardLogger())
+	return NewPlatform(newStubAPI(t, stub), cfg, Identity{TeamID: "T1"}, discardLogger())
 }
 
 func newTestRenderer(t *testing.T, stub *stubSlack, mode string) *renderer {

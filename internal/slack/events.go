@@ -99,6 +99,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 		},
 		UserID:    event.User,
 		Workspace: callback.TeamID,
+		TS:        event.TS,
 		Text:      strings.TrimSpace(text),
 		Mentioned: mentioned,
 		Direct:    direct,

@@ -57,6 +57,11 @@ type Message struct {
 	EventID string // platform event ID, used to drop redeliveries
 	Thread  Thread
 	UserID  string // the human who sent it
+	// TS is the platform's identifier for this particular message, which is what
+	// the observation watermark is compared against. It differs from
+	// Thread.ThreadTS for a reply, and equals it for the message that started the
+	// thread.
+	TS string
 	// Workspace is the workspace (Slack team) ID. It is the same identifier
 	// Thread.Workspace carries, and streaming to a channel needs it.
 	Workspace string
@@ -109,6 +114,32 @@ type Action struct {
 	// replace it instead of leaving a stale picker behind.
 	MessageTS string
 	ReplyTo   string
+}
+
+// Said is one message of a thread's conversation: something said by somebody
+// other than the agent. What was said between two of the agent's turns rides in
+// front of the next prompt, so a session can follow a conversation it is only
+// occasionally addressed in (DESIGN.md §4).
+type Said struct {
+	TS     string // the platform's message id, which orders the transcript
+	UserID string // who said it, empty for a platform that has no identity to give
+	Name   string // display name, empty when the platform cannot resolve one
+	Text   string
+	// FromBot marks pi-chat's own message. The core leaves them out of a
+	// transcript — the agent has them in its own history — and only the adapter
+	// can tell which messages are its own.
+	FromBot bool
+}
+
+// Observer is implemented by a platform that can read a thread's conversation
+// back. The core asks for everything said after the watermark it remembers and
+// folds the answer into the next prompt; a platform that cannot answer is simply
+// not asked (DESIGN.md §4).
+//
+// Pagination and sanity caps are the platform's business; what reaches a prompt
+// is bounded by the core.
+type Observer interface {
+	Conversation(ctx context.Context, t Thread, oldest string) ([]Said, error)
 }
 
 // Renderer renders one turn into its thread. A renderer is used by a single

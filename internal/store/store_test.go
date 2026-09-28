@@ -36,6 +36,7 @@ func sampleThread() ThreadRow {
 		LastSeq:     41,
 		LeafID:      "leaf-41",
 		ProgressTS:  "1700000000.000200",
+		ObservedTS:  "1700000000.000150",
 		CreatedAt:   now,
 		LastActive:  now,
 	}
