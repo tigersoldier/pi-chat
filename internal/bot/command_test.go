@@ -403,8 +403,21 @@ func TestPiArgsWithoutApprovals(t *testing.T) {
 	b.cfg.Behavior.InjectedPrompt = ""
 
 	project := workspaceProject(t, b, "fix the tests")
-	if args := b.piArgs(project); len(args) != 0 {
-		t.Errorf("piArgs = %v, want none", args)
+	args := b.piArgs(project)
+	if slices.Contains(args, "--approve") {
+		t.Errorf("approvals are interactive, so --approve should not be there: %v", args)
+	}
+	// The instruction that explains a Slack thread is not configuration: every
+	// session pi-chat creates carries it, so the arguments are never empty even
+	// when nothing else is set.
+	if n := countFlag(args, "--append-system-prompt"); n != 1 {
+		t.Errorf("--append-system-prompt appears %d times in %v, want once", n, args)
+	}
+	if value := flagValue(t, args, "--append-system-prompt"); !strings.Contains(value, instructionMarker) {
+		t.Errorf("the instruction is missing from %v", args)
+	}
+	if len(args) != 2 {
+		t.Errorf("piArgs = %v, want just the instruction", args)
 	}
 }
 

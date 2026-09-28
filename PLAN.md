@@ -306,10 +306,20 @@ for.
       also found a bogus sidecar keyed by the daemon's cwd on every `gw_new_session`,
       which `delete` cannot remove — written up in the proposal's Outcome section and
       [filed as pi-gateway issue #1](https://github.com/tigersoldier/pi-gateway/issues/1).
-- [ ] The instruction: add it to the `--append-system-prompt` that `bot.piArgs` already
+- [x] The instruction: add it to the `--append-system-prompt` that `bot.piArgs` already
       builds for sessions we create, and prefix it to the first prompt we send in an
       adopted session inside `<slack-specific-instructions>` markers — re-sent after an
       observed `compaction_end`, never per turn
+      — built: `internal/bot/instruction.go` (the text, the `(pi-chat instruction)` marker
+      that identifies it, and `appendSystemPrompt`, which coalesces the configured
+      `pi_args` and the project's injected prompt into **one** flag instead of risking
+      two), the catalog check for whether a session already carries it
+      (`gw_list_sessions[].spawn`, so a session made before this build is not trusted
+      because its name looks like ours), the adopted-path prefix, a re-send after a
+      *successful* `compaction_end` (applied to the thread, because it can arrive between
+      turns while its consequence outlives the turn it happened in), and the permanence
+      distinction — a system prompt survives compaction, a message does not. 8 new tests,
+      including one that guards the text still explains the transcript.
 - [x] Observation: fetch the thread with `conversations.replies` from the previous turn's
       trigger, fold the labelled transcript into the prompt, bound it, and write the
       omitted text to a per-thread file (DESIGN §4, decisions 4 and 5)
@@ -326,14 +336,22 @@ for.
 - [x] `users:read`-driven labels in the transcript, with the ID-only fallback when the
       scope is missing (the adapter latches after the first refusal, so a plain-bot install
       pays for one failed call, not one per message)
-- [ ] `users:read` in both manifests, so labels carry names: **the app must be reinstalled
-      for the scope change** (the code side above is done and works without it)
+- [x] `users:read` in both manifests, so labels carry names — added to
+      `slack/manifest.yaml` and `slack/manifest-agent.yaml`, and to the scope table in
+      `docs/slack-app-setup.md`. **The app still has to be reinstalled for it to take
+      effect**: until then a transcript reads `[U123]`, with one warning in the journal
+      and no further attempts (`users:read` is a *new* scope, so Slack disables the
+      install until it is granted)
 - [ ] Grammar: DM messages turn, channel-thread plain text is observed only, mentions
-      register a thread without provisioning, and a top-level DM message starts a new
-      session with a visible notice
-- [ ] Use the new client surface where it simplifies what exists: `unbound: true` from
-      stop/delete (gwclient now clears its binding), and `spawn` from the catalog to tell
-      whether a session already carries our instruction
+      register a thread without provisioning, a top-level DM message starts a new session
+      with a visible notice, and a **group DM behaves like a channel** rather than like a
+      one-to-one DM (decided 2026-09-28: with two or more people in it, the conversation
+      is no longer only the bot's address, so only a mention turns)
+- [x] Use the new client surface where it simplifies what exists: `spawn` from the catalog
+      now decides whether a session already carries the instruction, instead of trusting a
+      session name that cannot tell a session made before the instruction existed
+- [ ] `unbound: true` from stop/delete (gwclient clears its own binding on it) — that lands
+      with phase 2's `/delete` and eviction, the paths that unbind a thread on purpose
 
 **Exit:** a channel thread where the bot answers mentions, sees what other people said
 since its last turn, and knows what the transcript means — with the instruction installed
@@ -434,14 +452,18 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 ## Next action
 
-1. **M3 — the phase-0 vertical slice.** Both halves are verified: `pi-gatewayd` is up with
-   working tokens, and the Slack app opens a Socket Mode socket with `app_mentions:read`
-   and `chat:write`. Nothing is blocking it.
-2. **When convenient (one reinstall):** the phase-1 scopes and settings (M1.5/M1.6) — see
-   [docs/slack-app-setup.md](docs/slack-app-setup.md), which now includes them in the main
-   walkthrough.
-3. **Whenever you like:** rename the GitHub repo to `pi-chat`, and file the upstream
-   rebind fix (DESIGN §3) — neither blocks M3.
+1. **The rest of M4.7.** The upgrade, the observation and the instruction are built,
+   tested and deployed. What is left is the grammar half (`@pi /new`, plain text as
+   observation only, a top-level DM starting a new session, group DMs behaving like
+   channels) and `users:read` in both manifests — the reinstall is the one part that is
+   yours to do.
+2. **Open from the interview:** `@pi /new` semantics (the next question), how a message
+   arriving mid-turn is handled (the code takes the next turn's transcript), and whether
+   the first turn in a thread that already had people talking should read that history
+   (the code does, bounded — say so if you would rather it did not).
+3. **Whenever you like:** rename the GitHub repo to `pi-chat`. The upstream rebind ask
+   (DESIGN §3) is unchanged, and the spawn-sidecar litter is filed as
+   [pi-gateway issue #1](https://github.com/tigersoldier/pi-gateway/issues/1).
 
 The gateway side is ready: `pi-gatewayd` is running, both tokens work, and the seam is
 proven by `tools/gateway-probe`. The repo side is ready: `make check` validates the live

@@ -56,6 +56,7 @@ oauth_config:
       - groups:history
       - im:history
       - mpim:history
+      - users:read           # names beside a message, not just the ID
       - assistant:write      # app_context_changed + legacy methods
       - files:read           # phase 3: attachments
       - reactions:write      # phase 3: a 👀 receipt while the agent works

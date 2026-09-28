@@ -57,6 +57,11 @@ type thread struct {
 	// atomically swapped because the gateway's read goroutine reads it while
 	// the turn path writes it.
 	cur atomic.Pointer[turnState]
+
+	// instrMu guards instr, which the turn path checks and the connection's read
+	// goroutine updates when a compaction discards the instruction.
+	instrMu sync.Mutex
+	instr   instructionState
 }
 
 // errSessionGone reports that the session this thread owns is not in the

@@ -54,15 +54,28 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// go, and because the reply is already on screen while it is read.
 	obs := th.observe(ctx, m)
 
+	// The instruction that explains the transcript travels once per session:
+	// the one we create carries it in its system prompt, and one we adopted gets
+	// it in front of the first prompt of the conversation (DESIGN.md §4).
+	instruction := th.neededInstruction(ctx)
+
 	// Only now do the session's events belong to this turn, and only now may the
 	// flusher render them.
 	st.prompted.Store(true)
-	if _, err := client.Prompt(ctx, trimPrompt(obs.prompt(trimPrompt(m.Text)))); err != nil {
+	prompt := obs.prompt(trimPrompt(m.Text))
+	if instruction != "" {
+		prompt = instruction + "\n\n" + prompt
+	}
+	if _, err := client.Prompt(ctx, trimPrompt(prompt)); err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
 	// The prompt is where those messages went, so this is the first moment the
-	// watermark may move past them.
+	// watermark may move past them — and the instruction is owed until a prompt
+	// has actually carried it.
 	th.rememberObserved(ctx, obs)
+	if instruction != "" {
+		th.instructionSent()
+	}
 	if err := st.waitStarted(ctx, startGrace); err != nil {
 		return err
 	}
@@ -306,6 +319,14 @@ func stripANSI(s string) string {
 // onEvent routes one gateway event to the turn it belongs to. It runs on the
 // connection's read goroutine.
 func (th *thread) onEvent(ev gwclient.Event) {
+	// A compaction is not a turn's output, and its consequence outlives the turn
+	// it happened in: it replaces the conversation with a summary, which is where
+	// an adopted session's instruction lives. It is applied to the thread rather
+	// than to the turn, and it does no I/O — the read goroutine must not block.
+	if ev.Type == "compaction_end" && compactionSucceeded(ev) {
+		th.instructionDiscarded()
+	}
+
 	cur := th.cur.Load()
 	if cur == nil {
 		// Nothing is being rendered: between turns, or a turn that already

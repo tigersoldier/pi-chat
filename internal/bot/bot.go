@@ -614,8 +614,9 @@ func (b *Bot) refuse(ctx context.Context, userID, channel string, thread *Thread
 }
 
 // piArgs is the argument list a new session starts with: the user's own
-// gateway.pi_args, --approve when approvals are automatic, and the project's
-// injected prompt.
+// gateway.pi_args, --approve when approvals are automatic, the project's
+// injected prompt, and the instruction that explains how a Slack thread reads
+// (DESIGN.md §4).
 func (b *Bot) piArgs(project workspace.Project) []string {
 	args := slices.Clone(b.cfg.Gateway.PiArgs)
 	// The setting is what makes the policy explicit; pi_args stays the place
@@ -623,7 +624,8 @@ func (b *Bot) piArgs(project workspace.Project) []string {
 	if b.cfg.Behavior.Approvals == "auto" && !slices.Contains(args, "--approve") {
 		args = append(args, "--approve")
 	}
-	return append(args, b.work.PiArgs(project)...)
+	args = append(args, b.work.PiArgs(project)...)
+	return appendSystemPrompt(args, instructionText)
 }
 
 // SweepWorkspaces removes project directories that no thread accounts for, and

@@ -224,6 +224,39 @@ and puts it in front of the request.
   That is the open question below, settled this way in the code: the mention usually refers
   to what was just said.
 
+### The instruction that explains the conversation (built, 2026-09-27)
+
+The transcript and the request arrive in one prompt, so the agent has to be told what the
+block means. pi-gateway has no way to inject anything mid-conversation — no released pi
+exposes one over RPC (§3) — so the instruction is client-side, and once per session
+rather than once per turn.
+
+- **A session pi-chat creates carries it in `--append-system-prompt`**, merged with the
+  configured `gateway.pi_args` and the project's injected prompt into a *single* flag: pi
+  takes the flag's value as the whole appended prompt, and which of two flags wins is its
+  parser's business, not something to rely on. pi re-supplies the system prompt on every
+  request, so this copy cannot be summarized away — no repetition per turn, none after a
+  restart, none after a compaction.
+- **A session pi-chat adopted cannot be changed that way**: its spawn parameters were
+  recorded when somebody else created it, and replacing them would take away what that
+  creator asked for. The instruction goes in front of the first prompt of the
+  conversation instead, wrapped in `<slack-specific-instructions>` markers, and again
+  after a successful compaction — which is what can summarize it away.
+- **Whether it is already installed is asked of the catalog**, not guessed from the
+  session's name: `gw_list_sessions[].spawn["append-system-prompt"]` is searched for the
+  instruction's own marker (`(pi-chat instruction)`). A session created before this build
+  has pi-chat's name and no instruction, and would otherwise never get one. A catalog that
+  cannot answer means it is sent — a repetition costs a few hundred tokens, while a
+  session that never learns how its prompts are shaped misreads every one of them.
+- **`compaction_end` is applied to the thread rather than to the turn**, and only when it
+  succeeded (not `aborted`, not `willRetry`): it can arrive between turns, its consequence
+  outlives the turn it happened in, and the read goroutine that receives it must not
+  block. A failed compaction changed nothing, so it discards nothing.
+- **The instruction is static per session.** Rewording it reaches future sessions only;
+  changing an existing one is `gw_reload_session{piArgs}`, which is refused while another
+  client is attached (§3). It opens by naming itself, because the agent is expected to
+  follow it, and a deployment that changes the rules should be able to say so.
+
 **Agreed, not built (interview of 2026-09-27).** The grammar half of that interview is
 still ahead of the code; the tables in this section still describe what ships today.
 
@@ -238,14 +271,17 @@ still ahead of the code; the tables in this section still describe what ships to
 3. **A mention registers the thread as a session but does not provision anything.** The
    worktree and the pi process are created by the first turn, so a bare `@pi` or
    `@pi /help` costs a row and nothing else.
+4. **A group DM behaves like a channel, not like a one-to-one DM**: with two or more
+   people in it, the conversation is no longer only the bot's address, so only a mention
+   turns and everything else is observed context. (Decided 2026-09-28; the code still
+   treats `mpim` as direct.)
 
 **Still open from the same interview:** how a message that arrives *while* a turn is
 running is handled (the default, and what the code does, is the next turn's transcript;
 steering it into the running turn is the alternative), what `@pi /new` does precisely —
 whether it takes effect on the next mention or immediately, and what happens to the session
-it replaces — whether the first turn in a thread that already had a human conversation
-includes that history (the code currently includes it, see above), and whether a group DM
-behaves like a channel or like a DM.
+it replaces — and whether the first turn in a thread that already had a human conversation
+includes that history (the code currently includes it, see above).
 
 - **Warm:** the thread has a bound connection; the daemon holds a pi process.
 - **Cold:** the connection is closed after `thread_idle_close_minutes` of inactivity
@@ -333,10 +369,11 @@ What reaches a session, and what does not:
 | Message | Behaviour |
 |---|---|
 | Channel root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one — the bot sits in busy channels |
-| DM or group DM, plain text | A prompt, rooted at that message. In a conversation the bot was added to, the conversation *is* the address — and this is the shape a suggested prompt takes |
+| DM (one-to-one), plain text | A prompt, rooted at that message. In a conversation the bot was added to, the conversation *is* the address — and this is the shape a suggested prompt takes |
+| Group DM, plain text | **Dropped** — observed as context, never a turn: with two or more people in it, the conversation is no longer only the bot's address. *Planned; the code still treats `mpim` as direct* |
 | Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
 | DM root, `@pi <text>` | Same, and the thread is a DM thread |
-| Channel thread, plain text | A prompt **only if** that thread already has a session (the bot sits in busy channels) |
+| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. *Planned; today it is a prompt when the thread is already one of ours* |
 | Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
 | DM thread, plain text | A prompt: in a DM the conversation is already the address |
 | Any thread, other people's messages | Dropped unless the thread is one of the bot's own, and unless the sender is allowed |

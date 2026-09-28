@@ -208,6 +208,7 @@ Reference for what you just applied. Nothing here needs action.
 | `groups:history` | read private-channel messages | the same, in a private channel |
 | `im:history` | read direct messages | DMs with the bot, including DM threads |
 | `mpim:history` | read group direct messages | a multi-person DM that includes the bot |
+| `users:read` | look up who a user ID is | the names in a thread transcript: without it, lines read `[U123]` instead of `[Alice (U123)]` — the agent gets IDs either way, and the fallback is deliberate |
 | `files:read` | download files shared with the app | handing an attached image to the agent (**phase 3**; the scope is requested now so enabling it needs no reinstall) |
 | `reactions:write` | add emoji reactions | a 👀 receipt while the agent is working (**phase 3**) |
 | `assistant:write` | act as a Slack agent | **agent variant only** — required by `app_context_changed` and the legacy `assistant.threads.*` methods. The agent status and title methods pi-chat uses (`agents.sessions.setStatus`/`rename`) need `chat:write` alone |
@@ -311,7 +312,7 @@ Slack's own pages, or who need to check what the manifest applied.
 |---|---|
 | Create New App → From scratch | App name `pi`, pick the workspace |
 | Features → **Socket Mode** | enable; app-level token with `connections:write` |
-| Features → **OAuth & Permissions** → Bot Token Scopes | add the nine (or ten) scopes in [the table above](#bot-token-scopes) |
+| Features → **OAuth & Permissions** → Bot Token Scopes | add the ten (or eleven) scopes in [the table above](#bot-token-scopes) |
 | Features → **Event Subscriptions** | enable; add the five (or nine) bot events; leave the Request URL empty |
 | Features → **App Home** → Show Tabs | Messages Tab on, "allow users to send messages" on |
 | Features → **Interactivity & Shortcuts** | enable; no Request URL needed |
