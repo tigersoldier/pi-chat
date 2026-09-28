@@ -288,6 +288,38 @@ worth fixing before M5 builds `/delete` on top of this base.
 Not built here, because each belongs with the thing that needs it: `agents.sessions.rename`
 titles, `suspended` while a turn waits for an approval (M5), `closed` on `/delete` (M5).
 
+### M4.7 — the thread conversation, and the instruction that explains it
+
+Agreed in the 2026-09-27 interview (DESIGN §4 lists the decisions, and which parts are
+still open). The upstream half is settled: pi-gateway v0.1.3 shipped durable spawn
+configuration and removed the `inject` command, because no released pi exposes the
+primitive over RPC — so the instruction is client-side, and there is nothing left to wait
+for.
+
+- [ ] Upgrade: build and install `pi-gatewayd` from v0.1.3 (`119f0f2` is running), bump
+      `go.mod` to `v0.1.3` (pi-chat compiles and its tests pass against it), and confirm
+      `gw_welcome.features` carries `spawn_config`
+- [ ] The instruction: add it to the `--append-system-prompt` that `bot.piArgs` already
+      builds for sessions we create, and prefix it to the first prompt we send in an
+      adopted session inside `<slack-specific-instructions>` markers — re-sent after an
+      observed `compaction_end`, never per turn
+- [ ] Observation: fetch the thread with `conversations.replies` from the previous turn's
+      trigger, fold the labelled transcript into the prompt, bound it, and write the
+      omitted text to a per-thread file (DESIGN §4, decisions 4 and 5)
+- [ ] Grammar: DM messages turn, channel-thread plain text is observed only, mentions
+      register a thread without provisioning, and a top-level DM message starts a new
+      session with a visible notice
+- [ ] `users:read` in both manifests for `[Name (U123)]` labels; the app must be
+      reinstalled for the scope change
+- [ ] Use the new client surface where it simplifies what exists: `unbound: true` from
+      stop/delete (gwclient now clears its binding), and `spawn` from the catalog to tell
+      whether a session already carries our instruction
+
+**Exit:** a channel thread where the bot answers mentions, sees what other people said
+since its last turn, and knows what the transcript means — with the instruction installed
+once, not per turn.
+**Depends on:** M4.6, pi-gateway v0.1.3.
+
 ### M5 — Phase 2
 
 - [ ] `@pi /delete` with button confirm → `DeleteSession` → worktree/branch cleanup → row

@@ -9,6 +9,28 @@ integration that drives gateway sessions).
 | Against | pi-gateway `119f0f2`, pi `0.85.1`, RPC protocol 1 |
 | Author | pi-chat, after implementing status, stop and streaming against this daemon |
 
+## Outcome (pi-gateway v0.1.3, `a47e0ad`)
+
+| Ask | Result |
+|---|---|
+| P1 `inject` + `context` capability | **Implemented, then removed** (`a47e0ad`). No released pi exposes `send_message` over RPC — 0.85.1 has none in `rpc-types.d.ts` or `rpc-mode.js` — so the command could only ever answer `not_supported`, and advertising it in `features` would invite clients to depend on something that cannot work. |
+| P2 durable spawn configuration | **Shipped.** Sidecar per session under `<stateDir>/spawn/`, written atomically; recorded spawn-only values win on a cold respawn, the requester fills keys the record never set; delete removes it, `fork`/`clone` copies it; credential values are redacted from the exposed view while the full argv stays internal; a sidecar that cannot be read is reported instead of silently meaning "nothing recorded". |
+| P3 exposure | **Shipped.** `gw_list_sessions[].spawn` (canonical key→values, redacted, omitted when nothing is recorded; the unauthenticated debug `/catalog` omits it) and `gw_welcome.features: ["spawn_config"]`. |
+| P4 replace on reload | **Shipped.** `gw_reload_session{session?, force?, piArgs?}` replaces the record, requires `control`, and the actor adopts the replacement; refused with `reload_busy` while a turn runs or another client is attached. |
+| R5 (never choose between installing and attaching) | **Shipped, with a documented asymmetry.** A client that names a key the record never set is no longer refused; a *live* session with a *differing* value for a *recorded* key still answers `spawn_param_conflict`. |
+
+Also in the release: stop/delete report `unbound: true` and `gwclient` clears its binding from it; `gwclient.SessionRow` is now an alias of `protocol.SessionRow`; `ReloadSession` takes optional `piArgs`.
+
+**Still open:** the §3 stop-rebind ask. The guard that stops an unbound connection from lazily creating a session is still set for `deleted` only, so a session-scoped command after a *stop* still creates a second session. `unbound: true` tells the client immediately, which makes it easier to avoid, but the daemon-side lazy creation stands.
+
+**Revised plan for a standing instruction** (upstream's prescription, and it needs no gateway change):
+
+1. Sessions the bot **creates**: put the instruction in the `--append-system-prompt` it already passes at `gw_new_session`. P2 keeps it installed across hibernation, daemon restarts and respawns triggered by other clients — and it is never compacted, because compaction summarizes messages, not the system prompt.
+2. Sessions the bot **adopts**: prefix the instruction to the first prompt it sends in that session, wrapped in `<slack-specific-instructions>…</slack-specific-instructions>`, and prefix it again after an observed `compaction_end` — which the event stream already delivers.
+3. **New participants** need nothing: the mapping is per line in the transcript block.
+
+The record makes the instruction *static per session*: changing the text later does not reach an existing session unless it is recreated or `gw_reload_session{piArgs}` is used (which is the deliberate P4 path, and unavailable while another client is attached).
+
 ---
 
 ## 1. Context

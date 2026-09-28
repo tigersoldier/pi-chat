@@ -130,15 +130,30 @@ message that distinguishes *stopped* (file exists, attach again) from *deleted*
 convenience.
 
 **Session context injection, and spawn configuration that survives a restart** — see
-[`docs/pi-gateway-session-context.md`](docs/pi-gateway-session-context.md). Two asks: an
-`inject` command that appends a non-turn message to a live session (pi has the primitive
-behind its extension API only), and persistence plus introspection of the spawn
-configuration a session was created with. **Until they ship, the Slack instruction is not
-installed at all** — §4's decisions below are agreed but not built, and building the
-thread observation without it would send the agent an unexplained transcript format. P2
-of that proposal also fixes a defect of ours that exists today: sessions are created with
-the project's `--append-system-prompt`, but the thread connection dials without `piArgs`,
-so the first respawn after a `pi-gatewayd` restart loses it.
+[`docs/pi-gateway-session-context.md`](docs/pi-gateway-session-context.md), which ended in
+a release (**pi-gateway v0.1.3**) rather than an answer. Shipped: durable spawn
+configuration (`gw_welcome.features: ["spawn_config"]`, `gw_list_sessions[].spawn`, a
+sidecar under `<stateDir>/spawn/`, `gw_reload_session{piArgs}` to replace it). **Removed:**
+the `inject` command, because no released pi exposes `send_message` over RPC — the
+primitive is extension-only — so it could only ever answer `not_supported`. Upstream's
+prescription for a standing instruction is therefore client-side, and it is what §4's
+decisions now assume: the instruction goes in `--append-system-prompt` for sessions we
+create (the record re-applies it, and compaction cannot touch it), and into the first
+prompt we send in a session we adopted, wrapped in `<slack-specific-instructions>`
+markers, re-sent after an observed `compaction_end`.
+
+That same release also **fixes the defect recorded here**: because spawn configuration is
+now persisted and re-applied, the project's `--append-system-prompt` survives a
+`pi-gatewayd` restart even though the thread connection dials without `piArgs`. It needs
+the upgraded daemon (this machine still runs `119f0f2`), and it applies to sessions
+created from then on — sessions that predate the release were already created without a
+record.
+
+The stop-rebind ask above is **unchanged** by that release: the guard is still set for
+`deleted` only, so a session-scoped command after a *stop* still creates a second
+session. `unbound: true` in the stop response now tells the client immediately, and
+`gwclient` clears its own binding from it, which makes the invariant easier to keep — but
+it is still an invariant.
 
 ---
 
