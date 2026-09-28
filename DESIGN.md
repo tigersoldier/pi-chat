@@ -204,6 +204,11 @@ and puts it in front of the request.
 - **The watermark moves only after a prompt is accepted**, and never backwards. A turn
   whose prompt failed leaves the conversation for the next turn to read again; a replayed
   turn cannot make the bot read the same messages twice.
+- **The boundary is checked, not trusted.** Slack takes `oldest` as the start of a range
+  rather than as an exclusive bound, so the message a previous prompt already carried
+  comes back with the next fetch; the core drops anything at or before the watermark
+  before it can become a line. Without that filter an earlier request would reappear as
+  a remark somebody made.
 - **The transcript rides in the prompt**, as a block between `<thread-conversation>`
   markers whose lines are `[Name (U123)] text`. The request follows the block, and the
   instruction installed once (§3, and the milestone that adds it) is what tells the agent
@@ -368,6 +373,11 @@ commands inside message threads** and its slash-command payload carries no `thre
    in phase 1) is answered rather than forwarded: pi would receive `/delete` as literal
    prompt text, and a clear "not in this build yet" beats that.
 6. **`@pi /delete` asks for confirmation with buttons**, then deletes.
+7. **A message nobody addressed to the bot is dropped before the allowlist is
+   consulted.** It is not a request, so there is nothing to refuse: an unlisted person
+   answering their colleague in a thread the bot happens to be in must not draw a visible
+   reply about somebody's allowlist. Their *mention*, or their DM, is a request, and a
+   refusal is the answer to it.
 
 What reaches a session, and what does not:
 
@@ -381,7 +391,7 @@ What reaches a session, and what does not:
 | Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark |
 | Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
 | DM thread, plain text | A prompt: in a DM the conversation is already the address |
-| Any thread, other people's messages | Dropped unless the thread is one of the bot's own, and unless the sender is allowed |
+| Any thread, a message that addresses nobody | **Dropped**, and before the allowlist is consulted: whoever sent it, it is not a request, so there is nothing to answer and nothing to refuse
 
 ### Command reference (v1)
 
@@ -550,7 +560,7 @@ threads(thread_key PK,            -- workspace:channel:thread_ts
         observed_ts,              -- newest message a prompt has already carried
         created_at, last_active)
 
-seen(event_id PK, received_at)    -- Slack retry dedupe (TTL sweep)
+seen(event_id PK, received_at)    -- inbound dedupe (TTL sweep); see the rule below
 pending_ui(dialog_id PK, thread_key, message_ts, created_at)
 admissions(id PK, thread_key, text, event_id, queued_at)
 retired(session_path PK,          -- a session /new replaced, kept resumable
@@ -571,10 +581,15 @@ Rules:
   text: the database stores how far the conversation has been read, never what it said.
 - **Persist before acking** anything that mutates state, so a crash cannot lose an acked
   message.
-- **`seen` is mandatory**, not an optimisation: upstream prompt idempotency is still
-  open, so this is the only guard against a Slack retry producing a double turn. A
-  failure to *write* the claim blocks the turn: running the prompt once, late, beats
-  running it twice.
+- **`seen` is mandatory**, not an optimisation, and it holds two kinds of key: a
+  **message's** identity — `msg:<workspace>:<channel>:<ts>`, which is what a turn is
+  claimed under — and, for input a message cannot identify (a slash command, a button,
+  an event the platform gave no timestamp), the event or envelope id. A message is the
+  unit of work, and one message can arrive as several events: Slack reports a mention
+  both as `app_mention` and as `message.channels`, with the same `ts` and two different
+  `event_id`s. Claiming by event id spent two turns, and posted two answers, on one
+  request. A failure to *write* the claim blocks the turn: running the prompt once, late,
+  beats running it twice.
 - **`progress_ts` is persisted** (with the reply's timestamp) so that a later phase
   can recognize the message a restart left half-written. Nothing reads it back yet:
   a restarted process cannot resume a stream it was not holding, so the next turn
@@ -770,6 +785,17 @@ terminal).
 extraction, allowlist input, mention stripping, rendering and chunking, streaming vs
 fallback, interactive components and modals, file download → `protocol.ImageContent`,
 slash-command registration.
+
+**Arguments travel form-encoded**, and that is a requirement rather than a preference:
+Slack reads a JSON body for some Web API methods and ignores it for others, where the
+arguments then look absent instead of malformed — `conversations.replies` answers
+`invalid_arguments` and `users.info` answers `user_not_found` for users that exist. Both
+methods pi-chat added for observation are in that second group, so the history a turn
+should read and the names it should show were silently missing until the client sent
+forms (scalars as text, and a structured value such as `blocks` or `prompts` as the JSON
+string Slack documents for a form body). The test stub parses what Slack parses, and
+answers the strict methods the way Slack answers, so this cannot return unnoticed — the
+stub decoding JSON was what let it live.
 
 The Slack app itself is configuration as code: `slack/manifest.yaml` (standard bot) and
 `slack/manifest-agent.yaml` (agent messaging experience) are the two supported app

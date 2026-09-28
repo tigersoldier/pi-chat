@@ -264,6 +264,50 @@ func TestTheWatermarkIsWhatTheNextFetchAsksFrom(t *testing.T) {
 	}
 }
 
+// The watermark is an exclusive lower bound in intent, but Slack's `oldest` is
+// inclusive: the message a previous prompt already carried comes back with the
+// next fetch, and it must not arrive as a remark somebody made.
+func TestTheMessageAtTheWatermarkIsNotPresentedAsARemark(t *testing.T) {
+	b, plat, st := newTestBot(t)
+	th := testThread(t, b, st)
+	th.rememberObserved(context.Background(), observation{ts: "1700000000.000500"})
+
+	plat.said = []Said{
+		{TS: "1700000000.000500", UserID: "U2", Name: "Alice", Text: "already carried"},
+		{TS: "1700000000.000600", UserID: "U2", Name: "Alice", Text: "said since"},
+	}
+	obs := th.observe(context.Background(), Message{TS: "1700000000.000700", Text: "and?"})
+
+	if strings.Contains(obs.block, "already carried") {
+		t.Errorf("the message at the watermark came back as a remark:\n%s", obs.block)
+	}
+	if !strings.Contains(obs.block, "said since") {
+		t.Errorf("the block is missing what was said since the watermark:\n%s", obs.block)
+	}
+	if want := "1700000000.000700"; obs.ts != want {
+		t.Errorf("watermark = %q, want the newest message %q", obs.ts, want)
+	}
+}
+
+// When nothing but the boundary comes back there is nothing to show — but the
+// watermark still moves to the trigger, because the request is carried as the
+// prompt and a later turn must not present it as somebody's remark.
+func TestABoundaryOnlyFetchStillMovesTheWatermark(t *testing.T) {
+	b, plat, st := newTestBot(t)
+	th := testThread(t, b, st)
+	th.rememberObserved(context.Background(), observation{ts: "1700000000.000500"})
+
+	plat.said = []Said{{TS: "1700000000.000500", UserID: "U2", Name: "Alice", Text: "already carried"}}
+	obs := th.observe(context.Background(), Message{TS: "1700000000.000800", Text: "what changed?"})
+
+	if obs.block != "" {
+		t.Errorf("block = %q, want nothing to tell", obs.block)
+	}
+	if want := "1700000000.000800"; obs.ts != want {
+		t.Errorf("watermark = %q, want the trigger %q", obs.ts, want)
+	}
+}
+
 // plainPlatform is a platform that cannot read a thread back, so the core must
 // not ask it to.
 type plainPlatform struct{ started int }

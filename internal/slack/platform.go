@@ -229,6 +229,7 @@ func capabilityUnavailable(err error) bool {
 	for _, code := range []string{
 		"feature_disabled",       // no agent feature in this workspace
 		"missing_scope",          // declared agent_view but never granted the scope
+		"not_agent_app",          // the app is not an agent app at all
 		"unknown_method",         // an older API surface
 		"method_deprecated",      //
 		"not_allowed_token_type", // a token Slack will not accept here at all

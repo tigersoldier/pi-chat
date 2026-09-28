@@ -125,32 +125,41 @@ func TestPostSendsButtonsAsAnActionsBlock(t *testing.T) {
 	}
 
 	call := stub.recorded()[0]
-	blocks, ok := call.params["blocks"].([]any)
-	if !ok || len(blocks) != 1 {
+	var blocks []struct {
+		Type     string `json:"type"`
+		Elements []struct {
+			ActionID string `json:"action_id"`
+			Value    string `json:"value"`
+			Style    string `json:"style"`
+			Text     struct {
+				Type string `json:"type"`
+			} `json:"text"`
+		} `json:"elements"`
+	}
+	jsonParam(t, call.params, "blocks", &blocks)
+	if len(blocks) != 1 {
 		t.Fatalf("blocks = %#v, want one actions block", call.params["blocks"])
 	}
-	actions := blocks[0].(map[string]any)
-	if actions["type"] != "actions" {
-		t.Fatalf("block type = %v, want actions", actions["type"])
+	if blocks[0].Type != "actions" {
+		t.Fatalf("block type = %v, want actions", blocks[0].Type)
 	}
-	elements := actions["elements"].([]any)
+	elements := blocks[0].Elements
 	if len(elements) != 2 {
 		t.Fatalf("elements = %d, want 2", len(elements))
 	}
-	first := elements[0].(map[string]any)
-	if first["action_id"] != bot.ActionResume || first["value"] != "/sessions/a.jsonl" {
+	first := elements[0]
+	if first.ActionID != bot.ActionResume || first.Value != "/sessions/a.jsonl" {
 		t.Errorf("first button = %#v", first)
 	}
-	if first["style"] != nil {
+	if first.Style != "" {
 		t.Errorf("an unstyled button got a style: %#v", first)
 	}
-	if second := elements[1].(map[string]any); second["style"] != "primary" {
+	if second := elements[1]; second.Style != "primary" {
 		t.Errorf("second button lost its style: %#v", second)
 	}
 	// A button's label is plain text, because Slack rejects markdown there.
-	text := first["text"].(map[string]any)
-	if text["type"] != "plain_text" {
-		t.Errorf("button text type = %v, want plain_text", text["type"])
+	if first.Text.Type != "plain_text" {
+		t.Errorf("button text type = %v, want plain_text", first.Text.Type)
 	}
 }
 

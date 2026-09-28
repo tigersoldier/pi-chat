@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -23,11 +24,27 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// jsonParam reads a parameter that travels as a JSON string inside a form body —
+// a message's blocks, a suggestion's prompts — back into the structure a test
+// asserts on. That string is the shape Slack's form parser takes, so a
+// parameter arriving as anything else would not be a request Slack could read.
+func jsonParam(t *testing.T, params map[string]any, key string, out any) {
+	t.Helper()
+	raw, ok := params[key].(string)
+	if !ok {
+		t.Fatalf("%s = %#v, want a JSON string in the form body", key, params[key])
+	}
+	if err := json.Unmarshal([]byte(raw), out); err != nil {
+		t.Fatalf("%s = %q, want JSON: %v", key, raw, err)
+	}
+}
+
 // stubCall is one recorded Web API request.
 type stubCall struct {
-	method string
-	params map[string]any
-	auth   string
+	method      string
+	params      map[string]any
+	auth        string
+	contentType string
 }
 
 // stubSlack is a stand-in for Slack's Web API.
@@ -47,17 +64,46 @@ type stubSlack struct {
 	bodies func(method string, params map[string]any) string
 }
 
+// strictJSON names the methods that ignore a JSON body, with the error each
+// answers when it gets one. Slack reports these as argument problems rather than
+// as an unreadable body — conversations.replies says `invalid_arguments` and
+// users.info answers `user_not_found` for a user that exists — which is what
+// kept the mismatch quiet. The stub answers the same way, so a body Slack would
+// ignore cannot pass a test and then fail in a workspace.
+var strictJSON = map[string]string{
+	"conversations.replies": "invalid_arguments",
+	"users.info":            "user_not_found",
+}
+
 func (s *stubSlack) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var params map[string]any
-		if len(raw) > 0 {
-			_ = json.Unmarshal(raw, &params)
-		}
 		method := strings.TrimPrefix(r.URL.Path, "/")
+		raw, _ := io.ReadAll(r.Body)
+		contentType := r.Header.Get("Content-Type")
+
+		// Slack reads arguments from a form body, and from a JSON body only for
+		// the methods that accept one.
+		params := map[string]any{}
+		unread := ""
+		switch {
+		case strings.HasPrefix(contentType, "application/json"):
+			if unread = strictJSON[method]; unread == "" && len(raw) > 0 {
+				_ = json.Unmarshal(raw, &params)
+			}
+		case len(raw) > 0:
+			if values, err := url.ParseQuery(string(raw)); err == nil {
+				for key, value := range values {
+					if len(value) > 0 {
+						params[key] = value[0]
+					}
+				}
+			}
+		}
 
 		s.mu.Lock()
-		s.calls = append(s.calls, stubCall{method: method, params: params, auth: r.Header.Get("Authorization")})
+		s.calls = append(s.calls, stubCall{
+			method: method, params: params, auth: r.Header.Get("Authorization"), contentType: contentType,
+		})
 		code := s.failed[method]
 		if s.policy != nil {
 			code = s.policy(method, params)
@@ -68,6 +114,10 @@ func (s *stubSlack) handler() http.HandlerFunc {
 		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
+		if unread != "" {
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, unread)
+			return
+		}
 		if status != 0 {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(status)

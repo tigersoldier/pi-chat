@@ -35,12 +35,15 @@ func TestSetSuggestedPromptsOmitsThreadTS(t *testing.T) {
 	if params["title"] != "Try one of these" {
 		t.Errorf("title = %v", params["title"])
 	}
-	prompts, ok := params["prompts"].([]any)
-	if !ok || len(prompts) != 1 {
+	var prompts []struct {
+		Title   string `json:"title"`
+		Message string `json:"message"`
+	}
+	jsonParam(t, params, "prompts", &prompts)
+	if len(prompts) != 1 {
 		t.Fatalf("prompts = %#v, want one", params["prompts"])
 	}
-	first, ok := prompts[0].(map[string]any)
-	if !ok || first["title"] != "What changed?" || first["message"] == "" {
+	if prompts[0].Title != "What changed?" || prompts[0].Message == "" {
 		t.Errorf("prompt = %#v, want the core's title and message", prompts[0])
 	}
 }

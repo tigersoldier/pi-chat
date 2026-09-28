@@ -365,6 +365,51 @@ for.
 - [ ] `unbound: true` from stop/delete (gwclient clears its own binding on it) — that lands
       with phase 2's `/delete` and eviction, the paths that unbind a thread on purpose
 
+**Fixed after the first real conversation (2026-09-28)** — three defects the first live
+use found, all of them in paths the stubs could not see:
+
+- [x] **One message, two turns.** Slack reports a mention twice — `app_mention` and
+      `message.channels`, same `ts`, two different `event_id`s — and the core claimed a
+      turn by event id, so one request posted two answers (visible in the `seen` table as
+      two ids in the same second, and in the journal as two turns ten seconds apart).
+      A message is now claimed by its own identity, `msg:<workspace>:<channel>:<ts>`,
+      which is what all deliveries of it share; input a message cannot identify (a slash
+      command, a button, an event with no timestamp) still claims by event or envelope id.
+      4 new tests: the three shapes a twin arrives in, the two deliveries disagreeing
+      about *why* they were routed, and — the guard against over-reach — that two
+      messages in one thread are still two turns. Also verified in isolation that the
+      second delivery is dropped synchronously, before any session is touched.
+- [x] **The conversation never arrived.** Every Web API call went out with a JSON body,
+      and Slack parses a JSON body for some methods while ignoring it for others, so the
+      arguments look absent rather than malformed: `conversations.replies` answered
+      `invalid_arguments` on every turn and `users.info` answered `user_not_found` for
+      users that exist (including the bot's own id). Measured against the live API before
+      changing anything: the same call as JSON fails with any arguments at all, and as a
+      form body it reads 20 messages. Arguments now travel form-encoded — scalars as
+      text, structured values (`blocks`, `prompts`) as the JSON string Slack documents for
+      a form body — which every method accepts; the stub now parses what Slack parses and
+      answers the strict methods the way Slack answers, so a JSON body cannot pass a test
+      and then fail in a workspace. 3 wire-shape tests, plus a new opt-in live test
+      (`internal/slack/live_test.go`). Verified live through this client: 20 messages read
+      from the real thread, and `U6K8Y3FV1` resolved to `tigersoldier`.
+- [x] **An unaddressed message drew an allowlist refusal.** The allowlist was consulted
+      before the question of whether the bot was addressed at all, so an unlisted person's
+      reply in a thread got a visible "I am not allowed to work for you". The drop now
+      comes first: a message nobody addressed is not a request, so there is nothing to
+      refuse — their mention, or their DM, is refused as before. 2 new tests.
+- [x] Also fixed while in there: the core filters the observation boundary itself, because
+      Slack's `oldest` is inclusive and the message a previous prompt carried could
+      otherwise return as a remark somebody made. 2 new tests.
+
+- [ ] The workspace's app answers `not_agent_app` for
+      `assistant.threads.setSuggestedPrompts`, and it latched `feature_disabled` for
+      `agents.sessions.setStatus`: whatever it is installed as now, it is not an agent
+      app, so the suggested prompts (M4.6) and the session indicator are dormant. Nothing
+      to code — turns, commands and `/pi status` do not need either — but installing from
+      `slack/manifest-agent.yaml` (and any Slack-side agent feature that has to be
+      switched on first) is what makes them live. Found by the new live test, which is why
+      that test skips on a capability answer rather than failing.
+
 **Exit:** a channel thread where the bot answers mentions, sees what other people said
 since its last turn, and knows what the transcript means — with the instruction installed
 once, not per turn.

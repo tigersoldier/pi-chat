@@ -69,11 +69,7 @@ func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, v
 // background, so the caller can acknowledge the platform immediately
 // (DESIGN.md §7: the ack budget is three seconds).
 func (b *Bot) HandleMessage(ctx context.Context, m Message) {
-	if !b.claim(ctx, m.EventID) {
-		return
-	}
-	if !b.allowed(m.UserID, m.Thread.Channel) {
-		b.refuse(ctx, m.UserID, m.Thread.Channel, &m.Thread, "")
+	if !b.claim(ctx, messageClaim(m)) {
 		return
 	}
 
@@ -91,11 +87,22 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	// the bot sits in busy rooms, and a reply meant for somebody else must not
 	// spend one. Nothing is lost by dropping it, because the next turn reads the
 	// thread back from its watermark (DESIGN.md §4, §5).
+	//
+	// This is checked before the allowlist on purpose. A message nobody addressed
+	// to the bot is not a request, so there is nothing to refuse — and a stranger
+	// answering their colleague in a thread the bot happens to be in must not draw
+	// a visible reply about somebody's allowlist (DESIGN.md §5, §10).
 	if !m.Mentioned && !m.Direct {
 		b.log.Debug("not addressed to the bot; the next turn will read it as context",
 			"thread", m.Thread.Key(), "user", m.UserID)
 		return
 	}
+
+	if !b.allowed(m.UserID, m.Thread.Channel) {
+		b.refuse(ctx, m.UserID, m.Thread.Channel, &m.Thread, "")
+		return
+	}
+
 	th, err := b.threadFor(m.Thread)
 	if err != nil {
 		// Without the stored state a prompt could create a second session for a
@@ -504,20 +511,40 @@ func (b *Bot) allowed(userID, channel string) bool {
 	return len(channels) == 0 || slices.Contains(channels, channel)
 }
 
-// claim records the event and reports whether this is the first time it has
-// been seen. A failure to record blocks the turn: without the record, a
+// claim records an inbound identity and reports whether this is the first time
+// it has been seen. A failure to record blocks the turn: without the record, a
 // platform retry would run the same prompt twice, and running it once late
 // beats running it twice (DESIGN.md §7).
-func (b *Bot) claim(ctx context.Context, eventID string) bool {
-	claimed, err := b.store.ClaimEvent(ctx, eventID)
+func (b *Bot) claim(ctx context.Context, key string) bool {
+	claimed, err := b.store.ClaimEvent(ctx, key)
 	if err != nil {
-		b.log.Error("cannot record the inbound event; refusing to act twice", "event", eventID, "error", err)
+		b.log.Error("cannot record the inbound identity; refusing to act twice", "key", key, "error", err)
 		return false
 	}
 	if !claimed {
-		b.log.Debug("duplicate event ignored", "event", eventID)
+		b.log.Debug("duplicate inbound ignored", "key", key)
 	}
 	return claimed
+}
+
+// messageClaim is the identity a message is claimed under, which is not the
+// identity of the event that carried it.
+//
+// A platform can report one message as several events: a mention in a Slack
+// channel arrives both as `app_mention` and as `message.channels`, with the same
+// timestamp and two different event ids. Those are two deliveries of one
+// request, and claiming by event id spends two turns — and posts two answers —
+// on it. The message's own identity is the same in both, so that is what is
+// claimed (DESIGN.md §7).
+//
+// A message a platform gives no timestamp for falls back to its event id: there
+// is nothing better to dedupe by, and a platform that names no message is a
+// platform whose events are its messages.
+func messageClaim(m Message) string {
+	if m.TS == "" {
+		return m.EventID
+	}
+	return "msg:" + m.Thread.Workspace + ":" + m.Thread.Channel + ":" + m.TS
 }
 
 // startTurn builds a renderer and runs the turn in the background.

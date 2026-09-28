@@ -48,21 +48,26 @@ func TestSetStatusMapsTheCoreStates(t *testing.T) {
 }
 
 // TestSetStatusAsksOnceWhenTheInstallCannotShowOne: a workspace without the
-// agent feature answers `feature_disabled` forever, and a per-turn warning about
-// a cosmetic loss is noise. The refusal is remembered, and it is not an error —
+// agent feature answers `feature_disabled` forever, an install that is not an
+// agent app at all answers `not_agent_app`, and a per-turn warning about a
+// cosmetic loss is noise. The refusal is remembered, and it is not an error —
 // turns run without an indicator.
 func TestSetStatusAsksOnceWhenTheInstallCannotShowOne(t *testing.T) {
-	stub := &stubSlack{failed: map[string]string{"agents.sessions.setStatus": "feature_disabled"}}
-	platform := newTestPlatform(t, stub, "stream")
-	thread := bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1.2"}
+	for _, code := range []string{"feature_disabled", "not_agent_app", "missing_scope"} {
+		t.Run(code, func(t *testing.T) {
+			stub := &stubSlack{failed: map[string]string{"agents.sessions.setStatus": code}}
+			platform := newTestPlatform(t, stub, "stream")
+			thread := bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1.2"}
 
-	for i := 0; i < 3; i++ {
-		if err := platform.SetStatus(context.Background(), thread, bot.StatusBusy); err != nil {
-			t.Fatalf("SetStatus %d: %v", i, err)
-		}
-	}
-	if got := stub.methods(); len(got) != 1 {
-		t.Errorf("made %d calls, want 1: an install without the agent feature is asked once", len(got))
+			for i := 0; i < 3; i++ {
+				if err := platform.SetStatus(context.Background(), thread, bot.StatusBusy); err != nil {
+					t.Fatalf("SetStatus %d: %v", i, err)
+				}
+			}
+			if got := stub.methods(); len(got) != 1 {
+				t.Errorf("made %d calls, want 1: an install that cannot show one is asked once", len(got))
+			}
+		})
 	}
 }
 

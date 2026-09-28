@@ -81,11 +81,18 @@ func (th *thread) observe(ctx context.Context, m Message) observation {
 	ctx, cancel := context.WithTimeout(ctx, observeTimeout)
 	defer cancel()
 
-	said, err := observer.Conversation(ctx, th.t, th.snapshot().ObservedTS)
+	watermark := th.snapshot().ObservedTS
+	said, err := observer.Conversation(ctx, th.t, watermark)
 	if err != nil {
 		th.log.Warn("cannot read what the thread has been saying; prompting without it", "error", err)
 		return observation{}
 	}
+	// The watermark is an exclusive lower bound in intent, but a platform may
+	// treat it as the start of the range and hand the boundary message back —
+	// Slack's `oldest` is inclusive. Dropping it here rather than trusting the
+	// boundary is what keeps a request the previous turn already carried from
+	// returning as a remark somebody made (DESIGN.md §4).
+	said = slices.DeleteFunc(said, func(s Said) bool { return compareTS(s.TS, watermark) <= 0 })
 	if len(said) == 0 {
 		// Nothing new, but the trigger is a message of this thread too: moving
 		// the watermark past it is what stops a later turn from presenting the

@@ -6,8 +6,15 @@ import (
 	"time"
 )
 
-// ClaimEvent records that an inbound event has been handled and reports
+// ClaimEvent records that an inbound identity has been handled and reports
 // whether this call was the first to see it.
+//
+// The key is not always an event id: a message is claimed under its own
+// identity — `msg:<workspace>:<channel>:<ts>` — because one message can arrive
+// as several events, and the event id differs between them (Slack sends
+// app_mention and message.channels for the same mention). Slash commands,
+// buttons and anything a platform does not timestamp for fall back to the event
+// or envelope id.
 //
 // This is mandatory rather than an optimisation (DESIGN.md §7): the gateway's
 // prompt path has no idempotency key, so a platform redelivery that got past
@@ -16,7 +23,7 @@ import (
 // so a duplicate is dropped rather than de-duplicated afterwards.
 //
 // An empty eventID claims nothing and reports true: a platform that sends no
-// event ID gets no dedupe rather than sharing one row with every other
+// identity gets no dedupe rather than sharing one row with every other
 // identifier-less event.
 func (s *Store) ClaimEvent(ctx context.Context, eventID string) (bool, error) {
 	if eventID == "" {

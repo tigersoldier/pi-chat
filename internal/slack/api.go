@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -55,18 +56,20 @@ func IsCode(err error, code string) bool {
 
 // call posts one Web API method and decodes the response into out. A nil out
 // discards the response body beyond its status.
+//
+// Arguments travel form-encoded rather than in a JSON body, and that is not a
+// style choice: Slack parses a JSON body for some methods and ignores it for
+// others, where the arguments then look absent rather than malformed.
+// conversations.replies answered `invalid_arguments` and users.info answered
+// `user_not_found` — for the bot's own user ID — for as long as this sent JSON.
+// Every method takes a form body; only some take JSON.
 func (a *API) call(ctx context.Context, method string, params map[string]any, out any) error {
 	// The request body is kept as bytes rather than as a reader: an http.Request
 	// consumes its body, so a retry built on the same reader would send no
 	// parameters at all — which is exactly how the rate-limit retry used to fail.
-	contentType := "application/x-www-form-urlencoded"
-	var raw []byte
-	if params != nil {
-		encoded, err := json.Marshal(params)
-		if err != nil {
-			return fmt.Errorf("slack %s: encode request: %w", method, err)
-		}
-		raw, contentType = encoded, "application/json; charset=utf-8"
+	raw, err := encodeParams(params)
+	if err != nil {
+		return fmt.Errorf("slack %s: encode request: %w", method, err)
 	}
 
 	for attempt := 0; ; attempt++ {
@@ -78,7 +81,7 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 		if err != nil {
 			return fmt.Errorf("slack %s: %w", method, err)
 		}
-		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Authorization", "Bearer "+a.token)
 
 		resp, err := a.http.Do(req)
@@ -124,6 +127,51 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 			return fmt.Errorf("slack %s: decode response: %w", method, err)
 		}
 		return nil
+	}
+}
+
+// encodeParams renders arguments as the form body of a Web API request. No
+// parameters is no body at all, which is what methods like auth.test receive.
+func encodeParams(params map[string]any) ([]byte, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	form := url.Values{}
+	for key, value := range params {
+		text, err := paramText(value)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %s: %w", key, err)
+		}
+		form.Set(key, text)
+	}
+	return []byte(form.Encode()), nil
+}
+
+// paramText renders one argument the way a form body carries it: a scalar as
+// its text — an int would otherwise be the JSON number 200, which Slack's
+// argument parser is entitled to read as absent — and anything structured, such
+// as a message's blocks or a suggestion's prompts, as the JSON string Slack
+// documents for a form body.
+func paramText(value any) (string, error) {
+	switch v := value.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	case int:
+		return strconv.Itoa(v), nil
+	case int64:
+		return strconv.FormatInt(v, 10), nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	default:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
 	}
 }
 
