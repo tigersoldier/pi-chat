@@ -115,6 +115,11 @@ func controls() map[string]control {
 			summary: "adopt a session that was started outside pi-chat",
 			run:     (*Bot).cmdResume,
 		},
+		"new": {
+			scope:   scopeThread,
+			summary: "start a fresh session here; the previous one stays resumable",
+			run:     (*Bot).cmdNew,
+		},
 		"abort": {
 			scope:   scopeThread,
 			summary: "cancel the running turn; queued prompts survive",
@@ -159,6 +164,49 @@ func (b *Bot) cmdResume(ctx context.Context, r request, _ string) error {
 	return b.pickResumable(ctx, r)
 }
 
+// cmdNew answers @pi /new: replace this thread's session with a fresh one.
+//
+// The text after the command, when there is any, is the new session's first
+// prompt — otherwise the next message here is. The session being replaced stays
+// resumable, and the answer says so, because somebody who wanted their work gone
+// would have asked for `/pi delete` instead (DESIGN.md §4).
+func (b *Bot) cmdNew(ctx context.Context, r request, arg string) error {
+	th, err := b.threadFor(*r.thread)
+	if err != nil {
+		return err
+	}
+	// A turn holds turnMu for its whole life, so waiting for one would mean this
+	// command answering minutes later. Refusing is immediate and honest.
+	if !th.turnMu.TryLock() {
+		b.answer(ctx, r, "A turn is running here. Stop it, or wait for it to finish, and try again.")
+		return nil
+	}
+	retired, err := th.retire(ctx)
+	th.turnMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !retired {
+		b.answer(ctx, r, "There is no session here yet — send a message and I will start one.")
+		return nil
+	}
+
+	// The notice answers the command, so it is ephemeral like every other command
+	// answer; the fresh session's own answer is a normal message.
+	b.answer(ctx, r, "Starting a new session. The previous one stays available in `/pi resume`.")
+	if text := strings.TrimSpace(arg); text != "" {
+		b.startTurn(ctx, th, Message{
+			Thread:    *r.thread,
+			UserID:    r.userID,
+			Workspace: r.workspace,
+			TS:        r.ts,
+			Text:      text,
+			Mentioned: true,
+		})
+	}
+	return nil
+}
+
 // request is one inbound interaction after the allowlist, normalized across
 // the three entry points so the command and turn paths share one shape.
 type request struct {
@@ -168,6 +216,7 @@ type request struct {
 	workspace string
 	replyTo   string
 	text      string // the command as written, slash included
+	ts        string // the message it arrived in, "" for a slash command
 }
 
 // dispatch resolves one command: a control command of ours, an agent command
@@ -180,6 +229,7 @@ func (b *Bot) dispatch(ctx context.Context, c Command) {
 		workspace: c.Workspace,
 		replyTo:   c.ReplyTo,
 		text:      c.Text,
+		ts:        c.TS,
 	}
 	name, arg := splitCommand(c.Text)
 	if name == "" {
@@ -229,6 +279,7 @@ func (b *Bot) forward(ctx context.Context, r request) {
 		Thread:    *r.thread,
 		UserID:    r.userID,
 		Workspace: r.workspace,
+		TS:        r.ts,
 		Text:      r.text,
 		Mentioned: true,
 	}

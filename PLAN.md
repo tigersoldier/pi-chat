@@ -342,11 +342,23 @@ for.
       effect**: until then a transcript reads `[U123]`, with one warning in the journal
       and no further attempts (`users:read` is a *new* scope, so Slack disables the
       install until it is granted)
-- [ ] Grammar: DM messages turn, channel-thread plain text is observed only, mentions
+- [x] Grammar: DM messages turn, channel-thread plain text is observed only, mentions
       register a thread without provisioning, a top-level DM message starts a new session
       with a visible notice, and a **group DM behaves like a channel** rather than like a
       one-to-one DM (decided 2026-09-28: with two or more people in it, the conversation
       is no longer only the bot's address, so only a mention turns)
+      — built: plain text in a channel thread or a group DM no longer starts a turn (the
+      adapter stops treating `mpim` as direct; the core drops anything not addressed, and
+      the next turn reads it back as context through the watermark), a top-level DM
+      message announces a new session when the DM already had one, and `@pi /new [<text>]`
+      retires the thread's session immediately — letting go of the connection, saving its
+      cursor, clearing the row's session fields and watermark — while the session file,
+      project directory and pi process stay, recorded in the new `retired` table so the
+      startup sweep keeps the directory and `/pi resume` can still adopt the session. A
+      thread's later sessions get a generation suffix (`…-2`), so a thread with more than
+      one session keeps an unambiguous catalog. Store schema 3, verified by migrating the
+      live database 2 -> 3 with its rows intact. 14 new tests (8 core, 6 store) plus two
+      rewritten for the new group-DM and plain-text rules.
 - [x] Use the new client surface where it simplifies what exists: `spawn` from the catalog
       now decides whether a session already carries the instruction, instead of trusting a
       session name that cannot tell a session made before the instruction existed
@@ -457,10 +469,10 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
    observation only, a top-level DM starting a new session, group DMs behaving like
    channels) and `users:read` in both manifests — the reinstall is the one part that is
    yours to do.
-2. **Open from the interview:** `@pi /new` semantics (the next question), how a message
-   arriving mid-turn is handled (the code takes the next turn's transcript), and whether
-   the first turn in a thread that already had people talking should read that history
-   (the code does, bounded — say so if you would rather it did not).
+2. **Open from the interview:** how a message arriving mid-turn is handled (the code takes
+   the next turn's transcript), and whether the first turn in a thread that already had
+   people talking should read that history (the code does, bounded — say so if you would
+   rather it did not).
 3. **Whenever you like:** rename the GitHub repo to `pi-chat`. The upstream rebind ask
    (DESIGN §3) is unchanged, and the spawn-sidecar litter is filed as
    [pi-gateway issue #1](https://github.com/tigersoldier/pi-gateway/issues/1).

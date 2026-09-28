@@ -97,6 +97,14 @@ func (p *fakePlatform) startedTurns() int {
 	return len(p.turns)
 }
 
+// postedTurns returns the turns the core began, in order, so a test can check
+// what a turn was actually asked.
+func (p *fakePlatform) postedTurns() []Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Message(nil), p.turns...)
+}
+
 // Conversation reports what a test put in the thread, making the fake an
 // Observer. It records the watermark it was asked from, which is what a test
 // about observation is usually asserting.

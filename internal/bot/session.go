@@ -287,7 +287,7 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 	defer admin.Close()
 
 	ref, err := admin.NewSession(ctx, gwclient.NewSessionRequest{
-		Name:   th.t.SessionName(),
+		Name:   th.sessionName(ctx),
 		Cwd:    project.Dir,
 		PiArgs: piArgs,
 		Tags:   map[string]string{"platform": platformName, "thread": th.key},
@@ -307,6 +307,82 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 		"cwd", project.Dir, "project", project.Name(), "pi_args", piArgs)
 	created = true
 	return nil
+}
+
+// sessionName is the name a new session gets: the thread's deterministic name,
+// with a generation suffix once the thread has had one before.
+//
+// `/pi new` replaces a thread's session without changing the thread, and two
+// sessions of one thread under one name would leave the catalog ambiguous — for
+// `/pi resume`, and for anyone reading it. The suffix is the count of sessions
+// this thread has retired, so a rebuilt database lands on the same names.
+func (th *thread) sessionName(ctx context.Context) string {
+	base := th.t.SessionName()
+	n, err := th.b.store.RetiredCount(ctx, th.key)
+	if err != nil {
+		th.log.Warn("cannot count the thread's retired sessions; naming this one as the first",
+			"error", err)
+		return base
+	}
+	if n == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s-%d", base, n+1)
+}
+
+// retire lets go of the thread's session because a new one is replacing it, and
+// records that the old one is still there to be resumed.
+//
+// It is deliberately not a delete: the session file, its working directory and
+// its pi process are all left where they are, because "new session" means a
+// clean slate rather than "throw my work away" — that is what `/pi delete` is
+// for, with its confirmation button (DESIGN.md §4).
+//
+// The caller holds turnMu, or has established that no turn is running: a session
+// must not be retired under the turn that is using it.
+//
+// It reports whether there was a session to retire.
+func (th *thread) retire(ctx context.Context) (bool, error) {
+	row := th.snapshot()
+	if row.SessionPath == "" {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
+	defer cancel()
+	if err := th.b.store.RetireSession(ctx, store.RetiredSession{
+		SessionPath: row.SessionPath,
+		ThreadKey:   th.key,
+		SessionName: row.SessionName,
+		ProjectDir:  row.ProjectDir,
+		RetiredAt:   time.Now(),
+	}); err != nil {
+		return false, err
+	}
+
+	// Let go of the connection: the thread must not stay attached to a session it
+	// no longer owns, and closing saves the cursor, so resuming the old session
+	// later continues where this thread stopped rather than replaying it.
+	th.connMu.Lock()
+	client := th.client
+	th.client = nil
+	th.connMu.Unlock()
+	if client != nil {
+		th.saveCursor(ctx, client)
+		_ = client.Close()
+	}
+
+	th.update(func(r *store.ThreadRow) {
+		r.SessionName, r.SessionPath, r.SessionID = "", "", ""
+		r.Cwd, r.ProjectDir = "", ""
+		r.LastSeq, r.LeafID, r.ProgressTS = 0, "", ""
+		// A new session starts with its own conversation: the messages the old one
+		// read are in its history, not in this one's.
+		r.ObservedTS = ""
+		r.State = store.StateCold
+	})
+	th.log.Info("retired the thread's session; it stays resumable",
+		"session", row.SessionName, "path", row.SessionPath)
+	return true, nil
 }
 
 // dial opens the thread's long-lived connection. Events arrive on the

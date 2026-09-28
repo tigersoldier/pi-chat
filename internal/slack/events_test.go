@@ -119,18 +119,40 @@ func TestParseMessageDirectMessages(t *testing.T) {
 		}
 	})
 
-	t.Run("a group DM is a conversation too", func(t *testing.T) {
-		// The bot was added to it deliberately, so a bare message there is
-		// addressed to the bot for the same reason a DM's is.
-		env := eventsAPI(`{"type":"message","user":"U1","text":"what changed?",` +
+	t.Run("a group DM is a room, not an address", func(t *testing.T) {
+		// Two or more people are in it and they talk to each other, so it behaves
+		// like a channel (DESIGN.md §5). A bare top-level message is not addressed
+		// to the bot at all, exactly as in a channel root...
+		root := eventsAPI(`{"type":"message","user":"U1","text":"what changed?",` +
+			`"ts":"1721609960.000600","channel":"G1","channel_type":"mpim"}`)
+		if _, ok := parseMessage(root, botUser); ok {
+			t.Error("a bare top-level message in a group DM is not addressed to the bot")
+		}
+
+		// ...while a reply inside one of its threads reaches the core, which is
+		// where the decision lives that it is context rather than a request.
+		reply := eventsAPI(`{"type":"message","user":"U1","text":"I think so too",` +
+			`"ts":"1721609960.000700","thread_ts":"1721609960.000600",` +
+			`"channel":"G1","channel_type":"mpim"}`)
+		message, ok := parseMessage(reply, botUser)
+		if !ok {
+			t.Fatal("a reply in a group DM thread should reach the core as context")
+		}
+		if message.Direct {
+			t.Error("a group DM should not count as direct: only a mention turns there")
+		}
+	})
+
+	t.Run("a mention in a group DM turns", func(t *testing.T) {
+		env := eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> what changed?",` +
 			`"ts":"1721609960.000600","channel":"G1","channel_type":"mpim"}`)
 
 		message, ok := parseMessage(env, botUser)
 		if !ok {
-			t.Fatal("plain text in a group DM should reach the core")
+			t.Fatal("a mention in a group DM should reach the core")
 		}
-		if !message.Direct {
-			t.Error("a group DM should count as direct")
+		if !message.Mentioned || message.Direct {
+			t.Errorf("mentioned/direct = %v/%v, want true/false", message.Mentioned, message.Direct)
 		}
 	})
 

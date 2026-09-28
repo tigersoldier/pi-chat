@@ -257,31 +257,36 @@ rather than once per turn.
   client is attached (§3). It opens by naming itself, because the agent is expected to
   follow it, and a deployment that changes the rules should be able to say so.
 
-**Agreed, not built (interview of 2026-09-27).** The grammar half of that interview is
-still ahead of the code; the tables in this section still describe what ships today.
+### The grammar of a turn (built, 2026-09-28)
 
-1. **A DM thread is a session, and a top-level DM message starts a new one**, with a
-   one-line notice when the DM already had a session (so a reset is visible rather than
-   silent). Replying inside a thread continues it.
-2. **Plain text in a channel thread is never a turn trigger** — it is conversation to
-   observe. Only a mention turns. The first mention in a channel thread is what starts
-   the session, whether the thread began with the mention or already had people talking.
-   (Observation is built; what is missing is the other half — plain text still triggers a
-   turn today.)
-3. **A mention registers the thread as a session but does not provision anything.** The
-   worktree and the pi process are created by the first turn, so a bare `@pi` or
-   `@pi /help` costs a row and nothing else.
-4. **A group DM behaves like a channel, not like a one-to-one DM**: with two or more
-   people in it, the conversation is no longer only the bot's address, so only a mention
-   turns and everything else is observed context. (Decided 2026-09-28; the code still
-   treats `mpim` as direct.)
+- **Only a mention turns in a room** — a channel thread or a group DM. Plain text there is
+  conversation to observe: the bot sits in busy rooms, and a reply meant for somebody else
+  must not spend a turn. Nothing is lost by not turning on it, because the next turn reads
+  the thread back from its watermark.
+- **In a one-to-one DM the conversation is the address**, so plain text turns — and a
+  **top-level DM message starts a session of its own**, which the thread model gives for
+  free: a new thread is a new session. When the DM already had one, a visible one-line
+  notice says so, because a reset that shows nothing is how work gets lost.
+- **A mention registers the thread but provisions nothing**: the worktree and the pi
+  process are created by the first turn, so a bare `@pi` or `@pi /help` costs a row.
+- **`@pi /new [<text>]` replaces the thread's session.** It retires the current one
+  immediately — the connection is let go, its cursor saved, the row forgets the session —
+  while the session file, its working directory and its pi process are left alone, because
+  "new session" means a clean slate rather than "throw my work away" (that is `/delete`,
+  with its confirmation button). The retired session is recorded (see `retired` in §7) so
+  the startup sweep keeps its directory, and it stays adoptable through `/pi resume`. A
+  following `<text>` becomes the new session's first prompt; without one, the next message
+  here is. A turn already running in the thread is refused rather than waited for.
+- **A thread's later sessions get a generation suffix** (`slack-<ws>-<ch>-<ts>-2`): one
+  thread can now have more than one session, and two of them under one name would leave the
+  catalog ambiguous — for `/pi resume`, and for anyone reading it. The suffix is the number
+  of retired sessions, so a rebuilt database lands on the same names.
 
 **Still open from the same interview:** how a message that arrives *while* a turn is
 running is handled (the default, and what the code does, is the next turn's transcript;
-steering it into the running turn is the alternative), what `@pi /new` does precisely —
-whether it takes effect on the next mention or immediately, and what happens to the session
-it replaces — and whether the first turn in a thread that already had a human conversation
-includes that history (the code currently includes it, see above).
+steering it into the running turn is the alternative), and whether the first turn in a
+thread that already had a human conversation should read that history (the code does,
+bounded — see the observation section above).
 
 - **Warm:** the thread has a bound connection; the daemon holds a pi process.
 - **Cold:** the connection is closed after `thread_idle_close_minutes` of inactivity
@@ -370,10 +375,10 @@ What reaches a session, and what does not:
 |---|---|
 | Channel root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one — the bot sits in busy channels |
 | DM (one-to-one), plain text | A prompt, rooted at that message. In a conversation the bot was added to, the conversation *is* the address — and this is the shape a suggested prompt takes |
-| Group DM, plain text | **Dropped** — observed as context, never a turn: with two or more people in it, the conversation is no longer only the bot's address. *Planned; the code still treats `mpim` as direct* |
+| Group DM, plain text | **Dropped** — observed as context, never a turn: with two or more people in it, the conversation is no longer only the bot's address. Only a mention turns there, exactly as in a channel |
 | Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
 | DM root, `@pi <text>` | Same, and the thread is a DM thread |
-| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. *Planned; today it is a prompt when the thread is already one of ours* |
+| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark |
 | Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
 | DM thread, plain text | A prompt: in a DM the conversation is already the address |
 | Any thread, other people's messages | Dropped unless the thread is one of the bot's own, and unless the sender is allowed |
@@ -386,6 +391,7 @@ What reaches a session, and what does not:
 | `/pi status` | root | bot status |
 | `@pi /status` | thread | session id, cwd, model, warm/cold, queue, last activity |
 | `/pi resume` | root | list adoptable sessions; pick with buttons |
+| `@pi /new [<text>]` | thread | retire this thread's session and start a fresh one; `<text>`, when given, is its first prompt. The old session stays in `/pi resume` |
 | `@pi /abort` | thread | `Abort`; queued prompts survive by design |
 | `@pi /delete` | thread | confirm → `DeleteSession` → worktree/branch cleanup → row deleted |
 | `@pi /model` | thread | `SetModel` / `GetAvailableModels` |
@@ -547,6 +553,8 @@ threads(thread_key PK,            -- workspace:channel:thread_ts
 seen(event_id PK, received_at)    -- Slack retry dedupe (TTL sweep)
 pending_ui(dialog_id PK, thread_key, message_ts, created_at)
 admissions(id PK, thread_key, text, event_id, queued_at)
+retired(session_path PK,          -- a session /new replaced, kept resumable
+        thread_key, session_name, project_dir, retired_at)
 ```
 
 Rules:
@@ -587,6 +595,9 @@ Rules:
   already carried. It advances only after a prompt was accepted, so a failed prompt
   leaves the conversation to be read again, and it never moves backwards, so a replayed
   turn cannot make the bot read the same messages twice.
+- **`retired` is what `/new` keeps alive** (§4): a session it replaced still exists, so its
+  working directory is somebody's work rather than litter, and the sweep has to be able to
+  tell the two apart. It is also where the next session's generation number comes from.
 
 ---
 
@@ -649,9 +660,10 @@ Cleanup:
   the agent made, a worktree on somebody else's branch, or a file the agent wrote outside
   `repos/` is reported as left behind, and a directory that is not empty is never
   removed. Deleting the wrong repository is worse than a directory outliving its session.
-- **Startup GC:** for each directory under `projects_root` with **no** `threads` row:
-  remove its worktrees, prune its branch, delete the directory. Orphans only — a cold
-  thread with a live row is never touched, because `/pi resume` (and the work in its
+- **Startup GC:** for each directory under `projects_root` with **no** `threads` row and
+  no `retired` record: remove its worktrees, prune its branch, delete the directory.
+  Orphans only — a cold thread with a live row is never touched, and neither is the
+  directory of a session `/new` replaced, because `/pi resume` (and the work in its
   worktree) must still be there. Only names that look like pi-chat's own
   (`<YYYY-MM-DD>-<slug>`) are considered at all.
 - Sessions adopted from outside the bot have no project dir, live outside `projects_root`,

@@ -85,31 +85,32 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		return
 	}
 
-	// Plain text in a channel thread is a prompt only when the thread is
-	// already one of ours: the bot sits in busy channels, and a reply to
-	// somebody else's conversation must not start a session. A mention always
-	// starts one, and a DM thread needs neither, because there the conversation
-	// is already the address (DESIGN.md §5).
-	var th *thread
-	switch {
-	case m.Mentioned || m.Direct:
-		created, err := b.threadFor(m.Thread)
-		if err != nil {
-			// Without the stored state a prompt could create a second session for
-			// a thread that already has one, so this is a refusal, not a risk to
-			// take.
-			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
-				Text: "I cannot read this thread's state right now, so I will not start anything: " + err.Error()})
-			return
-		}
-		th = created
-	default:
-		ours, ok := b.tracked(m.Thread)
-		if !ok {
-			b.log.Debug("ignoring plain text in a thread that is not ours", "thread", m.Thread.Key())
-			return
-		}
-		th = ours
+	// A mention starts or joins a session, and in a one-to-one DM plain text does
+	// too: there the conversation *is* the address. Plain text anywhere else — a
+	// channel thread, a group DM — is conversation to observe and never a turn:
+	// the bot sits in busy rooms, and a reply meant for somebody else must not
+	// spend one. Nothing is lost by dropping it, because the next turn reads the
+	// thread back from its watermark (DESIGN.md §4, §5).
+	if !m.Mentioned && !m.Direct {
+		b.log.Debug("not addressed to the bot; the next turn will read it as context",
+			"thread", m.Thread.Key(), "user", m.UserID)
+		return
+	}
+	th, err := b.threadFor(m.Thread)
+	if err != nil {
+		// Without the stored state a prompt could create a second session for a
+		// thread that already has one, so this is a refusal, not a risk to take.
+		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
+			Text: "I cannot read this thread's state right now, so I will not start anything: " + err.Error()})
+		return
+	}
+
+	// A top-level message in a DM starts a session of its own — the thread is the
+	// session, so a new thread is a new session by construction — and saying so is
+	// what keeps that reset from being invisible when the DM already had one
+	// (DESIGN.md §4, §5).
+	if m.Direct && m.TS != "" && m.TS == m.Thread.ThreadTS {
+		b.noticeNewDMSession(ctx, m)
 	}
 
 	// `@pi /status` is a command, not a prompt: the vocabulary is resolved
@@ -120,6 +121,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 			Channel:   m.Thread.Channel,
 			UserID:    m.UserID,
 			Workspace: m.Workspace,
+			TS:        m.TS,
 			Text:      strings.TrimSpace(m.Text),
 		})
 		return
@@ -652,5 +654,40 @@ func (b *Bot) SweepWorkspaces(ctx context.Context) ([]string, error) {
 			keep[row.Cwd] = true
 		}
 	}
+	// Retired sessions are still resumable, so their directories stay too: a
+	// directory no row accounts for is the remains of a crash, but one a retired
+	// session points at is somebody's work (DESIGN.md §4, §9).
+	retired, err := b.store.RetiredProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, dir := range retired {
+		keep[dir] = true
+	}
 	return b.work.Sweep(ctx, keep)
 }
+
+// noticeNewDMSession tells the user that this message starts a session of its
+// own, when the DM already had one.
+//
+// It is a posted message rather than an ephemeral one: it is about the
+// conversation, not about one interaction, and it is the only sign that the
+// earlier session is still there (DESIGN.md §5).
+func (b *Bot) noticeNewDMSession(ctx context.Context, m Message) {
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
+	defer cancel()
+	had, err := b.store.ChannelHasSession(ctx, m.Workspace, m.Thread.Channel, m.Thread.Key())
+	if err != nil {
+		b.log.Warn("cannot tell whether this DM already had a session", "error", err)
+		return
+	}
+	if !had {
+		return
+	}
+	b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: newSessionNotice})
+}
+
+// newSessionNotice is the one line that keeps a new DM session from being a
+// silent reset. The prefix is the same word the command uses, so the two ways to
+// start fresh look alike.
+const newSessionNotice = "New session. The earlier one stays available in `/pi resume`."

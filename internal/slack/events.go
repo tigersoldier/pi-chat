@@ -15,10 +15,12 @@ import (
 // What counts as addressing it:
 //
 //   - a mention, anywhere (`@pi …`);
-//   - plain text in a DM thread, where the conversation is already the address;
-//   - plain text in a channel thread, which the core accepts only for threads
-//     it already owns — the bot sits in busy channels, and a stray reply must
-//     not start a session.
+//   - plain text in a one-to-one DM, where the conversation is already the
+//     address;
+//   - plain text in a channel thread or a group DM, which is conversation to
+//     observe rather than a request: the bot sits in busy rooms, a reply meant
+//     for somebody else must not start a session, and a group DM is a room with
+//     several people in it rather than a private address (DESIGN.md §5).
 //
 // A bare message in a channel or DM *root* is not a prompt: roots are
 // session-less by design (DESIGN.md §4), which is what keeps `@pi hello` in a
@@ -66,7 +68,10 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	// mentioned in alongside others.
 	text := stripMention(event.Text, botUserID)
 	mentioned := event.Type == "app_mention" || text != event.Text
-	direct := event.ChannelType == "im" || event.ChannelType == "mpim"
+	// A group DM is not a one-to-one conversation: two or more people are in it
+	// and they talk to each other, so it behaves like a channel — only a mention
+	// turns (DESIGN.md §5).
+	direct := event.ChannelType == "im"
 
 	switch {
 	case mentioned:

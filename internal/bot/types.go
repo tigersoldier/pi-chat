@@ -88,6 +88,11 @@ type Command struct {
 	Thread    *Thread // nil at a channel or DM root
 	UserID    string
 	Workspace string
+	// TS is the message the command arrived in. It is empty for a slash command,
+	// whose payload carries no timestamp at all, and set when the command was
+	// typed inside a thread — where it is also the message a turn started by the
+	// command has to treat as its trigger.
+	TS string
 
 	// Text is the command as written, slash included: "/status", "/skill:x".
 	// Adapters normalize their platform's shape into this one form — Slack's

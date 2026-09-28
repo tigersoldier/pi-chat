@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -79,6 +79,19 @@ CREATE TABLE IF NOT EXISTS admissions (
     event_id   TEXT NOT NULL,
     queued_at  INTEGER NOT NULL
 );
+
+-- Sessions /pi new replaced but did not delete: they stay resumable, so their
+-- working directories have to survive the sweep that removes the ones no row
+-- accounts for (DESIGN.md §4, §9).
+CREATE TABLE IF NOT EXISTS retired (
+    session_path TEXT PRIMARY KEY,
+    thread_key   TEXT NOT NULL,
+    session_name TEXT NOT NULL DEFAULT '',
+    project_dir  TEXT NOT NULL DEFAULT '',
+    retired_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS retired_thread ON retired(thread_key);
 `
 
 // migrations bring an older database up to schemaVersion, one step at a time.
@@ -97,6 +110,18 @@ var migrations = []struct {
 		// thread's conversation that a prompt has already carried, so the next
 		// turn fetches what came after it and nothing twice.
 		`ALTER TABLE threads ADD COLUMN observed_ts TEXT NOT NULL DEFAULT ''`,
+	}},
+	{to: 3, stmt: []string{
+		// Sessions a new one replaced, kept so their working directories survive
+		// the startup sweep (DESIGN.md §4, §9).
+		`CREATE TABLE IF NOT EXISTS retired (
+            session_path TEXT PRIMARY KEY,
+            thread_key   TEXT NOT NULL,
+            session_name TEXT NOT NULL DEFAULT '',
+            project_dir  TEXT NOT NULL DEFAULT '',
+            retired_at   INTEGER NOT NULL
+        )`,
+		`CREATE INDEX IF NOT EXISTS retired_thread ON retired(thread_key)`,
 	}},
 }
 
@@ -206,6 +231,7 @@ func (s *Store) migrate(ctx context.Context, from int) error {
 var versionStatements = map[int]string{
 	1: "PRAGMA user_version = 1",
 	2: "PRAGMA user_version = 2",
+	3: "PRAGMA user_version = 3",
 }
 
 // setVersion stamps the schema version.

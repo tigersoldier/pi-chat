@@ -160,7 +160,7 @@ func TestHandleMessageDropsPlainTextInAThreadWeDoNotOwn(t *testing.T) {
 	}
 }
 
-func TestHandleMessageContinuesOurOwnThreadWithoutAMention(t *testing.T) {
+func TestHandleMessageDoesNotTurnOnPlainTextInAChannelThread(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	seedThread(t, st, store.ThreadRow{
 		ThreadKey: "T1:C1:1700000000.000100", WorkspaceID: "T1", ChannelID: "C1",
@@ -171,6 +171,32 @@ func TestHandleMessageContinuesOurOwnThreadWithoutAMention(t *testing.T) {
 
 	b.HandleMessage(context.Background(), message)
 
+	// Even in a thread the bot owns, plain text is somebody talking to somebody
+	// else: only a mention turns (DESIGN.md §5). The message is not lost — the
+	// next turn reads it back from the observation watermark — so the assertion is
+	// silence, not an answer.
+	if platform.startedTurns() != 0 {
+		t.Error("plain text in a channel thread started a turn")
+	}
+	if notices := platform.postedNotices(); len(notices) != 0 {
+		t.Errorf("posted %+v, want silence: a nudge on every stray reply would be noise", notices)
+	}
+}
+
+func TestHandleMessageTurnsOnPlainTextInADMThread(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: "T1:D1:1700000000.000100", WorkspaceID: "T1", ChannelID: "D1",
+		ThreadTS: "1700000000.000100", SessionPath: "/sessions/x.jsonl", State: store.StateCold,
+	})
+	message := newTestMessage("Ev1", "carry on")
+	message.Mentioned = false
+	message.Direct = true
+	message.Thread = Thread{Workspace: "T1", Channel: "D1", ThreadTS: "1700000000.000100"}
+
+	b.HandleMessage(context.Background(), message)
+
+	// In a one-to-one DM the conversation is the address, so plain text turns.
 	waitFor(t, "the turn", func() bool { return platform.startedTurns() == 1 })
 }
 
