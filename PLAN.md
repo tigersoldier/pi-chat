@@ -333,6 +333,12 @@ for.
       (fetch after the session exists, advance the watermark only after `Prompt` is
       accepted). 17 new tests, including the bounding, the file, the failure paths and the
       migration.
+      **First live proof, 2026-09-28 11:57:** the watermarks of both threads moved
+      (`observed_ts` empty -> set, which a failed fetch leaves alone), the journal has no
+      "cannot read what the thread has been saying", and the agent — asked to reply in
+      Chinese and restate the thread — recited it in order from its first message, including
+      a message that never became a turn of its own and could therefore only have reached it
+      through the transcript.
 - [x] `users:read`-driven labels in the transcript, with the ID-only fallback when the
       scope is missing (the adapter latches after the first refusal, so a plain-bot install
       pays for one failed call, not one per message)
@@ -413,12 +419,13 @@ use found, all of them in paths the stubs could not see:
       now costs neither a claim nor a turn. Tests: the four contexts, plus the two events
       that used to double-answer.
       **The assumption this rests on, checked with the first message after deploying:**
-      that `app_mention` fires for a mention *inside a thread*. Our own evidence says yes (a
-      thread mention produced two event ids in one second, and Slack's only documented
-      pairing for one message is `app_mention` + `message`); one third-party report says
-      no; Slack's docs do not say. If it is wrong, a thread mention goes unanswered —
-      visible immediately in Slack and in the journal, where the turn would leave no
-      `bound the thread to its session` line — and the fix is two lines.
+      `app_mention` fires for a mention *inside a thread*, and a channel root mention
+      starts a thread of its own. Both were sent 2026-09-28 11:55–11:57 and both were
+      answered, each with exactly one turn: `bound the thread to its session` for the
+      thread mention and `created session` for the root one. The thread turn is the proof,
+      because its `message` delivery is dropped by the rule above — app_mention is the only
+      way it could have been answered. (Two third-party reports say otherwise; this
+      workspace says the reports are stale.) The rule stays as it is.
 
 - [ ] The workspace's app answers `not_agent_app` for
       `assistant.threads.setSuggestedPrompts`, and it latched `feature_disabled` for
