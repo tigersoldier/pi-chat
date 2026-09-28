@@ -38,7 +38,8 @@ The record makes the instruction *static per session*: changing the text later d
 - `gw_delete_session` removes the real record.
 - pi-chat itself passes its live test against the new daemon with the old client library, so the upgrade is compatible in both directions.
 
-**Defect found while verifying, reported upstream.** `handleGWNewSession` calls
+**Defect found while verifying, [reported upstream as issue #1](https://github.com/tigersoldier/pi-gateway/issues/1).**
+`handleGWNewSession` calls
 `setCreated` *before* it asks pi for its state, so `setCreated`'s
 `canonicalPath(a.Path())` runs with an empty path — and `canonicalPath("")` resolves to
 the daemon's working directory, not to nothing. Every `gw_new_session` therefore writes

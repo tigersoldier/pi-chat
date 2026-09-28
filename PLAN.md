@@ -304,8 +304,8 @@ for.
       catalog still reports it, i.e. it came from the sidecar), `go test ./...` and
       `-race` are green, and the live test passes against the new daemon. Verification
       also found a bogus sidecar keyed by the daemon's cwd on every `gw_new_session`,
-      which `delete` cannot remove — written up in the proposal's Outcome section for
-      upstream.
+      which `delete` cannot remove — written up in the proposal's Outcome section and
+      [filed as pi-gateway issue #1](https://github.com/tigersoldier/pi-gateway/issues/1).
 - [ ] The instruction: add it to the `--append-system-prompt` that `bot.piArgs` already
       builds for sessions we create, and prefix it to the first prompt we send in an
       adopted session inside `<slack-specific-instructions>` markers — re-sent after an
