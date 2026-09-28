@@ -31,6 +31,33 @@ Also in the release: stop/delete report `unbound: true` and `gwclient` clears it
 
 The record makes the instruction *static per session*: changing the text later does not reach an existing session unless it is recreated or `gw_reload_session{piArgs}` is used (which is the deliberate P4 path, and unavailable while another client is attached).
 
+### Verified on this machine (v0.1.3 deployed)
+
+- `gw_welcome.features` reports `["spawn_config"]`; grants are unchanged.
+- A session created with `--append-system-prompt` shows it in `gw_list_sessions[].spawn`, and **still shows it after a daemon restart** — read from the sidecar, since nothing else survives. That is the durability promise, confirmed end to end.
+- `gw_delete_session` removes the real record.
+- pi-chat itself passes its live test against the new daemon with the old client library, so the upgrade is compatible in both directions.
+
+**Defect found while verifying, reported upstream.** `handleGWNewSession` calls
+`setCreated` *before* it asks pi for its state, so `setCreated`'s
+`canonicalPath(a.Path())` runs with an empty path — and `canonicalPath("")` resolves to
+the daemon's working directory, not to nothing. Every `gw_new_session` therefore writes
+one bogus sidecar keyed `/home/pi`, holding whichever session was created last. The
+correct record is written later by `onPath`, so durability is unaffected; but
+`gw_delete_session` deletes by the session's real canonical path, so the bogus file
+survives every delete, and `setCreated`'s `canon != ""` guard does not catch it because
+`canonicalPath("")` is not empty.
+
+```text
+create a session with --append-system-prompt, then ls <stateDir>/spawn/
+  -> two files: the real session path, and /home/pi
+DeleteSession, then ls again
+  -> the real record is gone; /home/pi remains, holding the deleted session's config
+```
+
+Suggested fix: persist only from `onPath`/`replaceSpawn`, or make `canonicalPath` refuse
+an empty path (the guard then works as intended).
+
 ---
 
 ## 1. Context

@@ -296,9 +296,16 @@ configuration and removed the `inject` command, because no released pi exposes t
 primitive over RPC — so the instruction is client-side, and there is nothing left to wait
 for.
 
-- [ ] Upgrade: build and install `pi-gatewayd` from v0.1.3 (`119f0f2` is running), bump
+- [x] Upgrade: build and install `pi-gatewayd` from v0.1.3 (`119f0f2` was running), bump
       `go.mod` to `v0.1.3` (pi-chat compiles and its tests pass against it), and confirm
       `gw_welcome.features` carries `spawn_config`
+      — done and verified: the daemon is v0.1.3 (`a47e0ad`), features report
+      `["spawn_config"]`, a `--append-system-prompt` survives a daemon restart (the
+      catalog still reports it, i.e. it came from the sidecar), `go test ./...` and
+      `-race` are green, and the live test passes against the new daemon. Verification
+      also found a bogus sidecar keyed by the daemon's cwd on every `gw_new_session`,
+      which `delete` cannot remove — written up in the proposal's Outcome section for
+      upstream.
 - [ ] The instruction: add it to the `--append-system-prompt` that `bot.piArgs` already
       builds for sessions we create, and prefix it to the first prompt we send in an
       adopted session inside `<slack-specific-instructions>` markers — re-sent after an

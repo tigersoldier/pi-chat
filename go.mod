@@ -5,7 +5,8 @@ go 1.26.4
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/coder/websocket v1.8.15
-	github.com/tigersoldier/pi-gateway v0.1.2
+	github.com/tigersoldier/pi-gateway v0.1.3
+	modernc.org/sqlite v1.59.0
 )
 
 require (
@@ -18,7 +19,6 @@ require (
 	modernc.org/libc v1.75.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.59.0 // indirect
 )
 
 // To develop against a local pi-gateway checkout instead of the published tag
