@@ -70,6 +70,12 @@ const (
 	// rootCommandHint answers a root command that needs a session.
 	rootCommandHint = "That command needs a session, and sessions live in threads: " +
 		"mention me with a prompt to start one, then use `@pi /<command>` there."
+	// channelReplyHint answers somebody who typed in a thread without addressing the
+	// bot. In a channel that is conversation rather than a request, and nothing
+	// about the thread tells them so — the bot may have opened it, which makes
+	// typing in it look exactly like the way to continue.
+	channelReplyHint = "I answer mentions in channels: reply with `@pi <what to do>` and I will pick it up. " +
+		"Anything else here I read as context, not as a request."
 )
 
 // scope says where a command is legal.
@@ -737,7 +743,7 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		b.reply(ctx, Notice{Thread: &thread, Text: "I found that session but could not attach to it: " + err.Error()})
 		return
 	}
-	b.reply(ctx, resumeNotice(thread, *chosen))
+	b.reply(ctx, resumeNotice(thread, *chosen, a.Direct))
 	// The picker is replaced rather than left behind, so the same session
 	// cannot be adopted twice by an old button.
 	if a.MessageTS != "" || a.ReplyTo != "" {
@@ -747,21 +753,29 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 	}
 }
 
-// continueHere says how to keep going in a thread the bot just opened. The
-// grammar differs by context — a channel thread answers mentions, a DM thread
-// answers anything — and a notice that gets this wrong leaves somebody typing at
-// a bot that is listening for something else (DESIGN.md §5).
-const continueHere = "Continue in this thread: in a channel, mention me (`@pi <what to do>`); in a DM, just type."
+// How to keep going in a thread the bot just opened. The grammar differs by
+// context — a channel thread answers mentions, a DM thread answers anything — so
+// the notice says the one that is true where it is posted. Telling somebody in a
+// DM to mention the bot, or somebody in a channel to just type, leaves them
+// talking to a bot that is listening for something else (DESIGN.md §5).
+const (
+	continueInChannel = "Continue in this thread by mentioning me: `@pi <what to do>`."
+	continueInDM      = "This is a direct message: just type here to continue."
+)
 
-// resumeNotice is what an adopted thread says. It carries the thread's channel
-// as well as the thread, because a notice that names only the thread leaves the
-// adapter with nowhere to post it — which is how the first live adoption ended
-// in `channel_not_found` and silence.
-func resumeNotice(t Thread, row gwclient.SessionRow) Notice {
+// resumeNotice is what an adopted thread says. It carries the thread's channel as
+// well as the thread, because a notice that names only its thread leaves the
+// adapter with nowhere to post it — which is how the first live adoption ended in
+// `channel_not_found` and silence.
+func resumeNotice(t Thread, row gwclient.SessionRow, direct bool) Notice {
+	howToContinue := continueInChannel
+	if direct {
+		howToContinue = continueInDM
+	}
 	return Notice{
 		Thread:  &t,
 		Channel: t.Channel,
-		Text:    fmt.Sprintf("Attached to `%s` in `%s`. %s", sessionName(row), row.Cwd, continueHere),
+		Text:    fmt.Sprintf("Attached to `%s` in `%s`. %s", sessionName(row), row.Cwd, howToContinue),
 	}
 }
 

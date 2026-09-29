@@ -172,14 +172,35 @@ func TestHandleMessageDoesNotTurnOnPlainTextInAChannelThread(t *testing.T) {
 	b.HandleMessage(context.Background(), message)
 
 	// Even in a thread the bot owns, plain text is somebody talking to somebody
-	// else: only a mention turns (DESIGN.md §5). The message is not lost — the
-	// next turn reads it back from the observation watermark — so the assertion is
-	// silence, not an answer.
+	// else: only a mention turns (DESIGN.md §5). The message is not lost — the next
+	// turn reads it back from the observation watermark — so what this asserts is
+	// that no turn ran.
 	if platform.startedTurns() != 0 {
 		t.Error("plain text in a channel thread started a turn")
 	}
-	if notices := platform.postedNotices(); len(notices) != 0 {
-		t.Errorf("posted %+v, want silence: a nudge on every stray reply would be noise", notices)
+
+	// What it does earn is one note saying so. The thread may be one the bot opened
+	// itself, and a reply that goes nowhere in silence reads as a broken bot rather
+	// than as a rule — which is exactly how "replying in the resume thread doesn't
+	// work" happened twice.
+	notices := platform.postedNotices()
+	if len(notices) != 1 {
+		t.Fatalf("posted %+v, want one note explaining that only mentions turn", notices)
+	}
+	if !notices[0].Ephemeral {
+		t.Error("the explanation is visible to the whole channel")
+	}
+
+	// Once: the note is for somebody who does not know the rule, not for every
+	// sentence they type.
+	second := newTestMessage("Ev2", "and another thing")
+	second.Mentioned = false
+	b.HandleMessage(context.Background(), second)
+	if n := len(platform.postedNotices()); n != 1 {
+		t.Errorf("the note was repeated: %+v", platform.postedNotices())
+	}
+	if platform.startedTurns() != 0 {
+		t.Error("a later stray reply started a turn")
 	}
 }
 

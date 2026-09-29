@@ -98,6 +98,10 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	if !m.Mentioned && !m.Direct {
 		b.log.Debug("not addressed to the bot; the next turn will read it as context",
 			"thread", m.Thread.Key(), "user", m.UserID)
+		// Nothing runs — and, in a thread pi-chat has a session in, the person who
+		// typed is told why. Silence there looks like a broken bot, because the bot
+		// may be the one who opened the thread (DESIGN.md §5).
+		b.hintUnaddressed(ctx, m)
 		return
 	}
 
@@ -177,6 +181,34 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 
 // HandleCommand answers a command: a slash command at a channel or DM root, or
 // `@pi /<command>` inside a thread (DESIGN.md §5).
+// hintUnaddressed tells somebody who typed in a thread pi-chat has a session in,
+// without addressing the bot, why nothing is happening.
+//
+// In a channel only a mention is a request (DESIGN.md §5), and nothing outside
+// says so: a bot that opened the thread looks like it is waiting for a reply. The
+// note is ephemeral — it is for the person who typed, not for the channel — and it
+// is asked once per person per thread, recorded in the same table that dedupes
+// messages, so a side conversation running alongside a session gets one answer and
+// then silence.
+func (b *Bot) hintUnaddressed(ctx context.Context, m Message) {
+	if _, ok := b.tracked(m.Thread); !ok {
+		// No session here: nobody has ever been answered in this thread, so there is
+		// nothing to explain, and asking would write a row for a thread pi-chat has
+		// never worked in.
+		return
+	}
+	if !b.claim(ctx, "hint:"+m.Thread.Key()+":"+m.UserID) {
+		return
+	}
+	b.reply(ctx, Notice{
+		Thread:    &m.Thread,
+		Channel:   m.Thread.Channel,
+		Ephemeral: true,
+		UserID:    m.UserID,
+		Text:      channelReplyHint,
+	})
+}
+
 func (b *Bot) HandleCommand(ctx context.Context, c Command) {
 	if !b.claim(ctx, c.EventID) {
 		return

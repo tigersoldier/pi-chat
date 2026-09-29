@@ -392,7 +392,7 @@ What reaches a session, and what does not:
 | Group DM, plain text | **Dropped** — observed as context, never a turn: with two or more people in it, the conversation is no longer only the bot's address. Only a mention turns there, exactly as in a channel |
 | Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
 | DM root, `@pi <text>` | Same, and the thread is a DM thread |
-| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark |
+| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark. In a thread that already has a session, the first such message from one person earns exactly one **ephemeral note** saying that only mentions are requests |
 | Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
 | DM thread, plain text | A prompt: in a DM the conversation is already the address |
 | Any thread, a message that addresses nobody | **Dropped**, and before the allowlist is consulted: whoever sent it, it is not a request, so there is nothing to answer and nothing to refuse
@@ -421,8 +421,10 @@ sessions apart. A live session is marked: adopting one that a terminal is alread
 makes it a shared session, and that is worth knowing before pressing, not after.
 
 Adopting opens a thread, and the notice in it says how to continue **there**: a channel
-thread answers mentions, a DM thread answers anything (rule 5). A notice that names only
-its thread also names its channel, so the adapter always has somewhere to post it.
+thread answers mentions, a DM thread answers anything — and it says the one that applies
+where it is posted, because the two rules are opposites (`Direct` travels with the command
+and the button for exactly this). A notice that names only its thread also names its
+channel, so the adapter always has somewhere to post it.
 
 Command answers, hints, refusals and pickers are **ephemeral**: they are about the session,
 not part of the conversation, and a thread full of status messages buries the answers. A
@@ -826,6 +828,16 @@ the drop is the mechanism, the claim is the net under it, for a redelivery or a 
 that sends one message twice in a way an adapter cannot see. The subscriptions stay as
 they are — the manifest says what the app *may* receive, the adapter says what pi-chat
 *answers*, and a workspace that subscribes to more does not change that.
+
+**A dropped message that the bot could have been asked about is not dropped in silence.**
+A room `message` event that does *not* mention the bot is handed to the core **unaddressed**
+rather than discarded in the parser, because the core is the side that knows whether that
+thread has a session — and only the core can explain the rule to the person who typed.
+Plain text at a channel root *is* discarded here: a root message belongs to no thread, so
+there is nothing to read it back into and nobody to explain anything to. Every inbound
+envelope is logged at debug level with its event type and whether the bot was mentioned,
+so "did Slack deliver it, and did we take it" is answerable from the journal — twice now,
+silence in that path was indistinguishable from a message that never arrived.
 
 **Arguments travel form-encoded**, and that is a requirement rather than a preference:
 Slack reads a JSON body for some Web API methods and ignores it for others, where the

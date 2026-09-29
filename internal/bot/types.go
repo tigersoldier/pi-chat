@@ -88,6 +88,11 @@ type Command struct {
 	Thread    *Thread // nil at a channel or DM root
 	UserID    string
 	Workspace string
+	// Direct records that the command was typed in a one-to-one DM rather than in a
+	// channel. The two answer differently — a DM thread takes anything typed in it,
+	// a channel thread only mentions — so a notice that explains how to continue
+	// has to say the right one (DESIGN.md §5).
+	Direct bool
 	// TS is the message the command arrived in. It is empty for a slash command,
 	// whose payload carries no timestamp at all, and set when the command was
 	// typed inside a thread — where it is also the message a turn started by the
@@ -113,8 +118,11 @@ type Action struct {
 	Thread    *Thread
 	UserID    string
 	Workspace string
-	ActionID  string // which button, as the core named it
-	Value     string // the button's payload, which comes back through the platform
+	// Direct records that the button was pressed in a one-to-one DM (see
+	// Command.Direct).
+	Direct   bool
+	ActionID string // which button, as the core named it
+	Value    string // the button's payload, which comes back through the platform
 	// MessageTS is the message the button was attached to, so the bot can
 	// replace it instead of leaving a stale picker behind.
 	MessageTS string

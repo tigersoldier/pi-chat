@@ -53,30 +53,49 @@ func TestParseMessageMentionInsideAThreadJoinsIt(t *testing.T) {
 	}
 }
 
-func TestParseMessageAMessageEventInARoomIsNotAnswered(t *testing.T) {
-	// In a room only a mention turns, and app_mention owns that: Slack sends both
-	// events for one mention, so the message event would be the same request over
-	// again. What is left in a room is conversation, which the next turn fetches
-	// as context from its watermark (DESIGN.md §4, §5).
-	plain := eventsAPI(`{"type":"message","user":"U1","text":"and another thing",` +
-		`"ts":"1721609800.000300","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
-	if _, ok := parseMessage(plain, botUser); ok {
-		t.Error("a plain message in a channel thread was answered as a request")
-	}
-
-	// The same message with the bot mentioned is the app_mention event's to answer:
-	// this copy must not become a second turn (which is what it used to be).
+func TestParseMessagePlainRoomTextIsHandedOverUnaddressed(t *testing.T) {
+	// In a room only a mention turns, and `app_mention` owns that: Slack sends both
+	// events for one mention, so the message event carrying it is the same request
+	// over again and is dropped here.
+	//
+	// What is left is the room's own conversation, and it is handed to the core
+	// *unaddressed* rather than discarded: the core is the side that knows whether
+	// the thread has a session, and somebody typing in a thread pi-chat opened has to
+	// be told why nothing happens (DESIGN.md §5).
 	mention := eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> again",` +
 		`"ts":"1721609800.000400","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
 	if _, ok := parseMessage(mention, botUser); ok {
-		t.Error("a channel message event carrying a mention was answered; its app_mention copy owns it")
+		t.Error("a channel message event carrying a mention was handed over; its app_mention copy owns it")
 	}
 
-	// A mention of somebody else is not addressed to the bot either way.
+	plain := eventsAPI(`{"type":"message","user":"U1","text":"and another thing",` +
+		`"ts":"1721609800.000300","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
+	message, ok := parseMessage(plain, botUser)
+	if !ok {
+		t.Fatal("a plain message in a channel thread should reach the core, unaddressed")
+	}
+	if message.Mentioned || message.Direct {
+		t.Errorf("mentioned/direct = %v/%v, want false/false", message.Mentioned, message.Direct)
+	}
+
+	// A mention of somebody else is the same conversation: it does not address the
+	// bot, and the core decides what to do with it.
 	other := eventsAPI(`{"type":"message","user":"U1","text":"<@UOTHER> hi",` +
 		`"ts":"1721609800.000500","thread_ts":"1721609600.000100","channel":"C1"}`)
-	if _, ok := parseMessage(other, botUser); ok {
-		t.Error("a mention of somebody else in a room was answered")
+	otherMessage, ok := parseMessage(other, botUser)
+	if !ok {
+		t.Fatal("a mention of somebody else is conversation, not a request for the bot")
+	}
+	if otherMessage.Mentioned {
+		t.Error("a mention of somebody else was taken as addressing the bot")
+	}
+
+	// At a channel root there is no thread to belong to: nothing to read back, and
+	// nobody to explain anything to, so the core is not troubled with it.
+	root := eventsAPI(`{"type":"message","user":"U1","text":"hello everyone",` +
+		`"ts":"1721609800.000600","channel":"C1","channel_type":"channel"}`)
+	if _, ok := parseMessage(root, botUser); ok {
+		t.Error("a plain message at a channel root was handed to the core")
 	}
 }
 
@@ -122,13 +141,19 @@ func TestParseMessageDirectMessages(t *testing.T) {
 			t.Error("a bare top-level message in a group DM is not addressed to the bot")
 		}
 
-		// A reply inside one of its threads is conversation too: the next turn reads
-		// it as context, and only a mention turns here.
+		// A reply inside one of its threads is handed over unaddressed, for the same
+		// reason a channel thread's is: the core knows whether that thread has a
+		// session, and only a mention is a request here.
 		reply := eventsAPI(`{"type":"message","user":"U1","text":"I think so too",` +
 			`"ts":"1721609960.000700","thread_ts":"1721609960.000600",` +
 			`"channel":"G1","channel_type":"mpim"}`)
-		if _, ok := parseMessage(reply, botUser); ok {
-			t.Error("a reply in a group DM thread was answered as a request")
+		message, ok := parseMessage(reply, botUser)
+		if !ok {
+			t.Fatal("a reply in a group DM thread should reach the core, unaddressed")
+		}
+		if message.Mentioned || message.Direct {
+			t.Errorf("mentioned/direct = %v/%v, want false/false for a group DM",
+				message.Mentioned, message.Direct)
 		}
 	})
 

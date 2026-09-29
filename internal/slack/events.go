@@ -85,12 +85,29 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	// delivery that owns the message and whether the core needs a mention at all.
 	direct := event.ChannelType == "im"
 
-	// One message, one delivery (see above): the event that owns this context
-	// answers it, and the other carries the same request again.
+	// One message, one delivery (see above), and in a room the delivery that owns a
+	// mention is `app_mention` — Slack's own statement that the bot was mentioned,
+	// which is what makes it right to trust for a mention composed in rich text.
+	//
+	// A `message` event that mentions the bot is the twin of that same request, so it
+	// is dropped here. One that does *not* mention the bot is the room's own
+	// conversation, and it is handed to the core rather than discarded: the core is
+	// the side that knows whether this thread has a session, and somebody typing at
+	// a bot in a thread it owns has to be told why nothing happens — which cannot
+	// happen in a code path that throws the message away (DESIGN.md §5).
 	switch {
 	case direct && event.Type == "app_mention":
+		// Slack does not send this for a DM; the message event owns it.
 		return bot.Message{}, false
-	case !direct && event.Type != "app_mention":
+	case !direct && event.Type == "app_mention":
+		// The delivery that owns a mention in a room.
+	case !direct && mentioned:
+		// The twin of the mention above, arriving as a message event.
+		return bot.Message{}, false
+	case !direct && event.ThreadTS == "":
+		// Plain text at a channel root. It belongs to no thread, so there is nothing
+		// for the core to read it back into and nobody to explain anything to; a
+		// thread pi-chat owns always has a root of its own.
 		return bot.Message{}, false
 	}
 
@@ -131,6 +148,7 @@ func parseCommand(env Envelope) (bot.Command, bool) {
 	var payload struct {
 		TeamID      string `json:"team_id"`
 		ChannelID   string `json:"channel_id"`
+		ChannelName string `json:"channel_name"`
 		UserID      string `json:"user_id"`
 		Text        string `json:"text"`
 		ResponseURL string `json:"response_url"`
@@ -150,9 +168,24 @@ func parseCommand(env Envelope) (bot.Command, bool) {
 		Channel:   payload.ChannelID,
 		UserID:    payload.UserID,
 		Workspace: payload.TeamID,
+		Direct:    isDirectChannel(payload.ChannelID, payload.ChannelName),
 		Text:      "/" + strings.TrimSpace(payload.Text),
 		ReplyTo:   payload.ResponseURL,
 	}, true
+}
+
+// isDirectChannel reports whether a channel is a one-to-one conversation.
+//
+// Slack names it `directmessage` and ids it with a D. A group DM has neither —
+// its name is the generated `mpdm-…` — and that is what the grammar wants, since
+// with two or more people in it the conversation is no longer only the bot's
+// address (DESIGN.md §5). The name decides; the id is only a fallback for a
+// payload that omits the name, and never turns a room into a DM on its own.
+func isDirectChannel(id, name string) bool {
+	if name != "" {
+		return name == "directmessage"
+	}
+	return strings.HasPrefix(id, "D")
 }
 
 // parseAction turns a Socket Mode interactive envelope (a button press) into a
@@ -170,7 +203,8 @@ func parseAction(env Envelope) (bot.Action, bool) {
 			ID string `json:"id"`
 		} `json:"user"`
 		Channel struct {
-			ID string `json:"id"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
 		} `json:"channel"`
 		Message struct {
 			TS       string `json:"ts"`
@@ -211,8 +245,12 @@ func parseAction(env Envelope) (bot.Action, bool) {
 		Workspace: payload.Team.ID,
 		// The press carries the id the adapter rendered, which is unique per
 		// button; the core named the button by what it means.
-		ActionID:  coreActionID(payload.Actions[0].ActionID),
-		Value:     payload.Actions[0].Value,
+		ActionID: coreActionID(payload.Actions[0].ActionID),
+		Value:    payload.Actions[0].Value,
+		// Slack names a one-to-one conversation `directmessage` and ids it with a
+		// D. A group DM is neither (it behaves like a channel), so both have to
+		// agree before the core is told this is a DM.
+		Direct:    isDirectChannel(payload.Channel.ID, payload.Channel.Name),
 		MessageTS: payload.Message.TS,
 		ReplyTo:   payload.ResponseURL,
 	}, true

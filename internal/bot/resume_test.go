@@ -126,7 +126,7 @@ func TestResumeNoticeCarriesItsChannelAndSaysHowToContinue(t *testing.T) {
 	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
 	row := gwclient.SessionRow{Name: "their-session", Cwd: "/home/pi/code/thing"}
 
-	notice := resumeNotice(thread, row)
+	notice := resumeNotice(thread, row, false)
 	if notice.Thread == nil || *notice.Thread != thread {
 		t.Errorf("the notice is not in the adopted thread: %#v", notice.Thread)
 	}
@@ -137,7 +137,18 @@ func TestResumeNoticeCarriesItsChannelAndSaysHowToContinue(t *testing.T) {
 	if !strings.Contains(notice.Text, "their-session") || !strings.Contains(notice.Text, "/home/pi/code/thing") {
 		t.Errorf("the notice does not say what was adopted or where it works: %q", notice.Text)
 	}
-	if !strings.Contains(notice.Text, "mention me") {
+	if !strings.Contains(notice.Text, "mentioning me") {
 		t.Errorf("the notice does not say how to continue in a channel thread: %q", notice.Text)
+	}
+
+	// The same notice in a DM says the opposite thing, because it is the opposite
+	// rule: asking somebody in a DM to mention the bot would be teaching them a
+	// habit that does nothing.
+	dm := resumeNotice(thread, row, true)
+	if strings.Contains(dm.Text, "mentioning me") {
+		t.Errorf("a direct message is told to mention the bot: %q", dm.Text)
+	}
+	if !strings.Contains(dm.Text, "just type") {
+		t.Errorf("the DM notice does not say what to do: %q", dm.Text)
 	}
 }

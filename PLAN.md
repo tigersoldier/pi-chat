@@ -491,6 +491,38 @@ defects the first round could not reach, because until then neither command had 
       the notice's channel and wording, a press with no thread, and a press naming a
       session that belongs to nobody.
 
+**Found by the third live round (2026-09-28, replying in a resumed thread)** — one
+diagnosis and two fixes, from a single report ("replying in the resume thread still
+doesn't work"; "it should know the context if it's in a channel or DM"):
+
+- [x] **A reply in an adopted thread did nothing, and said nothing.** The adoption bound
+      the session — the journal has `bound the thread to its session` — and the reply was
+      plain text in a channel thread, which the grammar watches and never answers, by
+      design. Nothing was recorded either, so nothing could be explained afterwards: the
+      drop happened in the adapter, before the core, and the `seen` table has no row for
+      it. Two changes: the adapter now hands a room `message` event that does *not* mention
+      the bot to the core **unaddressed** (a mention's twin is still dropped, so one
+      message still gets one turn), and the core answers the first such message in a
+      thread that has a session with one ephemeral note — "reply with `@pi <what to do>`"
+      — recorded in the same table that dedupes messages, so a side conversation gets one
+      note and then silence. A thread with no session still gets nothing, and still writes
+      no row. 2 new tests, plus the one whose premise this changes (`want silence` becomes
+      `want one note, once`), plus a test that plain text at a channel root is still
+      dropped in the parser: no thread, nothing to read back, nobody to tell.
+- [x] **The adoption notice told a DM it was a channel.** It now says the rule that
+      applies where it is posted — a channel thread answers mentions, a DM thread answers
+      anything — which meant letting the context travel with the interaction: `Direct` is
+      now part of `Command` and `Action`. Slack names a one-to-one conversation
+      `directmessage` and ids it with a D; the name decides, the id is only a fallback,
+      and neither turns a group DM into an address. 4 new tests.
+- [ ] **Pending the next reply:** whether Slack delivers `app_mention` for a mention
+      inside a thread *whose root message the bot posted* — which is the thread
+      `/pi resume` opens, and the only kind never tested (every earlier thread was started
+      by a person). The adapter is instrumented for it now (debug level, with the event
+      type and whether the bot was mentioned), so one reply settles it; if Slack sends only
+      `message.channels` there, the fix is to accept a room message event that mentions the
+      bot when no `app_mention` arrives for it.
+
 **Exit:** a channel thread where the bot answers mentions, sees what other people said
 since its last turn, and knows what the transcript means — with the instruction installed
 once, not per turn.
