@@ -169,6 +169,39 @@ func (g *fakeGateway) Sessions(context.Context) ([]gwclient.SessionRow, error) {
 
 func (g *fakeGateway) Status(context.Context) string { return g.status }
 
+// fakeLifecycle records the sessions the core asks the gateway to delete, and
+// can be told to refuse — which is how the paths where a delete must not happen
+// are tested.
+type fakeLifecycle struct {
+	mu      sync.Mutex
+	deleted []string
+	err     error
+}
+
+func (l *fakeLifecycle) DeleteSession(_ context.Context, path string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
+	l.deleted = append(l.deleted, path)
+	return nil
+}
+
+// deletedSessions returns the paths the core deleted, in order.
+func (l *fakeLifecycle) deletedSessions() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.deleted...)
+}
+
+// failDelete makes every later delete answer with err.
+func (l *fakeLifecycle) failDelete(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.err = err
+}
+
 // newTestBot builds a core whose state lives in temporary directories, with
 // the platform and the gateway replaced by recorders.
 func newTestBot(t *testing.T) (*Bot, *fakePlatform, *store.Store) {
@@ -205,6 +238,7 @@ func newTestBotWith(t *testing.T, adjust func(*config.Config)) (*Bot, *fakePlatf
 	platform := &fakePlatform{}
 	b := New(cfg, discardLogger(), platform, st, "test")
 	b.gw = &fakeGateway{}
+	b.life = &fakeLifecycle{}
 	return b, platform, st
 }
 

@@ -17,6 +17,11 @@ import (
 // path between a command and its answer.
 const gatewayTimeout = 10 * time.Second
 
+// deleteTimeout bounds a delete, which is longer than a read on purpose: the
+// daemon stops pi and reaps it before it removes the session file, and a caller
+// that gave up early would report a failure for work still being done.
+const deleteTimeout = 60 * time.Second
+
 // gateway is the read-only view of pi-gatewayd the core needs.
 //
 // It is an interface for two reasons: the core can be tested without a running
@@ -28,6 +33,18 @@ type gateway interface {
 	Sessions(ctx context.Context) ([]gwclient.SessionRow, error)
 	// Status describes the daemon for /pi status.
 	Status(ctx context.Context) string
+}
+
+// lifecycle is the half of the gateway that changes sessions rather than reading
+// them. It dials with the admin token, one throwaway connection per operation:
+// gw_new_session binds the connection that issues it and there is no unbind
+// command, so a pooled admin connection would stay attached to every session it
+// ever touched and keep them all from being evicted (DESIGN.md §8, §10).
+type lifecycle interface {
+	// DeleteSession stops the session's pi process and removes its file. A
+	// session the gateway no longer knows answers `unknown_session`, which the
+	// caller reads as "already gone" rather than as a failure.
+	DeleteSession(ctx context.Context, path string) error
 }
 
 // connector is the real gateway: one throwaway connection per read.
@@ -42,20 +59,41 @@ type connector struct {
 	cfg *config.Config
 }
 
-// connect opens one session-less connection; the caller closes it.
-func (c *connector) connect(ctx context.Context, what string) (*gwclient.Client, error) {
-	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+// dial opens one connection with the given token; the caller closes it.
+func (c *connector) dial(ctx context.Context, tokenFile, what string, timeout time.Duration) (*gwclient.Client, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client, err := gwclient.Dial(ctx, gwclient.Config{
+	return gwclient.Dial(ctx, gwclient.Config{
 		StateDir:  c.cfg.Gateway.StateDir,
-		TokenFile: c.cfg.Gateway.ThreadTokenFile,
+		TokenFile: tokenFile,
 		Name:      "pi-chat " + what,
 		Kind:      kind,
 	})
+}
+
+// connect opens one session-less connection with the thread token; the caller
+// closes it.
+func (c *connector) connect(ctx context.Context, what string) (*gwclient.Client, error) {
+	return c.dial(ctx, c.cfg.Gateway.ThreadTokenFile, what, gatewayTimeout)
+}
+
+// DeleteSession removes a session through the gateway: pi is stopped, reaped,
+// and its session file deleted (DESIGN.md §3).
+//
+// force is false, and deliberately: a caller refuses to delete a thread whose
+// turn is running, so there is never work in progress to kill — a confirmation
+// button must not quietly turn into an abort.
+func (c *connector) DeleteSession(ctx context.Context, path string) error {
+	client, err := c.dial(ctx, c.cfg.Gateway.AdminTokenFile, "delete", deleteTimeout)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return client, nil
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+	_, err = client.DeleteSession(ctx, path, false)
+	return err
 }
 
 // Sessions reads the catalog.

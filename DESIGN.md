@@ -372,7 +372,11 @@ commands inside message threads** and its slash-command payload carries no `thre
 5. **A command the grammar reserves but this build does not implement yet** (`/delete`
    in phase 1) is answered rather than forwarded: pi would receive `/delete` as literal
    prompt text, and a clear "not in this build yet" beats that.
-6. **`@pi /delete` asks for confirmation with buttons**, then deletes.
+6. **`@pi /delete` asks for confirmation with buttons**, then deletes: the confirmation
+   names the session, both buttons carry its path, and a press whose path is no longer the
+   thread's session (a `/new` landed in between) is refused rather than applied to the
+   successor. It refuses while a turn is running, too: the answer is "stop it or wait",
+   not a force delete of work in progress.
 7. **A message nobody addressed to the bot is dropped before the allowlist is
    consulted.** It is not a request, so there is nothing to refuse: an unlisted person
    answering their colleague in a thread the bot happens to be in must not draw a visible
@@ -667,9 +671,16 @@ is never touched.
 
 Cleanup:
 
-- `@pi /delete` → `DeleteSession` (gateway removes the session file) → for each dir under
-  the project dir's `repos/*`: `git -C <mainrepo> worktree remove --force`, prune the
-  `pi/<date>-<slug>` branch → delete the row → remove the project dir if empty.
+- `@pi /delete` asks first, with buttons, and the confirmation names the session it would
+  delete: both buttons carry that session's path, so a press that arrives after the thread
+  has moved on refuses instead of deleting the successor. It refuses while a turn is
+  running as well. Then `DeleteSession` (the gateway stops pi, reaps it, removes the
+  session file) → for each dir under the project dir's `repos/*`: `git -C <mainrepo>
+  worktree remove --force`, prune the `pi/<date>-<slug>` branch → the row is marked
+  `deleted` (its key stays reserved, so the next message here starts a fresh session) →
+  remove the project dir if it ended up empty. An adopted session has no project directory
+  and only the session goes. A session the gateway no longer has is not an error: the
+  cleanup still runs, and the answer says the session was already gone.
 - **Cleanup only touches what it can prove is pi-chat's**: a linked worktree (git reports
   a different `--git-dir` and `--git-common-dir`) sitting on a `pi/` branch. A real clone
   the agent made, a worktree on somebody else's branch, or a file the agent wrote outside
@@ -815,6 +826,19 @@ forms (scalars as text, and a structured value such as `blocks` or `prompts` as 
 string Slack documents for a form body). The test stub parses what Slack parses, and
 answers the strict methods the way Slack answers, so this cannot return unnoticed — the
 stub decoding JSON was what let it live.
+
+**Buttons are rendered with unique action ids**, because Slack refuses a whole message
+with `invalid_blocks` when one actions block repeats an `action_id`. A picker is exactly
+that shape — every button means the same thing and carries its choice in its `value` — and
+`/pi resume` was rejected for it the first time it had two sessions to offer. Measured
+against the live API: two buttons with one id are refused, the same two with distinct ids
+are accepted, and one id repeated across two separate blocks is accepted as well. The core
+keeps naming a button by what it means (`resume`, `delete`, `delete-cancel`); the adapter
+adds the button's position to the id it renders and takes it off again when the press comes
+back, so the vocabulary the core switches on is unchanged. A refused reply path may not
+swallow the answer either: when the interaction's `response_url` rejects a notice, the
+adapter posts it instead — the picker's failure was reported through that same URL, which
+is why the command was silent at both ends.
 
 The Slack app itself is configuration as code: `slack/manifest.yaml` (standard bot) and
 `slack/manifest-agent.yaml` (agent messaging experience) are the two supported app

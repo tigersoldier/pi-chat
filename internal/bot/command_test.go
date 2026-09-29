@@ -284,18 +284,24 @@ func TestResumeSessionRefusesAValueThatIsNotInTheCatalog(t *testing.T) {
 }
 
 func TestDispatchAnswersReservedCommandsInsteadOfForwardingThem(t *testing.T) {
-	// `/delete` arrives before its phase. Forwarding it would send the literal
-	// text to the agent, which is worse than saying so.
-	b, platform, _ := newTestBot(t)
+	// The grammar reserves more commands than this build implements, and
+	// forwarding one of those would send its literal text to the agent: a clear
+	// "not yet" is better. `/delete` used to be answered here and is not any more
+	// — it deletes.
+	for _, name := range []string{"/abort", "/model", "/stop"} {
+		t.Run(name, func(t *testing.T) {
+			b, platform, _ := newTestBot(t)
 
-	b.HandleCommand(context.Background(), commandRequest("1700000000.000100", "/delete"))
+			b.HandleCommand(context.Background(), commandRequest("1700000000.000100", name))
 
-	waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
-	if platform.startedTurns() != 0 {
-		t.Fatal("a reserved command reached the agent")
-	}
-	if text := platform.postedNotices()[0].Text; !strings.Contains(text, "not in this build") {
-		t.Errorf("the answer does not explain itself: %q", text)
+			waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
+			if platform.startedTurns() != 0 {
+				t.Fatal("a reserved command reached the agent")
+			}
+			if text := platform.postedNotices()[0].Text; !strings.Contains(text, "not in this build") {
+				t.Errorf("the answer does not explain itself: %q", text)
+			}
+		})
 	}
 }
 

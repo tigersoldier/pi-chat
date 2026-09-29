@@ -209,7 +209,9 @@ func parseAction(env Envelope) (bot.Action, bool) {
 		Thread:    thread,
 		UserID:    payload.User.ID,
 		Workspace: payload.Team.ID,
-		ActionID:  payload.Actions[0].ActionID,
+		// The press carries the id the adapter rendered, which is unique per
+		// button; the core named the button by what it means.
+		ActionID:  coreActionID(payload.Actions[0].ActionID),
 		Value:     payload.Actions[0].Value,
 		MessageTS: payload.Message.TS,
 		ReplyTo:   payload.ResponseURL,

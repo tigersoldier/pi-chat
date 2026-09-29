@@ -13,6 +13,7 @@ import (
 	"github.com/tigersoldier/pi-gateway/protocol"
 
 	"github.com/tigersoldier/pi-chat/internal/store"
+	"github.com/tigersoldier/pi-chat/internal/workspace"
 )
 
 // kind identifies pi-chat connections in the gateway's client roster and in
@@ -383,6 +384,81 @@ func (th *thread) retire(ctx context.Context) (bool, error) {
 	th.log.Info("retired the thread's session; it stays resumable",
 		"session", row.SessionName, "path", row.SessionPath)
 	return true, nil
+}
+
+// deleteReport is what a completed deletion did, for the answer and the log.
+type deleteReport struct {
+	// AlreadyGone records that the gateway did not have the session any more:
+	// there was nothing to delete, but the rest of the work was still worth doing.
+	AlreadyGone bool
+	// Cleanup is what the provisioner removed, and what it deliberately did not.
+	Cleanup workspace.CleanupResult
+	// CleanupErr is a cleanup that did not finish. The session is gone by then, so
+	// it is reported rather than retried.
+	CleanupErr error
+}
+
+// destroy deletes the session this thread owns and what pi-chat can prove it put
+// on disk.
+//
+// An error means nothing was deleted: the gateway refused, so the session, its
+// directory and the row are exactly as they were and the user can ask again.
+// Once the session is gone the row is marked deleted even when the cleanup
+// reports trouble, because a row pointing at a session that no longer exists is
+// worse than a directory that outlives its session — and the leftovers are what
+// the answer is for (DESIGN.md §4, §9).
+//
+// The caller holds turnMu, so no turn is running on the session being deleted.
+func (th *thread) destroy(ctx context.Context) (deleteReport, error) {
+	row := th.snapshot()
+	var report deleteReport
+
+	// The connection goes first. A delete unbinds attached clients rather than
+	// disconnecting them, so leaving this one open would keep a client of a
+	// session that is going away, receiving the events of a session this thread no
+	// longer owns.
+	th.connMu.Lock()
+	client := th.client
+	th.client = nil
+	th.connMu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
+
+	if row.SessionPath != "" {
+		switch err := th.b.life.DeleteSession(ctx, row.SessionPath); {
+		case err == nil:
+			th.log.Info("deleted the session",
+				"session", row.SessionName, "path", row.SessionPath)
+		case isGone(err):
+			report.AlreadyGone = true
+			th.log.Info("the session was already gone; cleaning up what is left",
+				"session", row.SessionName, "path", row.SessionPath)
+		default:
+			return report, fmt.Errorf("delete the session: %w", err)
+		}
+	}
+
+	if row.ProjectDir != "" {
+		var err error
+		report.Cleanup, err = th.b.work.Cleanup(ctx, row.ProjectDir)
+		if err != nil {
+			report.CleanupErr = err
+			th.log.Warn("the session is gone, but cleaning up its directory failed",
+				"dir", row.ProjectDir, "error", err)
+		}
+	}
+
+	th.update(func(r *store.ThreadRow) {
+		r.State = store.StateDeleted
+		r.SessionName, r.SessionPath, r.SessionID = "", "", ""
+		r.Cwd, r.ProjectDir = "", ""
+		r.LastSeq, r.LeafID, r.ProgressTS = 0, "", ""
+		// A session that follows in this thread starts its own conversation: what
+		// the deleted one read is in its history, not in the next one's.
+		r.ObservedTS = ""
+	})
+	return report, nil
 }
 
 // dial opens the thread's long-lived connection. Events arrive on the

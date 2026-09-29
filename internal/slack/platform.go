@@ -127,7 +127,28 @@ func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
 	blocks := blocksFor(n.Buttons)
 	switch {
 	case n.ReplyTo != "":
-		return p.api.Respond(ctx, n.ReplyTo, n.Text, blocks, n.Update != "")
+		err := p.api.Respond(ctx, n.ReplyTo, n.Text, blocks, n.Update != "")
+		if err == nil {
+			return nil
+		}
+		if n.Update != "" {
+			// Replacing the message is the whole point here: the interaction's own
+			// response URL is the only way to rewrite an ephemeral message, so there
+			// is nothing to fall back to.
+			return err
+		}
+		// An answer that the platform refuses must not become an answer nobody ever
+		// sees. /pi resume's picker failed this way: the response URL rejected the
+		// message, and the error report went through the same URL, so the command
+		// was silent from both ends (the blocks are fixed; this is the net under
+		// it). Posting gives the answer a home when the reply path does not.
+		p.log.Warn("cannot answer through the response URL; posting instead", "error", err)
+		if n.Ephemeral && n.UserID != "" {
+			_, perr := p.api.PostEphemeral(ctx, n.Channel, n.UserID, threadTS(n.Thread), n.Text, blocks)
+			return perr
+		}
+		_, perr := p.api.PostBlocks(ctx, n.Channel, threadTS(n.Thread), n.Text, blocks)
+		return perr
 	case n.Update != "":
 		return p.api.UpdateBlocks(ctx, n.Channel, n.Update, n.Text, blocks)
 	case n.Ephemeral:

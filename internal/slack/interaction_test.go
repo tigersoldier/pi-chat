@@ -147,15 +147,18 @@ func TestPostSendsButtonsAsAnActionsBlock(t *testing.T) {
 	if len(elements) != 2 {
 		t.Fatalf("elements = %d, want 2", len(elements))
 	}
+	// Slack refuses a message whose actions block repeats an action_id, so the
+	// adapter renders a unique one per button; the press path takes the suffix off
+	// again (see wireActionID), which is what keeps the core's vocabulary intact.
 	first := elements[0]
-	if first.ActionID != bot.ActionResume || first.Value != "/sessions/a.jsonl" {
+	if first.ActionID != bot.ActionResume+":0" || first.Value != "/sessions/a.jsonl" {
 		t.Errorf("first button = %#v", first)
 	}
 	if first.Style != "" {
 		t.Errorf("an unstyled button got a style: %#v", first)
 	}
-	if second := elements[1]; second.Style != "primary" {
-		t.Errorf("second button lost its style: %#v", second)
+	if second := elements[1]; second.ActionID != bot.ActionResume+":1" || second.Style != "primary" {
+		t.Errorf("second button = %#v, want a primary button with its own action id", second)
 	}
 	// A button's label is plain text, because Slack rejects markdown there.
 	if first.Text.Type != "plain_text" {
@@ -213,6 +216,37 @@ func TestProgressNamesTheReply(t *testing.T) {
 	// half-written (DESIGN.md §7).
 	if got, want := r.Progress(), "1700000000.000001"; got != want {
 		t.Errorf("Progress() = %q, want %q", got, want)
+	}
+}
+
+func TestPostFallsBackWhenTheResponseURLRefusesTheAnswer(t *testing.T) {
+	// A platform that refuses the reply path must not take the answer with it.
+	// /pi resume's picker failed exactly this way: the response URL rejected the
+	// message, and the failure was reported through the same URL, so the command
+	// was silent at both ends and looked like nothing had happened.
+	response := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "invalid_blocks")
+	}))
+	defer response.Close()
+
+	stub := &stubSlack{}
+	platform := newTestPlatform(t, stub, "stream")
+	notice := noticeFor()
+	notice.Ephemeral = true
+	notice.ReplyTo = response.URL
+	if err := platform.Post(context.Background(), notice); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	posted := false
+	for _, method := range stub.methods() {
+		if method == "chat.postEphemeral" {
+			posted = true
+		}
+	}
+	if !posted {
+		t.Errorf("the refused answer was posted nowhere: %v", stub.methods())
 	}
 }
 

@@ -39,6 +39,7 @@ type Bot struct {
 	store   *store.Store
 	work    *workspace.Provisioner
 	gw      gateway
+	life    lifecycle
 	version string
 
 	mu      sync.Mutex
@@ -49,6 +50,9 @@ type Bot struct {
 // New builds a Bot. The caller keeps ownership of cfg, log, plat and st, and
 // closes the store itself.
 func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, version string) *Bot {
+	// One connector serves both halves of the gateway: reading the catalog and
+	// changing sessions differ in the token they dial with, not in what they are.
+	conn := &connector{cfg: cfg}
 	return &Bot{
 		cfg:     cfg,
 		log:     log,
@@ -60,7 +64,8 @@ func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, v
 			ReposRoot:      cfg.Paths.ReposRoot,
 			InjectedPrompt: cfg.Behavior.InjectedPrompt,
 		}, log),
-		gw:      &connector{cfg: cfg},
+		gw:      conn,
+		life:    conn,
 		threads: make(map[string]*thread),
 	}
 }
@@ -197,6 +202,12 @@ func (b *Bot) HandleAction(ctx context.Context, a Action) {
 		go b.resumeSession(ctx, a)
 	case ActionStop:
 		b.stopTurn(ctx, a)
+	case ActionDelete:
+		// A delete dials the gateway, stops pi and removes worktrees, so it answers
+		// through the button instead of inside the delivery that carried the press.
+		go b.deleteSession(ctx, a)
+	case ActionDeleteCancel:
+		b.cancelDelete(ctx, a)
 	default:
 		b.log.Warn("ignoring a button this build does not know", "action", a.ActionID)
 	}

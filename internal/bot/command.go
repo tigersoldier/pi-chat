@@ -34,6 +34,18 @@ const ActionResume = "resume"
 // unchanged (DESIGN.md §6).
 const ActionStop = "stop"
 
+// ActionDelete and ActionDeleteCancel are the two buttons of the confirmation
+// `@pi /delete` posts (DESIGN.md §5, rule 6).
+//
+// Two action ids rather than one carrying a yes/no value: which button was
+// pressed is what the handler switches on, and Slack refuses a message whose
+// actions block repeats an id — see wireActionID in the Slack adapter, which
+// exists because /pi resume's picker was rejected for exactly that.
+const (
+	ActionDelete       = "delete"
+	ActionDeleteCancel = "delete-cancel"
+)
+
 // Limits on what the bot lists, so an answer stays a message rather than a
 // dump.
 const (
@@ -128,7 +140,7 @@ func controls() map[string]control {
 		"delete": {
 			scope:   scopeThread,
 			summary: "delete this thread's session and its worktree",
-			pending: "phase 2",
+			run:     (*Bot).cmdDelete,
 		},
 		"model": {
 			scope:   scopeThread,
@@ -205,6 +217,190 @@ func (b *Bot) cmdNew(ctx context.Context, r request, arg string) error {
 		})
 	}
 	return nil
+}
+
+// cmdDelete answers @pi /delete. It asks before it deletes: the session file is
+// what makes the thread resumable, and the worktree is where the work is
+// (DESIGN.md §5, rule 6).
+//
+// The confirmation names the session it would delete and its buttons carry that
+// session's path, so a confirmation that outlives the session it described — a
+// `/new` in between — cannot delete its successor.
+func (b *Bot) cmdDelete(ctx context.Context, r request, _ string) error {
+	th, ok := b.tracked(*r.thread)
+	row := store.ThreadRow{}
+	if ok {
+		row = th.snapshot()
+	}
+	if row.SessionPath == "" {
+		b.answer(ctx, r, "There is nothing to delete here: this thread has no session.")
+		return nil
+	}
+
+	lines := []string{fmt.Sprintf("*Delete this thread's session?* `%s`", row.SessionName)}
+	if row.ProjectDir != "" {
+		lines = append(lines,
+			fmt.Sprintf("Worktree `%s`.", row.Cwd),
+			"The session file is removed, so the session cannot be resumed. Worktrees pi-chat made under that project directory go too, with the `pi/` branches they were on. Anything else the agent wrote there is left in place.")
+	} else {
+		lines = append(lines,
+			"This session was started outside pi-chat, so its working directory is not pi-chat's to remove: only the session itself goes.")
+	}
+	if n, err := b.store.RetiredCount(ctx, th.key); err == nil && n > 0 {
+		lines = append(lines, fmt.Sprintf("Sessions this thread retired earlier are not touched — they stay in `%sresume`.", rootForm))
+	}
+
+	return b.plat.Post(ctx, Notice{
+		Thread:    r.thread,
+		Channel:   r.channel,
+		UserID:    r.userID,
+		Ephemeral: true,
+		ReplyTo:   r.replyTo,
+		Text:      strings.Join(lines, "\n"),
+		Buttons: []Button{
+			{ActionID: ActionDelete, Text: "Delete session", Value: row.SessionPath, Style: "danger"},
+			{ActionID: ActionDeleteCancel, Text: "Cancel", Value: row.SessionPath},
+		},
+	})
+}
+
+// deleteSession carries out a confirmed deletion: the session in the gateway,
+// then what pi-chat can prove it put on disk, then the row.
+//
+// It runs in its own goroutine and answers through the button, replacing the
+// confirmation as it goes: a delete stops pi and removes worktrees, which takes
+// longer than the platform's idea of an immediate answer.
+func (b *Bot) deleteSession(ctx context.Context, a Action) {
+	if a.Thread == nil {
+		b.log.Warn("a delete arrived without a thread to delete in", "channel", a.Channel)
+		return
+	}
+	r := request{thread: a.Thread, channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo}
+
+	th, ok := b.tracked(*a.Thread)
+	row := store.ThreadRow{}
+	if ok {
+		row = th.snapshot()
+	}
+	switch {
+	case row.SessionPath == "":
+		b.answer(ctx, r, "There is nothing to delete here: this thread has no session.")
+		return
+	case a.Value != row.SessionPath:
+		// The button named a session this thread no longer owns, so the confirmation
+		// no longer describes what would be deleted. Deleting the successor of the
+		// session somebody agreed to delete is exactly how a stale button destroys
+		// work, so this refuses instead.
+		b.answer(ctx, r, fmt.Sprintf(
+			"That confirmation was for another session of this thread, which is not the one here now. Ask again with `%sdelete`.", threadForm))
+		return
+	}
+	if !th.turnMu.TryLock() {
+		b.answer(ctx, r, "A turn is running here. Stop it, or wait for it to finish, then ask again.")
+		return
+	}
+	defer th.turnMu.Unlock()
+
+	// Say what is happening before doing it: the answer is a message the user is
+	// already looking at, and the work below is slower than that.
+	b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS,
+		Text: fmt.Sprintf("Deleting `%s`…", row.SessionName)})
+
+	report, err := th.destroy(ctx)
+	// Closed either way: the session is gone, and a status left at `processing`
+	// would be a spinner in a thread that has nothing behind it.
+	b.setStatus(ctx, th, StatusClosed)
+	if err != nil {
+		b.log.Warn("cannot delete the session", "thread", th.key, "error", err)
+		b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+			ReplyTo: a.ReplyTo, Update: a.MessageTS,
+			Text: "Nothing was deleted: " + err.Error()})
+		return
+	}
+
+	b.log.Info("deleted the thread's session", "thread", th.key, "user", a.UserID,
+		"session", row.SessionName, "path", row.SessionPath, "dir", row.ProjectDir,
+		"worktrees", len(report.Cleanup.RemovedWorktrees),
+		"branches", len(report.Cleanup.PrunedBranches),
+		"left", len(report.Cleanup.LeftBehind))
+	b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS,
+		Text: deleteAnswer(row, report)})
+}
+
+// cancelDelete answers the Cancel button: the confirmation is replaced and
+// nothing else happens.
+func (b *Bot) cancelDelete(ctx context.Context, a Action) {
+	b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS,
+		Text: "Nothing was deleted."})
+}
+
+// deleteAnswer says what a completed deletion did. It names the session from the
+// row as it was before the delete, because by now the row no longer has one.
+func deleteAnswer(row store.ThreadRow, report deleteReport) string {
+	var b strings.Builder
+	if report.AlreadyGone {
+		b.WriteString(fmt.Sprintf("*Deleted.* The gateway had already forgotten `%s`, so I removed what was left.",
+			row.SessionName))
+	} else {
+		b.WriteString(fmt.Sprintf("*Deleted* `%s`.", row.SessionName))
+	}
+	if n := len(report.Cleanup.RemovedWorktrees); n > 0 {
+		b.WriteString(fmt.Sprintf(" Removed %s and pruned %s.",
+			plural(n, "worktree", "worktrees"),
+			plural(len(report.Cleanup.PrunedBranches), "branch", "branches")))
+	}
+	if report.Cleanup.RemovedDir {
+		b.WriteString(" Its project directory was empty and is gone.")
+	}
+	if len(report.Cleanup.LeftBehind) > 0 {
+		b.WriteString("\n" + leftBehindText(report.Cleanup.LeftBehind))
+	}
+	if report.CleanupErr != nil {
+		b.WriteString("\nThe cleanup did not finish: " + report.CleanupErr.Error())
+	}
+	b.WriteString("\nThe next message here starts a fresh session.")
+	return b.String()
+}
+
+// leftBehindText names what a cleanup deliberately did not touch. The paths are
+// the point: "something was left behind" is not actionable, and these are the
+// files somebody might still want (DESIGN.md §9).
+func leftBehindText(paths []string) string {
+	const shown = 3
+	quoted := make([]string, 0, shown)
+	for i, path := range paths {
+		if i == shown {
+			break
+		}
+		quoted = append(quoted, "`"+path+"`")
+	}
+	text := "Not pi-chat's to remove, left in place: " + strings.Join(quoted, ", ")
+	if rest := len(paths) - len(quoted); rest > 0 {
+		text += fmt.Sprintf(" and %d more", rest)
+	}
+	return text + "."
+}
+
+// plural renders a count with its noun. The plural is given rather than derived,
+// because not every noun this reports takes an "s".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// threadStates renders a channel's thread counts, naming only the states it has:
+// a line that always ends in "0 deleted" is a line nobody reads.
+func threadStates(warm, cold, deleted int) string {
+	parts := []string{plural(warm, "warm", "warm"), plural(cold, "cold", "cold")}
+	if deleted > 0 {
+		parts = append(parts, plural(deleted, "deleted", "deleted"))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // request is one inbound interaction after the allowlist, normalized across
@@ -396,18 +592,25 @@ func (b *Bot) statusRoot(ctx context.Context, r request) error {
 	if err != nil {
 		return err
 	}
-	var warm, cold, here, hereWarm int
+	var warm, cold, deleted, here, hereWarm, hereCold, hereDeleted int
 	for _, row := range rows {
 		switch row.State {
 		case store.StateWarm:
 			warm++
 		case store.StateCold:
 			cold++
+		case store.StateDeleted:
+			deleted++
 		}
 		if row.ChannelID == r.channel {
 			here++
-			if row.State == store.StateWarm {
+			switch row.State {
+			case store.StateWarm:
 				hereWarm++
+			case store.StateCold:
+				hereCold++
+			case store.StateDeleted:
+				hereDeleted++
 			}
 		}
 	}
@@ -415,9 +618,10 @@ func (b *Bot) statusRoot(ctx context.Context, r request) error {
 	lines := []string{
 		fmt.Sprintf("*pi-chat %s*", b.version),
 		b.gw.Status(ctx),
-		fmt.Sprintf("warm sessions: %d of %d allowed (idle close after %dm)",
-			warm, b.cfg.Concurrency.MaxWarmSessions, b.cfg.Concurrency.ThreadIdleCloseMinutes),
-		fmt.Sprintf("threads in this channel: %d (%d warm, %d cold)", here, hereWarm, here-hereWarm),
+		fmt.Sprintf("warm sessions: %d of %d allowed (idle close after %dm); %s",
+			warm, b.cfg.Concurrency.MaxWarmSessions, b.cfg.Concurrency.ThreadIdleCloseMinutes,
+			threadStates(warm, cold, deleted)),
+		fmt.Sprintf("threads in this channel: %d (%s)", here, threadStates(hereWarm, hereCold, hereDeleted)),
 		fmt.Sprintf("render: %s, approvals: %s", b.cfg.Render.Mode, b.cfg.Behavior.Approvals),
 	}
 	b.answer(ctx, r, strings.Join(lines, "\n"))

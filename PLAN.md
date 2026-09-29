@@ -368,8 +368,14 @@ for.
 - [x] Use the new client surface where it simplifies what exists: `spawn` from the catalog
       now decides whether a session already carries the instruction, instead of trusting a
       session name that cannot tell a session made before the instruction existed
-- [ ] `unbound: true` from stop/delete (gwclient clears its own binding on it) — that lands
-      with phase 2's `/delete` and eviction, the paths that unbind a thread on purpose
+- [x] `unbound: true` from stop/delete — satisfied differently, and more simply than the
+      original note expected: the paths that unbind a thread on purpose (`/delete`, and
+      later eviction) dial with the admin token on a throwaway connection and close the
+      thread's own connection first, so there is no binding of ours to clear from a
+      response. A session deleted *outside* pi-chat arrives as
+      `gw_session_state{state:"deleted"}`, which the turn path turns into `forgetSession`
+      (the row keeps its key and the next message starts fresh), and a connection that
+      merely lost its binding is caught by `bound()` on the next attach.
 
 **Fixed after the first real conversation (2026-09-28)** — three defects the first live
 use found, all of them in paths the stubs could not see:
@@ -427,6 +433,20 @@ use found, all of them in paths the stubs could not see:
       way it could have been answered. (Two third-party reports say otherwise; this
       workspace says the reports are stale.) The rule stays as it is.
 
+- [x] **`/pi resume` never showed its picker, and said nothing about it either.** Slack
+      refuses a whole message with `invalid_blocks` when one actions block repeats an
+      `action_id`, and the picker gave every session's button the same one — `resume`.
+      Measured against the live API while fixing it: two buttons sharing an id are refused,
+      the same two with distinct ids are accepted, the same id in two *separate* blocks is
+      accepted too, and the count is why it looked intermittent (one button fine, four
+      refused). The adapter now adds the button's position to the id it renders and takes
+      it off again when the press comes back, so the core keeps naming a button by what it
+      means. The silence had a second cause, also fixed: the failed command's answer went
+      out through the same `response_url`, so a refused reply path produced nothing at
+      either end — a notice that cannot be answered through the interaction's own URL is
+      now posted instead. 4 tests (unique ids per block, the id round trip through a press,
+      the rendered buttons, and the fallback).
+
 - [ ] The workspace's app answers `not_agent_app` for
       `assistant.threads.setSuggestedPrompts`, and it latched `feature_disabled` for
       `agents.sessions.setStatus`: whatever it is installed as now, it is not an agent
@@ -443,7 +463,20 @@ once, not per turn.
 
 ### M5 — Phase 2
 
-- [ ] `@pi /delete` with button confirm → `DeleteSession` → worktree/branch cleanup → row
+- [x] `@pi /delete`: a button confirm (ephemeral, `Delete session` in danger red and
+      `Cancel`), then the gateway's `DeleteSession` on a throwaway admin connection, then
+      the worktree/branch cleanup, then the row marked `deleted` so its key stays reserved
+      and the next message here starts a fresh session. It refuses while a turn is running
+      — the answer is "stop it or wait", not a force delete — and both buttons carry the
+      session path the confirmation named, so a press that lands after a `/new` refuses
+      instead of deleting the successor. An adopted session (no `ProjectDir`) loses only
+      the session; a session the gateway no longer has is not an error, and the cleanup
+      still runs. 10 tests: the question before the act, the deletion itself, leftovers the
+      cleanup deliberately refuses to touch, a running turn, a stale confirmation, an
+      already-gone session, a gateway failure, cancel, a thread with no session (which
+      writes no row at all), and an adopted session's directory. The write half of the
+      gateway is its own `lifecycle` interface with its own admin dial, and `/pi status`
+      now counts the states it names instead of counting a deleted row as cold.
 - [ ] `@pi /abort`, `@pi /model`, `@pi /stop`
 - [ ] Interactive approvals: buttons + modal via `trigger_id`; `pending_ui` → `RespondUI`
 - [ ] Status `suspended` while a turn waits for an answer; `closed` on delete; titles via
