@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
 
@@ -264,6 +265,37 @@ func (b *Bot) cmdDelete(ctx context.Context, r request, _ string) error {
 	})
 }
 
+// threadForAction resolves the thread a button press belongs to.
+//
+// A platform may not report the thread a button was pressed in — Slack's payload
+// for a button on an *ephemeral* message carries no thread timestamp, which is
+// how /pi delete's confirmation came back with nothing to act on and did nothing
+// at all — so a press is also resolved through the session it named: whichever
+// thread owns that session is the thread the button belonged to.
+func (b *Bot) threadForAction(ctx context.Context, a Action) (*thread, bool) {
+	if a.Thread != nil && a.Thread.ThreadTS != "" {
+		return b.tracked(*a.Thread)
+	}
+	if a.Value == "" {
+		return nil, false
+	}
+	rows, err := b.store.Threads(ctx)
+	if err != nil {
+		b.log.Warn("cannot look up the session a button named", "error", err)
+		return nil, false
+	}
+	for _, row := range rows {
+		if row.SessionPath != a.Value || row.State == store.StateDeleted {
+			continue
+		}
+		t := Thread{Workspace: row.WorkspaceID, Channel: row.ChannelID, ThreadTS: row.ThreadTS}
+		if th, ok := b.tracked(t); ok {
+			return th, true
+		}
+	}
+	return nil, false
+}
+
 // deleteSession carries out a confirmed deletion: the session in the gateway,
 // then what pi-chat can prove it put on disk, then the row.
 //
@@ -271,22 +303,23 @@ func (b *Bot) cmdDelete(ctx context.Context, r request, _ string) error {
 // confirmation as it goes: a delete stops pi and removes worktrees, which takes
 // longer than the platform's idea of an immediate answer.
 func (b *Bot) deleteSession(ctx context.Context, a Action) {
-	if a.Thread == nil {
-		b.log.Warn("a delete arrived without a thread to delete in", "channel", a.Channel)
+	r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo}
+	th, ok := b.threadForAction(ctx, a)
+	if !ok {
+		// The session the confirmation named belongs to no thread any more: it was
+		// deleted, or the thread retired it. Say so where the button was pressed — a
+		// press that answers nothing is indistinguishable from a broken bot.
+		r.thread = a.Thread
+		b.answer(ctx, r, "That session is not one of mine any more — nothing was deleted.")
 		return
 	}
-	r := request{thread: a.Thread, channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo}
-
-	th, ok := b.tracked(*a.Thread)
-	row := store.ThreadRow{}
-	if ok {
-		row = th.snapshot()
-	}
+	r.thread = &th.t
+	row := th.snapshot()
 	switch {
 	case row.SessionPath == "":
 		b.answer(ctx, r, "There is nothing to delete here: this thread has no session.")
 		return
-	case a.Value != row.SessionPath:
+	case a.Value != "" && a.Value != row.SessionPath:
 		// The button named a session this thread no longer owns, so the confirmation
 		// no longer describes what would be deleted. Deleting the successor of the
 		// session somebody agreed to delete is exactly how a stale button destroys
@@ -303,7 +336,7 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 
 	// Say what is happening before doing it: the answer is a message the user is
 	// already looking at, and the work below is slower than that.
-	b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+	b.reply(ctx, Notice{Thread: &th.t, Channel: th.t.Channel, UserID: a.UserID, Ephemeral: true,
 		ReplyTo: a.ReplyTo, Update: a.MessageTS,
 		Text: fmt.Sprintf("Deleting `%s`…", row.SessionName)})
 
@@ -313,7 +346,7 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 	b.setStatus(ctx, th, StatusClosed)
 	if err != nil {
 		b.log.Warn("cannot delete the session", "thread", th.key, "error", err)
-		b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+		b.reply(ctx, Notice{Thread: &th.t, Channel: th.t.Channel, UserID: a.UserID, Ephemeral: true,
 			ReplyTo: a.ReplyTo, Update: a.MessageTS,
 			Text: "Nothing was deleted: " + err.Error()})
 		return
@@ -324,7 +357,7 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 		"worktrees", len(report.Cleanup.RemovedWorktrees),
 		"branches", len(report.Cleanup.PrunedBranches),
 		"left", len(report.Cleanup.LeftBehind))
-	b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+	b.reply(ctx, Notice{Thread: &th.t, Channel: th.t.Channel, UserID: a.UserID, Ephemeral: true,
 		ReplyTo: a.ReplyTo, Update: a.MessageTS,
 		Text: deleteAnswer(row, report)})
 }
@@ -704,14 +737,31 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		b.reply(ctx, Notice{Thread: &thread, Text: "I found that session but could not attach to it: " + err.Error()})
 		return
 	}
-	b.reply(ctx, Notice{Thread: &thread,
-		Text: fmt.Sprintf("Attached to `%s` in `%s`. Keep going here.", sessionName(*chosen), chosen.Cwd)})
+	b.reply(ctx, resumeNotice(thread, *chosen))
 	// The picker is replaced rather than left behind, so the same session
 	// cannot be adopted twice by an old button.
 	if a.MessageTS != "" || a.ReplyTo != "" {
 		b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
 			ReplyTo: a.ReplyTo, Update: a.MessageTS,
 			Text: fmt.Sprintf("Adopted `%s`. Continue in the new thread.", sessionName(*chosen))})
+	}
+}
+
+// continueHere says how to keep going in a thread the bot just opened. The
+// grammar differs by context — a channel thread answers mentions, a DM thread
+// answers anything — and a notice that gets this wrong leaves somebody typing at
+// a bot that is listening for something else (DESIGN.md §5).
+const continueHere = "Continue in this thread: in a channel, mention me (`@pi <what to do>`); in a DM, just type."
+
+// resumeNotice is what an adopted thread says. It carries the thread's channel
+// as well as the thread, because a notice that names only the thread leaves the
+// adapter with nowhere to post it — which is how the first live adoption ended
+// in `channel_not_found` and silence.
+func resumeNotice(t Thread, row gwclient.SessionRow) Notice {
+	return Notice{
+		Thread:  &t,
+		Channel: t.Channel,
+		Text:    fmt.Sprintf("Attached to `%s` in `%s`. %s", sessionName(row), row.Cwd, continueHere),
 	}
 }
 
@@ -825,14 +875,81 @@ func sessionName(row gwclient.SessionRow) string {
 	return filepath.Base(row.Path)
 }
 
-// sessionLabel is one button's text. Platforms cap button labels, and the
-// directory is what tells two sessions of one repository apart.
+// sessionLabel is one button's text: what the session is about, and where it
+// works — the two things that tell two sessions apart. It is the label a person
+// picks from, so it is never a filename: the catalog carries a title (the first
+// thing asked in the session) and an explicit name, and the directory is shown
+// as its last element rather than as a path.
+//
+// Platforms cap a button label, so the title gives way first: cutting the whole
+// label at the cap would eat the directory, which is the half that says where
+// the work is.
 func sessionLabel(row gwclient.SessionRow) string {
-	label := sessionName(row)
-	if row.Cwd != "" {
-		label += " · " + row.Cwd
+	var suffix string
+	if dir := filepath.Base(row.Cwd); dir != "" && dir != "." && dir != string(filepath.Separator) {
+		suffix += " · " + truncateText(dir, 24)
 	}
-	return truncateText(label, 70)
+	if row.Live {
+		// pi is running for this session right now, which usually means somebody is
+		// using it from a terminal.
+		suffix += " · live"
+	}
+	budget := 70 - utf8.RuneCountInString(suffix)
+	if budget < 12 {
+		budget = 12
+	}
+	return truncateText(sessionTitle(row), budget) + suffix
+}
+
+// sessionTitle says what a session is in the fewest words it can: the title the
+// catalog derived from the session's first prompt, or — when there is none — the
+// session's own name, or its file as the last resort.
+//
+// A name is deliberately second: the only sessions that have one are pi-chat's
+// own, named after the thread they came from (`slack-t6k8y3frr-…`), which says
+// nothing about the work. A title does.
+func sessionTitle(row gwclient.SessionRow) string {
+	if title := firstSentence(row.Title); title != "" {
+		return title
+	}
+	if row.Name != "" {
+		return row.Name
+	}
+	return filepath.Base(row.Path)
+}
+
+// firstSentence is the first line that says something, with the wrapper pi puts
+// around a skill or template invocation cut away — including its boilerplate
+// ("References are relative to …"), which is machinery rather than a request.
+// A session that began with `/grill-me` should be labelled by the question
+// somebody asked, not by the skill that ran.
+func firstSentence(title string) string {
+	for {
+		text := strings.TrimSpace(title)
+		if !strings.HasPrefix(text, "<") {
+			break
+		}
+		gt := strings.Index(text, ">")
+		if gt < 0 {
+			break
+		}
+		fields := strings.Fields(text[1:gt])
+		if len(fields) == 0 {
+			break
+		}
+		closing := "</" + strings.TrimSuffix(fields[0], "/") + ">"
+		end := strings.Index(text, closing)
+		if end < 0 {
+			break
+		}
+		title = text[end+len(closing):]
+	}
+	for _, line := range strings.Split(title, "\n") {
+		if line = strings.Join(strings.Fields(line), " "); line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 // truncateText cuts s to at most n runes, marking that it was cut.

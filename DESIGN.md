@@ -413,6 +413,17 @@ What reaches a session, and what does not:
 | `@pi /compact`, `@pi /skill:<name>`, `@pi /<template>` | thread | forwarded to pi |
 | `@pi <text>` | thread | prompt |
 
+**A picker's buttons say what a session is about**, not what its file is called: the
+catalog's title (the first thing asked in the session, with the wrapper pi puts around a
+skill or template invocation cut away), or the session's own name when it has no title,
+followed by the last element of the working directory — which together are what tell two
+sessions apart. A live session is marked: adopting one that a terminal is already driving
+makes it a shared session, and that is worth knowing before pressing, not after.
+
+Adopting opens a thread, and the notice in it says how to continue **there**: a channel
+thread answers mentions, a DM thread answers anything (rule 5). A notice that names only
+its thread also names its channel, so the adapter always has somewhere to post it.
+
 Command answers, hints, refusals and pickers are **ephemeral**: they are about the session,
 not part of the conversation, and a thread full of status messages buries the answers. A
 notice goes through the interaction's `response_url` when there is one (which is also the
@@ -839,6 +850,15 @@ back, so the vocabulary the core switches on is unchanged. A refused reply path 
 swallow the answer either: when the interaction's `response_url` rejects a notice, the
 adapter posts it instead — the picker's failure was reported through that same URL, which
 is why the command was silent at both ends.
+
+**A notice that names its thread has named its channel**, and the adapter takes the
+channel from either: a notice carrying a thread and an empty channel is posted into the
+thread's channel rather than into `""`. Posting to the empty one is how the "attached to
+this session" notice after `/pi resume` was answered with `channel_not_found` — a session
+that had in fact been adopted, announced as if nothing had happened. For the same reason
+the reply path is never the only path: a `response_url` that refuses a notice, or refuses
+the *replacement* of one (the outcome of a confirmed delete), falls back to posting, so a
+button always answers somewhere.
 
 The Slack app itself is configuration as code: `slack/manifest.yaml` (standard bot) and
 `slack/manifest-agent.yaml` (agent messaging experience) are the two supported app

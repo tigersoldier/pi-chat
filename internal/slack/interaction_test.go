@@ -25,6 +25,7 @@ func TestPostChoosesWhereANoticeGoes(t *testing.T) {
 		wantMethod   string
 		wantThreadTS any
 		wantReplace  bool
+		wantChannel  string
 	}{
 		{
 			name:       "a plain notice is a message in the thread",
@@ -33,6 +34,18 @@ func TestPostChoosesWhereANoticeGoes(t *testing.T) {
 			// A thread notice must stay in its thread, or it would appear at the
 			// channel root instead of with the conversation.
 			wantThreadTS: thread.ThreadTS,
+		},
+		{
+			// A notice that names its thread has named its channel: posting it at
+			// channel "" is what turned the adoption notice into channel_not_found.
+			name: "a thread notice without a channel finds it in the thread",
+			mutate: func(n *bot.Notice) {
+				n.Thread = &thread
+				n.Channel = ""
+			},
+			wantMethod:   "chat.postMessage",
+			wantThreadTS: thread.ThreadTS,
+			wantChannel:  thread.Channel,
 		},
 		{
 			name:         "an ephemeral notice is shown to one user",
@@ -86,6 +99,9 @@ func TestPostChoosesWhereANoticeGoes(t *testing.T) {
 			}
 			if test.wantThreadTS != nil && call.params["thread_ts"] != test.wantThreadTS {
 				t.Errorf("thread_ts = %v, want %v", call.params["thread_ts"], test.wantThreadTS)
+			}
+			if test.wantChannel != "" && call.params["channel"] != test.wantChannel {
+				t.Errorf("channel = %v, want %v", call.params["channel"], test.wantChannel)
 			}
 			if test.wantReplace && call.params["replace_original"] != true {
 				t.Errorf("replace_original = %v, want true", call.params["replace_original"])
@@ -247,6 +263,39 @@ func TestPostFallsBackWhenTheResponseURLRefusesTheAnswer(t *testing.T) {
 	}
 	if !posted {
 		t.Errorf("the refused answer was posted nowhere: %v", stub.methods())
+	}
+}
+
+func TestAFailedReplaceStillReportsTheOutcome(t *testing.T) {
+	// The confirmation message is replaced by the outcome of the action. When the
+	// platform refuses that replacement, the outcome is posted instead: a press
+	// that answers nothing looks exactly like a broken bot, which is how the first
+	// live delete looked.
+	response := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "invalid_blocks")
+	}))
+	defer response.Close()
+
+	stub := &stubSlack{}
+	platform := newTestPlatform(t, stub, "stream")
+	notice := noticeFor()
+	notice.Ephemeral = true
+	notice.ReplyTo = response.URL
+	notice.Update = "1700000000.000200"
+	notice.Text = "Deleted `their-session`."
+	if err := platform.Post(context.Background(), notice); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	posted := false
+	for _, method := range stub.methods() {
+		if method == "chat.postEphemeral" {
+			posted = true
+		}
+	}
+	if !posted {
+		t.Errorf("a failed replacement reported nothing: %v", stub.methods())
 	}
 }
 

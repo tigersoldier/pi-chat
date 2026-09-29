@@ -341,3 +341,50 @@ func TestDeleteAdoptedSessionLeavesItsDirectoryAlone(t *testing.T) {
 		t.Errorf("an adopted session's directory was removed: %v", err)
 	}
 }
+
+func TestDeleteWorksWhenThePlatformDoesNotReportTheThread(t *testing.T) {
+	// Slack's payload for a button on an *ephemeral* message carries no thread
+	// timestamp, so the press that deletes a session arrives naming only the
+	// session. Resolving that back to the thread that owns it is what makes the
+	// confirmation work at all: the first live press did nothing and said nothing,
+	// because the handler looked for a thread the platform never sent.
+	b, platform, st := newTestBot(t)
+	life := lifecycleFor(t, b)
+	th := threadWithSession(t, b, st, "C1", "1700000000.000100")
+	row := th.snapshot()
+
+	press := deletePress(row.SessionPath)
+	press.Thread = nil
+	b.HandleAction(context.Background(), press)
+
+	waitFor(t, "the deletion", func() bool { return len(life.deletedSessions()) == 1 })
+	if got := life.deletedSessions()[0]; got != row.SessionPath {
+		t.Errorf("deleted %q, want %q", got, row.SessionPath)
+	}
+	waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) >= 2 })
+	notices := platform.postedNotices()
+	if text := notices[len(notices)-1].Text; !strings.Contains(text, "Deleted") {
+		t.Errorf("the press answered nothing useful: %q", text)
+	}
+}
+
+func TestDeleteAnswersEvenWhenThereIsNothingToDelete(t *testing.T) {
+	// The session named is nobody's any more — deleted already, or retired by /new.
+	// Nothing is deleted, and the press still gets an answer: a button that answers
+	// nothing is indistinguishable from a broken bot, which is how the first live
+	// delete looked.
+	b, platform, _ := newTestBot(t)
+	life := lifecycleFor(t, b)
+
+	press := deletePress("/sessions/someone-elses.jsonl")
+	press.Thread = nil
+	b.HandleAction(context.Background(), press)
+
+	waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
+	if deleted := life.deletedSessions(); len(deleted) != 0 {
+		t.Fatalf("a delete worked for a session that is not ours: %v", deleted)
+	}
+	if text := platform.postedNotices()[0].Text; !strings.Contains(text, "nothing was deleted") {
+		t.Errorf("the answer is %q, want it to say nothing happened", text)
+	}
+}

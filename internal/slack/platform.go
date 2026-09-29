@@ -125,40 +125,46 @@ func (p *Platform) StartTurn(_ context.Context, m bot.Message) (bot.Renderer, er
 // one user, and everything else is a normal message in the channel or thread.
 func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
 	blocks := blocksFor(n.Buttons)
+	// A notice in a thread names its channel twice at most: the Thread carries it,
+	// and Channel repeats it for the channel-root case. Take whichever is set — a
+	// caller that named only the thread must not post into the void, which is how
+	// the "attached to this session" notice after /pi resume was answered with
+	// channel_not_found and the session looked unusable.
+	channel := n.Channel
+	if channel == "" && n.Thread != nil {
+		channel = n.Thread.Channel
+	}
 	switch {
 	case n.ReplyTo != "":
 		err := p.api.Respond(ctx, n.ReplyTo, n.Text, blocks, n.Update != "")
 		if err == nil {
 			return nil
 		}
+		// An answer the platform refuses must not become an answer nobody ever sees
+		// — whether it was the first post or the replacement of a confirmation. A
+		// replace that fails leaves the original in place, which is stale but
+		// readable; silence is not.
 		if n.Update != "" {
-			// Replacing the message is the whole point here: the interaction's own
-			// response URL is the only way to rewrite an ephemeral message, so there
-			// is nothing to fall back to.
-			return err
+			p.log.Warn("cannot replace the message; posting the answer instead", "error", err)
+		} else {
+			p.log.Warn("cannot answer through the response URL; posting instead", "error", err)
 		}
-		// An answer that the platform refuses must not become an answer nobody ever
-		// sees. /pi resume's picker failed this way: the response URL rejected the
-		// message, and the error report went through the same URL, so the command
-		// was silent from both ends (the blocks are fixed; this is the net under
-		// it). Posting gives the answer a home when the reply path does not.
-		p.log.Warn("cannot answer through the response URL; posting instead", "error", err)
 		if n.Ephemeral && n.UserID != "" {
-			_, perr := p.api.PostEphemeral(ctx, n.Channel, n.UserID, threadTS(n.Thread), n.Text, blocks)
+			_, perr := p.api.PostEphemeral(ctx, channel, n.UserID, threadTS(n.Thread), n.Text, blocks)
 			return perr
 		}
-		_, perr := p.api.PostBlocks(ctx, n.Channel, threadTS(n.Thread), n.Text, blocks)
+		_, perr := p.api.PostBlocks(ctx, channel, threadTS(n.Thread), n.Text, blocks)
 		return perr
 	case n.Update != "":
-		return p.api.UpdateBlocks(ctx, n.Channel, n.Update, n.Text, blocks)
+		return p.api.UpdateBlocks(ctx, channel, n.Update, n.Text, blocks)
 	case n.Ephemeral:
 		if n.UserID == "" {
 			return errors.New("slack: an ephemeral notice needs a user")
 		}
-		_, err := p.api.PostEphemeral(ctx, n.Channel, n.UserID, threadTS(n.Thread), n.Text, blocks)
+		_, err := p.api.PostEphemeral(ctx, channel, n.UserID, threadTS(n.Thread), n.Text, blocks)
 		return err
 	default:
-		_, err := p.api.PostBlocks(ctx, n.Channel, threadTS(n.Thread), n.Text, blocks)
+		_, err := p.api.PostBlocks(ctx, channel, threadTS(n.Thread), n.Text, blocks)
 		return err
 	}
 }

@@ -456,6 +456,41 @@ use found, all of them in paths the stubs could not see:
       switched on first) is what makes them live. Found by the new live test, which is why
       that test skips on a capability answer rather than failing.
 
+**Found by the second live round (2026-09-28, `/pi resume` and `/pi delete`)** — three
+defects the first round could not reach, because until then neither command had ever run:
+
+- [x] **The picker's buttons were filenames.** `sessionLabel` used the session's *name*,
+      which the catalog leaves empty for sessions pi-chat did not create, and fell back to
+      the file — so the sessions on offer read
+      `--home-pi-.emacs.d-private--/2026-09-04T16-23-14-361Z_01a06d3b-….jsonl`. It now
+      leads with the catalog's `Title` (the first thing asked in the session, which the
+      gateway already computes), cut to its first line with pi's skill/template wrapper —
+      and the "References are relative to …" boilerplate inside it — removed; then the
+      session's own name, then the file. It ends with the last element of the working
+      directory, plus `live` when pi is already running for that session. When the
+      platform's cap bites it is the title that gives way, because the directory is the
+      half that tells two sessions of one repository apart. What is offered is unchanged:
+      a session a thread owns, or one pi-chat created itself, is still not in the list.
+- [x] **Adopting a session looked like nothing had happened.** The attach worked — the
+      journal has `bound the thread to its session` — and the notice saying so went out
+      with the thread set and no channel: `chat.postMessage: channel_not_found`. The
+      adapter now takes the channel from the thread when a notice does not name one, and
+      the notice says how to continue in the thread it just opened: a channel thread
+      answers mentions, a DM thread answers anything. Without that sentence the first
+      message in an adopted channel thread is dropped as unaddressed conversation — by
+      design, and in silence — which is what "after resuming it doesn't work" was.
+- [x] **The delete confirmation did nothing and said nothing.** Slack's payload for a
+      button on an *ephemeral* message carries no `thread_ts`, so the press arrived with
+      nothing to act on: the handler logged `a delete arrived without a thread to delete
+      in` and returned. A press is now resolved through the session it names — whichever
+      thread owns that session is the thread the button belonged to — and a press that
+      resolves to nothing still answers where it was pressed, because a button that
+      answers nothing is indistinguishable from a broken bot. A *replacement* the response
+      URL refuses also falls back to posting, so the outcome of a confirmed delete cannot
+      vanish. 9 new tests across the two changes: the label tiers and the skill wrapper,
+      the notice's channel and wording, a press with no thread, and a press naming a
+      session that belongs to nobody.
+
 **Exit:** a channel thread where the bot answers mentions, sees what other people said
 since its last turn, and knows what the transcript means — with the instruction installed
 once, not per turn.
