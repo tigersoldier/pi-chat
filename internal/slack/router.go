@@ -2,7 +2,9 @@ package slack
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"strings"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
 )
@@ -72,5 +74,45 @@ func (r *Router) Handle(ctx context.Context, env Envelope) {
 		r.core.HandleOpened(ctx, opened)
 		return
 	}
-	r.log.Debug("ignoring an envelope this build does not answer", "type", env.Type)
+	r.logEvent(env)
+}
+
+// logEvent records what an envelope pi-chat did *not* answer actually carried.
+//
+// "Did the event arrive, and did we take it" is the first question a delivery
+// problem starts with, and the answer was twice missing: a dropped message left no
+// trace at all, which is indistinguishable from an event Slack never sent. One
+// line per unanswered envelope, at debug level, so the cost is paid only when
+// somebody is looking (DESIGN.md §12).
+func (r *Router) logEvent(env Envelope) {
+	if env.Type != "events_api" {
+		r.log.Debug("ignoring an envelope this build does not answer", "type", env.Type)
+		return
+	}
+	var callback struct {
+		Event struct {
+			Type     string `json:"type"`
+			Subtype  string `json:"subtype"`
+			BotID    string `json:"bot_id"`
+			User     string `json:"user"`
+			Text     string `json:"text"`
+			TS       string `json:"ts"`
+			ThreadTS string `json:"thread_ts"`
+			Channel  string `json:"channel"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(env.Payload, &callback); err != nil {
+		r.log.Debug("ignoring an events envelope this build cannot read", "error", err)
+		return
+	}
+	event := callback.Event
+	r.log.Debug("ignoring a slack event",
+		"event", event.Type,
+		"subtype", event.Subtype,
+		"from_a_bot", event.BotID != "",
+		"channel", event.Channel,
+		"user", event.User,
+		"ts", event.TS,
+		"thread_ts", event.ThreadTS,
+		"mentions_bot", strings.Contains(event.Text, "<@"+r.botUserID+">"))
 }
