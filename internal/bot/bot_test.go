@@ -393,7 +393,7 @@ func TestCloseIdleSkipsAThreadWithATurnInFlight(t *testing.T) {
 func TestHandleMessageAnswersAttachmentsOnlyOnce(t *testing.T) {
 	b, platform, _ := newTestBot(t)
 	message := newTestMessage("Ev1", "")
-	message.Files = 2
+	message.Files = []Attachment{{ID: "F1"}, {ID: "F2"}}
 
 	b.HandleMessage(context.Background(), message)
 

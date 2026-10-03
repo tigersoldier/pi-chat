@@ -226,7 +226,7 @@ func TestParseMessageRejectsWhatIsNotAddressedToTheBot(t *testing.T) {
 	}
 }
 
-func TestParseMessageCountsFiles(t *testing.T) {
+func TestParseMessagePreservesFileIdentities(t *testing.T) {
 	env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> look",` +
 		`"ts":"1","channel":"C1","files":[{"id":"F1"},{"id":"F2"}]}`)
 
@@ -234,8 +234,8 @@ func TestParseMessageCountsFiles(t *testing.T) {
 	if !ok {
 		t.Fatal("a mention with files should still parse")
 	}
-	if message.Files != 2 {
-		t.Fatalf("files = %d, want 2", message.Files)
+	if len(message.Files) != 2 {
+		t.Fatalf("files = %d, want 2", len(message.Files))
 	}
 }
 

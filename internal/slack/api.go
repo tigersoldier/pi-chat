@@ -362,6 +362,7 @@ type Reply struct {
 	BotID   string `json:"bot_id"`
 	Subtype string `json:"subtype"`
 	Text    string `json:"text"`
+	Files   []File `json:"files"`
 }
 
 // Bounds on reading a thread back. The page size is Slack's maximum, and the

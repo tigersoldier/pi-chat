@@ -148,17 +148,18 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	}
 
 	switch {
-	case strings.TrimSpace(m.Text) == "" && m.Files == 0:
+	case strings.TrimSpace(m.Text) == "" && len(m.Files) == 0:
 		// A bare mention: the user introduced the bot without asking anything.
 		// Answering costs nothing, and it is how the grammar is discovered from
 		// inside Slack.
 		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: mentionHelp})
 		return
 	case strings.TrimSpace(m.Text) == "":
-		// Attachments only, which this build cannot read.
-		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
-			Text: "I cannot read attachments yet — send the text instead."})
-		return
+		if _, ok := b.plat.(ImageReader); !ok {
+			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
+				Text: "This platform cannot read attachments — send the text instead."})
+			return
+		}
 	}
 
 	// A mention whose whole text is a control command's name is a near miss:
@@ -172,10 +173,6 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		}
 	}
 
-	if m.Files > 0 {
-		b.log.Warn("this message carries attachments, which this build ignores",
-			"count", m.Files, "thread", m.Thread.Key())
-	}
 	b.startTurn(ctx, th, m)
 }
 

@@ -555,7 +555,14 @@ once, not per turn.
 ### M6 — Phase 3
 
 - [ ] Message shortcut for in-thread discovery; `setTitle`/`setStatus`; suggested prompts
-- [ ] Image/attachment passthrough; `/pi resume` picker polish; metrics
+- [x] Image passthrough (2026-10-03): retain file IDs/names and `file_share` messages;
+      download PNG/JPEG/GIF/WebP through `files.info` with authenticated, host-restricted
+      requests; send native images on the gateway prompt, including image-only requests
+      and retained thread context. Trigger-first dedupe, four-image/5 MiB-per-image/
+      10 MiB-total limits, eight-read cap, bounded timeouts and visible failures.
+      Regression coverage includes the actual gateway wire frame, private downloads,
+      unsafe redirects, scope errors, thread filtering and size limits.
+- [ ] General attachment passthrough; `/pi resume` picker polish; metrics
 
 ### Parallel — upstream fix (user, in the pi-gateway repo)
 

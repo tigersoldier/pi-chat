@@ -229,6 +229,26 @@ and puts it in front of the request.
   That is the open question below, settled this way in the code: the mention usually refers
   to what was just said.
 
+### Images from Slack (2026-10-03)
+
+- Preserve file identities and names on inbound messages and thread replies, including
+  Slack's `file_share` subtype. Images in the trigger and in retained conversation lines
+  travel as pi's native `images` prompt content, not private URLs the model cannot open.
+- The optional platform `ImageReader` resolves each file through `files.info` and downloads
+  `url_private_download` (or `url_private`) with the bot token. Only HTTPS Slack file hosts
+  are allowed, including redirects; pi-chat does not log or save tokens, private URLs or
+  image bytes. pi retains native image prompts in its session history as usual.
+  The install needs `files:read`, already declared in both manifests.
+- Trigger images have priority, then the newest retained conversation images; deduplicate
+  by file identity. Bound a turn to four images, 5 MiB per image and 10 MiB total before
+  base64 encoding, safely below the gateway's 16 MiB frame cap. Accept PNG, JPEG, GIF and
+  WebP, checking downloaded bytes rather than trusting Slack's MIME label.
+- Text identifies each attached image's author/source and position. Conversation images
+  remain context, not requests. A bare image request gets a default inspection prompt.
+  Unsupported, inaccessible or oversized files are reported visibly rather than silently
+  discarded; a text request can still proceed, but an image-only request with no readable
+  images does not spend a model turn. Downloads happen only inside an authorized turn.
+
 ### The instruction that explains the conversation (built, 2026-09-27)
 
 The transcript and the request arrive in one prompt, so the agent has to be told what the
@@ -911,7 +931,8 @@ core passes back untouched.
   `@pi /model`; interactive approvals (buttons + modal); concurrency cap with eviction
   and bounded queue; streaming → patch fallback.
 - **Phase 3.** Message shortcut for in-thread discovery; `setTitle`/`setStatus` and
-  suggested prompts; image/attachment passthrough; `/pi resume` picker polish; metrics.
+  suggested prompts; image passthrough (built); general attachments; `/pi resume` picker
+  polish; metrics.
 
 Testing: run the real `pi-gatewayd` pointed at a stub `pi` binary (`--pi`), so the
 gateway contract is exercised for real while the agent is fake; recorded Slack payloads

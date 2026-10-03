@@ -3,6 +3,8 @@ package bot
 import (
 	"context"
 	"strings"
+
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // platformName is the platform this build speaks. It names the sessions
@@ -66,7 +68,7 @@ type Message struct {
 	// Thread.Workspace carries, and streaming to a channel needs it.
 	Workspace string
 	Text      string // the prompt, with the bot's own mention removed
-	Files     int    // attachments
+	Files     []Attachment
 
 	// Mentioned records that the sender addressed the bot by name. It is what
 	// separates `@pi status` (which earns a "did you mean @pi /status?") from
@@ -77,6 +79,19 @@ type Message struct {
 	// rather than in a channel. A DM thread needs no mention: the conversation
 	// is already the address (DESIGN.md §5).
 	Direct bool
+}
+
+// Attachment identifies a platform file. The adapter resolves its ID when asked
+// to read it; private URLs and credentials never enter the core or prompt.
+type Attachment struct {
+	ID   string
+	Name string
+}
+
+// ImageReader is implemented by platforms that can download image attachments.
+// Reads happen only after the core has authorized and started a turn.
+type ImageReader interface {
+	ReadImage(ctx context.Context, file Attachment) (protocol.ImageContent, error)
 }
 
 // Command is one inbound command: a slash command at a channel or DM root, or
@@ -138,6 +153,7 @@ type Said struct {
 	UserID string // who said it, empty for a platform that has no identity to give
 	Name   string // display name, empty when the platform cannot resolve one
 	Text   string
+	Files  []Attachment
 	// FromBot marks pi-chat's own message. The core leaves them out of a
 	// transcript — the agent has them in its own history — and only the adapter
 	// can tell which messages are its own.

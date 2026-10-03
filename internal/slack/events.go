@@ -53,9 +53,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 			ThreadTS    string `json:"thread_ts"`
 			Channel     string `json:"channel"`
 			ChannelType string `json:"channel_type"`
-			Files       []struct {
-				ID string `json:"id"`
-			} `json:"files"`
+			Files       []File `json:"files"`
 		} `json:"event"`
 	}
 	if err := json.Unmarshal(env.Payload, &callback); err != nil {
@@ -66,7 +64,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	switch {
 	case event.Type != "app_mention" && event.Type != "message":
 		return bot.Message{}, false
-	case event.BotID != "" || event.Subtype != "":
+	case event.BotID != "" || (event.Subtype != "" && event.Subtype != "file_share"):
 		// Our own post, an edit, a channel join: none of them is a prompt.
 		return bot.Message{}, false
 	case event.User == "", event.Channel == "", event.TS == "":
@@ -132,7 +130,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 		Text:      strings.TrimSpace(text),
 		Mentioned: mentioned,
 		Direct:    direct,
-		Files:     len(event.Files),
+		Files:     attachments(event.Files),
 	}, true
 }
 

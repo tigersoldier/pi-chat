@@ -58,7 +58,7 @@ oauth_config:
       - mpim:history
       - users:read           # names beside a message, not just the ID
       - assistant:write      # app_context_changed + legacy methods
-      - files:read           # phase 3: attachments
+      - files:read           # download images sent to the agent or shared in its thread
       - reactions:write      # phase 3: a 👀 receipt while the agent works
 
 settings:
