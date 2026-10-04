@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -92,6 +92,26 @@ CREATE TABLE IF NOT EXISTS retired (
 );
 
 CREATE INDEX IF NOT EXISTS retired_thread ON retired(thread_key);
+
+-- A surface's own bookkeeping, for an adapter that has no threads to hang it on
+-- (see surface.go). Not chat-shaped, on purpose: it holds a cursor and a list of
+-- messages the daemon posted, never conversation content.
+CREATE TABLE IF NOT EXISTS surface_kv (
+    surface    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (surface, key)
+);
+
+CREATE TABLE IF NOT EXISTS surface_posted (
+    surface   TEXT NOT NULL,
+    ts        TEXT NOT NULL,
+    posted_at INTEGER NOT NULL,
+    PRIMARY KEY (surface, ts)
+);
+
+CREATE INDEX IF NOT EXISTS surface_posted_at ON surface_posted(posted_at);
 `
 
 // migrations bring an older database up to schemaVersion, one step at a time.
@@ -122,6 +142,25 @@ var migrations = []struct {
             retired_at   INTEGER NOT NULL
         )`,
 		`CREATE INDEX IF NOT EXISTS retired_thread ON retired(thread_key)`,
+	}},
+	{to: 4, stmt: []string{
+		// The self-DM surface's cursor and posted ledger (DESIGN.md §12). A
+		// migration rather than only an entry in the schema so an install that
+		// turns the surface on later does not have to recreate its database.
+		`CREATE TABLE IF NOT EXISTS surface_kv (
+            surface    TEXT NOT NULL,
+            key        TEXT NOT NULL,
+            value      TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (surface, key)
+        )`,
+		`CREATE TABLE IF NOT EXISTS surface_posted (
+            surface   TEXT NOT NULL,
+            ts        TEXT NOT NULL,
+            posted_at INTEGER NOT NULL,
+            PRIMARY KEY (surface, ts)
+        )`,
+		`CREATE INDEX IF NOT EXISTS surface_posted_at ON surface_posted(posted_at)`,
 	}},
 }
 
@@ -232,6 +271,7 @@ var versionStatements = map[int]string{
 	1: "PRAGMA user_version = 1",
 	2: "PRAGMA user_version = 2",
 	3: "PRAGMA user_version = 3",
+	4: "PRAGMA user_version = 4",
 }
 
 // setVersion stamps the schema version.
