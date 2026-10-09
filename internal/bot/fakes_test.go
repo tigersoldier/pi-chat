@@ -24,11 +24,17 @@ func workspaceProject(t *testing.T, b *Bot, prompt string) workspace.Project {
 	return project
 }
 
+type requestAck struct {
+	message Message
+	allowed bool
+}
+
 // fakePlatform records what the core asks a platform to do.
 type fakePlatform struct {
 	mu       sync.Mutex
 	turns    []Message
 	notices  []Notice
+	acks     []requestAck
 	opened   []string // the text of each thread the core asked for
 	thread   Thread   // what OpenThread returns; zero means a stand-in
 	renderer *recordingRenderer
@@ -76,6 +82,13 @@ func (p *fakePlatform) Post(_ context.Context, n Notice) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.notices = append(p.notices, n)
+	return nil
+}
+
+func (p *fakePlatform) AcknowledgeRequest(_ context.Context, m Message, allowed bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.acks = append(p.acks, requestAck{message: m, allowed: allowed})
 	return nil
 }
 
@@ -147,6 +160,13 @@ func (p *fakePlatform) postedNotices() []Notice {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]Notice(nil), p.notices...)
+}
+
+// acknowledgedRequests returns the requests acknowledged so far.
+func (p *fakePlatform) acknowledgedRequests() []requestAck {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]requestAck(nil), p.acks...)
 }
 
 // openedThreads returns the texts of the threads the core asked to open.
