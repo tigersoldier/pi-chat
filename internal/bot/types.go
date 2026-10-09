@@ -51,8 +51,9 @@ func slugName(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// Message is one inbound message that addresses the bot: a mention, or plain
-// text in a thread the bot already owns.
+// Message is one inbound message delivered to the core. Room messages that do
+// not address the bot are carried here only to be ignored; the observer fetches
+// them later as context.
 type Message struct {
 	EventID string // platform event ID, used to drop redeliveries
 	Thread  Thread
@@ -73,9 +74,8 @@ type Message struct {
 	// the same word typed inside a conversation, where it is just a word.
 	Mentioned bool
 
-	// Direct records that the message arrived in a one-to-one (or group) DM
-	// rather than in a channel. A DM thread needs no mention: the conversation
-	// is already the address (DESIGN.md §5).
+	// Direct records a one-to-one DM. A group DM is a room, not an address, so
+	// it remains false and requires a mention just like a channel (DESIGN.md §5).
 	Direct bool
 }
 
@@ -204,6 +204,12 @@ const (
 // and not again (the adapter remembers its own refusal).
 type StatusReporter interface {
 	SetStatus(ctx context.Context, t Thread, s Status) error
+}
+
+// RequestAcknowledger acknowledges an addressed message before the core starts
+// work or refuses it. Platforms choose how to present the acknowledgement.
+type RequestAcknowledger interface {
+	AcknowledgeRequest(ctx context.Context, m Message, allowed bool) error
 }
 
 // Suggestion is one prompt a platform offers before the user types: a title for
