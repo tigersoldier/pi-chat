@@ -311,6 +311,15 @@ func (a *API) PostBlocks(ctx context.Context, channel, threadTS, text string, bl
 	return out.TS, nil
 }
 
+// AddReaction adds a named emoji reaction to one message.
+func (a *API) AddReaction(ctx context.Context, channel, ts, name string) error {
+	return a.call(ctx, "reactions.add", map[string]any{
+		"channel":   channel,
+		"timestamp": ts,
+		"name":      name,
+	}, nil)
+}
+
 // PostEphemeral posts text only the named user can see: refusals, hints and
 // command answers should not appear to everyone else in the channel. An empty
 // threadTS posts at the channel root.

@@ -186,6 +186,35 @@ func newTestPlatform(t *testing.T, stub *stubSlack, mode string) *Platform {
 	return NewPlatform(newStubAPI(t, stub), cfg, Identity{TeamID: "T1"}, discardLogger())
 }
 
+func TestAcknowledgeRequestReactsToOriginalMessage(t *testing.T) {
+	for _, tc := range []struct {
+		allowed  bool
+		reaction string
+	}{
+		{allowed: true, reaction: "eyes"},
+		{allowed: false, reaction: "shrug"},
+	} {
+		stub := &stubSlack{}
+		platform := newTestPlatform(t, stub, "patch")
+		message := testMessage()
+		message.TS = "1700000000.000200"
+
+		if err := platform.AcknowledgeRequest(context.Background(), message, tc.allowed); err != nil {
+			t.Fatalf("AcknowledgeRequest(allowed=%v): %v", tc.allowed, err)
+		}
+
+		calls := stub.recorded()
+		if len(calls) != 1 || calls[0].method != "reactions.add" {
+			t.Fatalf("calls = %+v, want one reactions.add", calls)
+		}
+		params := calls[0].params
+		if params["channel"] != message.Thread.Channel || params["timestamp"] != message.TS || params["name"] != tc.reaction {
+			t.Errorf("reactions.add params = %+v, want channel=%q timestamp=%q name=%q",
+				params, message.Thread.Channel, message.TS, tc.reaction)
+		}
+	}
+}
+
 func newTestRenderer(t *testing.T, stub *stubSlack, mode string) *renderer {
 	t.Helper()
 	return testRenderer(t, newTestPlatform(t, stub, mode))

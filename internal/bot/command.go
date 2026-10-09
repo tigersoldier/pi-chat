@@ -70,12 +70,6 @@ const (
 	// rootCommandHint answers a root command that needs a session.
 	rootCommandHint = "That command needs a session, and sessions live in threads: " +
 		"mention me with a prompt to start one, then use `@pi /<command>` there."
-	// channelReplyHint answers somebody who typed in a thread without addressing the
-	// bot. In a channel that is conversation rather than a request, and nothing
-	// about the thread tells them so — the bot may have opened it, which makes
-	// typing in it look exactly like the way to continue.
-	channelReplyHint = "I answer mentions in channels: reply with `@pi <what to do>` and I will pick it up. " +
-		"Anything else here I read as context, not as a request."
 )
 
 // scope says where a command is legal.

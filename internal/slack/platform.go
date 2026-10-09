@@ -169,6 +169,16 @@ func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
 	}
 }
 
+// AcknowledgeRequest reacts to the user's original message before work starts.
+// Slack's reactions.add expects the emoji name without colons.
+func (p *Platform) AcknowledgeRequest(ctx context.Context, m bot.Message, allowed bool) error {
+	reaction := "shrug"
+	if allowed {
+		reaction = "eyes"
+	}
+	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, reaction)
+}
+
 // OpenThread posts a top-level message and returns the thread it starts: the
 // new message's own timestamp is the thread root. The core needs this when a
 // root command has no message of its own to answer under.

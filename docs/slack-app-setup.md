@@ -210,7 +210,7 @@ Reference for what you just applied. Nothing here needs action.
 | `mpim:history` | read group direct messages | a multi-person DM that includes the bot |
 | `users:read` | look up who a user ID is | the names in a thread transcript: without it, lines read `[U123]` instead of `[Alice (U123)]` — the agent gets IDs either way, and the fallback is deliberate |
 | `files:read` | download files shared with the app | handing images from requests and thread context to the agent (built; an older install missing the scope must be reinstalled) |
-| `reactions:write` | add emoji reactions | a 👀 receipt while the agent is working (**phase 3**) |
+| `reactions:write` | add emoji reactions | 👀 on an accepted mention; 🤷 when access is denied |
 | `assistant:write` | act as a Slack agent | **agent variant only** — required by `app_context_changed` and the legacy `assistant.threads.*` methods. The agent status and title methods pi-chat uses (`agents.sessions.setStatus`/`rename`) need `chat:write` alone |
 
 ### Bot events
@@ -225,8 +225,8 @@ Reference for what you just applied. Nothing here needs action.
 
 `message.channels` delivers **every** message in every public channel the bot is in,
 including conversations pi-chat does not care about. That is inherent to the Events API —
-the daemon ignores anything that is not a thread it owns, and only responds when
-mentioned or addressed in a thread it already has a session for.
+pi-chat ignores unmentioned channel/group-DM thread messages without replying, then reads
+them back as context on the next addressed turn.
 
 The agent manifest adds four events: `app_home_opened` (how a DM open is detected —
 **no scope required**; pi-chat uses it to offer suggested prompts), `agent_session_stopped`

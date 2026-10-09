@@ -142,6 +142,45 @@ func TestOnlyAddressedMessagesAreClaimed(t *testing.T) {
 	}
 }
 
+func TestTaggedMessageIsAcknowledgedBeforeAuthorizationOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		userID  string
+		allowed bool
+	}{
+		{name: "allowlisted", userID: "U1", allowed: true},
+		{name: "not allowlisted", userID: "U2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, platform, _ := newTestBot(t)
+			message := newTestMessage("Ev1", "please help")
+			message.UserID, message.TS = tc.userID, "1700000000.000200"
+
+			b.HandleMessage(context.Background(), message)
+
+			acks := platform.acknowledgedRequests()
+			if len(acks) != 1 || acks[0].allowed != tc.allowed || acks[0].message.TS != message.TS {
+				t.Fatalf("acknowledgements = %+v, want one for the tagged message with allowed=%v", acks, tc.allowed)
+			}
+			if tc.allowed {
+				waitFor(t, "the turn", func() bool { return platform.startedTurns() == 1 })
+				if len(platform.postedNotices()) != 0 {
+					t.Errorf("allowlisted request produced a refusal: %+v", platform.postedNotices())
+				}
+				return
+			}
+
+			if platform.startedTurns() != 0 {
+				t.Error("a request from outside the allowlist started a turn")
+			}
+			notices := platform.postedNotices()
+			if len(notices) != 1 || notices[0].Text != deniedUserText || !notices[0].Ephemeral || notices[0].UserID != tc.userID {
+				t.Errorf("notices = %+v, want a private refusal to the sender", notices)
+			}
+		})
+	}
+}
+
 // A reply nobody addressed to the bot is not a request, so there is nothing to
 // refuse — and an unlisted person answering their colleague in a thread the bot
 // happens to be in must not draw a visible reply about somebody's allowlist.

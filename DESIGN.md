@@ -402,6 +402,8 @@ commands inside message threads** and its slash-command payload carries no `thre
    answering their colleague in a thread the bot happens to be in must not draw a visible
    reply about somebody's allowlist. Their *mention*, or their DM, is a request, and a
    refusal is the answer to it.
+8. **A mention is acknowledged before work or refusal.** Slack reacts `:eyes:` when the
+   sender is allowed; otherwise it reacts `:shrug:` and sends that person a private refusal.
 
 What reaches a session, and what does not:
 
@@ -409,10 +411,10 @@ What reaches a session, and what does not:
 |---|---|
 | Channel root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one — the bot sits in busy channels |
 | DM (one-to-one), plain text | A prompt, rooted at that message. In a conversation the bot was added to, the conversation *is* the address — and this is the shape a suggested prompt takes |
-| Group DM, plain text | **Dropped** — observed as context, never a turn: with two or more people in it, the conversation is no longer only the bot's address. Only a mention turns there, exactly as in a channel |
+| Group DM, plain text | **Observed only, never a prompt or notice**: with two or more people in it, the conversation is no longer only the bot's address. Only a mention turns there, exactly as in a channel |
 | Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
 | DM root, `@pi <text>` | Same, and the thread is a DM thread |
-| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark. In a thread that already has a session, the first such message from one person earns exactly one **ephemeral note** saying that only mentions are requests |
+| Channel thread, plain text | **Observed only, never a prompt or notice**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark |
 | Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
 | DM thread, plain text | A prompt: in a DM the conversation is already the address |
 | Any thread, a message that addresses nobody | **Dropped**, and before the allowlist is consulted: whoever sent it, it is not a request, so there is nothing to answer and nothing to refuse
