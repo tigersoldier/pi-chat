@@ -22,21 +22,70 @@ import (
 // client at a local server.
 var APIBase = "https://slack.com/api/"
 
-// API is the slice of Slack's Web API that pi-chat uses. Every method needs
-// the bot token: the app-level token only opens the socket.
+// API is the slice of Slack's Web API that pi-chat uses.
+//
+// It has two authentication modes, one per surface. The app surface sends the
+// bot token as a bearer token to slack.com. The self-DM surface sends the
+// browser session token as the same bearer token *and* the session cookie, to
+// the workspace's own host — which is the only place that pair is valid.
 type API struct {
-	token string
-	http  *http.Client
-	log   *slog.Logger
+	token  string
+	cookie string // a whole Cookie header value, empty for the app surface
+	base   string // the Web API root; empty means APIBase
+	http   *http.Client
+	log    *slog.Logger
 }
 
-// NewAPI builds a client for the given bot token.
-func NewAPI(token string, log *slog.Logger) *API {
-	return &API{
+// Option adjusts an API client at construction.
+type Option func(*API)
+
+// WithBaseURL points the client at one workspace's Web API instead of
+// slack.com. Slack's own client uses the workspace host, and a session token is
+// scoped to it.
+func WithBaseURL(base string) Option {
+	return func(a *API) {
+		if base != "" {
+			a.base = strings.TrimRight(base, "/") + "/"
+		}
+	}
+}
+
+// WithCookie sends a Cookie header with every request. It is what carries the
+// `d` cookie a browser session token must be paired with.
+func WithCookie(header string) Option {
+	return func(a *API) { a.cookie = strings.TrimSpace(header) }
+}
+
+// CookieHeader renders a `d` cookie value into the header the workspace expects.
+//
+// The value Slack sets is URL-encoded, but it is easy to copy the decoded form
+// from a browser's cookie pane — and a literal `+` is the one character that
+// then arrives as a space, which Slack answers as invalid_auth before anything
+// else can be diagnosed. A value that already looks like a whole Cookie header
+// (`d=…; d-s=…`) is passed through, because some workspaces need the sibling.
+func CookieHeader(value string) string {
+	value = strings.TrimSpace(value)
+	switch {
+	case value == "":
+		return ""
+	case strings.Contains(value, "="):
+		return value
+	default:
+		return "d=" + strings.ReplaceAll(value, "+", "%2B")
+	}
+}
+
+// NewAPI builds a client for the given token.
+func NewAPI(token string, log *slog.Logger, opts ...Option) *API {
+	a := &API{
 		token: token,
 		http:  &http.Client{Timeout: 30 * time.Second},
 		log:   log,
 	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 // Error is a Slack API error response, such as `missing_scope`.
@@ -73,16 +122,23 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 	}
 
 	for attempt := 0; ; attempt++ {
+		base := a.base
+		if base == "" {
+			base = APIBase
+		}
 		var body io.Reader = strings.NewReader("")
 		if raw != nil {
 			body = bytes.NewReader(raw)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, APIBase+method, body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+method, body)
 		if err != nil {
 			return fmt.Errorf("slack %s: %w", method, err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Authorization", "Bearer "+a.token)
+		if a.cookie != "" {
+			req.Header.Set("Cookie", a.cookie)
+		}
 
 		resp, err := a.http.Do(req)
 		if err != nil {
@@ -355,15 +411,24 @@ func (a *API) Respond(ctx context.Context, responseURL, text string, blocks []bl
 	return fmt.Errorf("slack response_url: unexpected answer %q", answer)
 }
 
-// Reply is one message `conversations.replies` returned.
-type Reply struct {
-	TS      string `json:"ts"`
-	User    string `json:"user"`
-	BotID   string `json:"bot_id"`
-	Subtype string `json:"subtype"`
-	Text    string `json:"text"`
-	Files   []File `json:"files"`
+// Message is one conversation message, as conversations.history and
+// conversations.replies return it. The reply fields are populated on a thread
+// parent: the self-DM surface uses them to decide which threads it has to read
+// replies from.
+type Message struct {
+	TS          string `json:"ts"`
+	ThreadTS    string `json:"thread_ts"`
+	User        string `json:"user"`
+	BotID       string `json:"bot_id"`
+	Subtype     string `json:"subtype"`
+	Text        string `json:"text"`
+	ReplyCount  int    `json:"reply_count"`
+	LatestReply string `json:"latest_reply"`
+	Files       []File `json:"files"`
 }
+
+// Reply is retained as the name for a message returned by conversations.replies.
+type Reply = Message
 
 // Bounds on reading a thread back. The page size is Slack's maximum, and the
 // fetch limit is a sanity cap: a thread longer than this is a conversation the
@@ -373,14 +438,53 @@ const (
 	replyFetchLimit = 600
 )
 
+// HistoryPage is one page of conversations.history, still in Slack's order:
+// newest first.
+type HistoryPage struct {
+	Messages []Message
+	HasMore  bool
+}
+
+// historyPageSize is Slack's maximum for conversations.history.
+const historyPageSize = 200
+
+// History reads one page of a conversation's messages, newest first, as Slack
+// returns them. `oldest` and `latest` are exclusive in Slack's default reading:
+// a message with either timestamp is not part of the page. Empty bounds are not
+// sent.
+//
+// It is one page on purpose. The caller owns the cursor — for the self-DM that
+// cursor is durable, so paging is a decision about how far behind the daemon
+// is willing to be, not about what the API can carry.
+func (a *API) History(ctx context.Context, channel, oldest, latest string, limit int) (HistoryPage, error) {
+	if limit <= 0 || limit > historyPageSize {
+		limit = historyPageSize
+	}
+	params := map[string]any{"channel": channel, "limit": limit}
+	if oldest != "" {
+		params["oldest"] = oldest
+	}
+	if latest != "" {
+		params["latest"] = latest
+	}
+	var page struct {
+		Messages []Message `json:"messages"`
+		HasMore  bool      `json:"has_more"`
+	}
+	if err := a.call(ctx, "conversations.history", params, &page); err != nil {
+		return HistoryPage{}, err
+	}
+	return HistoryPage{Messages: page.Messages, HasMore: page.HasMore}, nil
+}
+
 // Replies reads a thread's conversation in order, following Slack's cursor
 // until the thread ends or replyFetchLimit messages have arrived.
 //
 // `oldest` is the exclusive lower bound in intent — it is the message a previous
 // prompt already carried — but Slack treats it as the start of a range, so the
 // caller filters the boundary rather than trusting it.
-func (a *API) Replies(ctx context.Context, channel, threadTS, oldest string) ([]Reply, error) {
-	var out []Reply
+func (a *API) Replies(ctx context.Context, channel, threadTS, oldest string) ([]Message, error) {
+	var out []Message
 	cursor := ""
 	for {
 		params := map[string]any{"channel": channel, "ts": threadTS, "limit": replyPageSize}
@@ -391,8 +495,8 @@ func (a *API) Replies(ctx context.Context, channel, threadTS, oldest string) ([]
 			params["cursor"] = cursor
 		}
 		var page struct {
-			Messages []Reply `json:"messages"`
-			HasMore  bool    `json:"has_more"`
+			Messages []Message `json:"messages"`
+			HasMore  bool      `json:"has_more"`
 			Metadata struct {
 				NextCursor string `json:"next_cursor"`
 			} `json:"response_metadata"`

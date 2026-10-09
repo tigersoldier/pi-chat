@@ -11,6 +11,10 @@
 # your home directory. Unknown keys are an error, not a warning.
 
 [slack]
+# The Slack app surface (Socket Mode). Optional: with enabled = false, or with
+# either token file missing, it is simply not started — a missing secret is a
+# switch, a wrong one is still an error.
+enabled        = true
 # xapp-… (Socket Mode app-level token) and xoxb-… (bot token), one per file.
 app_token_file = "~/.config/pi-chat/slack-app-token"
 bot_token_file = "~/.config/pi-chat/slack-bot-token"
@@ -20,6 +24,24 @@ bot_token_file = "~/.config/pi-chat/slack-bot-token"
 allowed_users = []
 # Empty means any channel the bot is a member of.
 allowed_channels = []
+
+[slack.self_dm]
+# Your own "Notes to self" conversation, driven as you instead of as the bot. No
+# notifications, no slash commands, no buttons — in either credential mode. Two
+# ways in, chosen by auth:
+#   "session"    your own browser credentials, pasted from DevTools. No app to
+#                create, but an account-wide secret (docs/slack-self-dm-setup.md).
+#   "user_oauth" a token of your own, minted by the team's Slack app through a
+#                broker (docs/slack-user-token-setup.md) — scoped, revocable,
+#                and nothing shared with anyone else's daemon.
+enabled       = false
+auth          = "session"
+xoxc_file     = "~/.config/pi-chat/slack-xoxc"  # auth = "session": xoxc-… session token
+xoxd_file     = "~/.config/pi-chat/slack-xoxd"  # auth = "session": the `d` cookie, or a whole Cookie header
+xoxp_file     = "~/.config/pi-chat/slack-xoxp"  # auth = "user_oauth": xoxp-… user token
+workspace_url = ""                              # auth = "session": https://acme.slack.com
+channel_id    = ""                              # the self-DM's D… conversation id
+poll_interval = "5s"                            # how often the DM is read
 
 [gateway]
 state_dir         = "~/.config/pi-gateway"                  # port + token discovery

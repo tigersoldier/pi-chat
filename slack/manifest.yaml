@@ -29,6 +29,12 @@
 #   settings.socket_mode_enabled
 #   features.app_home           direct messages depend on it
 #
+# oauth_config.scopes.user is only for the optional team mode where each person
+# gets their own token for their own self-DM (docs/slack-user-token-setup.md).
+# Those scopes are requested by the broker's own install link, never by the
+# app's install, so the app's consent screen does not mention them — but adding
+# them here is a manifest change and Slack will ask for a reinstall.
+#
 # Tokens are not part of a manifest and cannot be: after saving this, generate
 # an app-level token (Basic Information → App-Level Tokens → connections:write)
 # and install the app to get the bot token. See docs/slack-app-setup.md.
@@ -70,6 +76,15 @@ oauth_config:
       - users:read          # names beside a message, not just the ID
       - files:read          # download images sent to the agent or shared in its thread
       - reactions:write     # a 👀 receipt while the agent works (phase 3)
+    # Only for the team self-DM mode, where a person's own token drives their
+    # own "Notes to self" (docs/slack-user-token-setup.md). Not requested by the
+    # app's install link, so a normal install does not ask anyone for these.
+    user:
+      - im:history          # read the person's own direct messages
+      - im:read             # …and see which conversations they are in
+      - im:write            # open one when it does not exist yet
+      - chat:write          # post in them as the person
+      - users:read          # names beside a message, not just the ID
 
 settings:
   event_subscriptions:

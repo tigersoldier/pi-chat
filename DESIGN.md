@@ -774,12 +774,29 @@ Mint with `pi-gatewayd --provision-token`; rotate via `tokens.json` + SIGHUP.
 
 ```toml
 [slack]
+# true (the default) runs the app surface; false runs only the self-DM below.
+# A missing app or bot token file disables this surface at startup with a
+# warning rather than failing the daemon.
+enabled        = true
 app_token_file = "~/.config/pi-chat/slack-app-token"   # xapp-…, Socket Mode
 bot_token_file = "~/.config/pi-chat/slack-bot-token"   # xoxb-…
 
 [slack.access]
 allowed_users    = ["U01234567"]   # required; Slack member IDs
 allowed_channels = []              # optional; empty = any channel the bot is in
+
+# The app-less surface: your own "Notes to self" conversation, polled with your
+# browser session. Off by default; enabling it is a deliberate act with a real
+# cost (no notifications, an account-wide credential — see docs/).
+[slack.self_dm]
+enabled       = false
+auth          = "session"          # session | user_oauth
+xoxc_file     = "~/.config/pi-chat/slack-xoxc"   # auth = session
+xoxd_file     = "~/.config/pi-chat/slack-xoxd"   # auth = session
+xoxp_file     = "~/.config/pi-chat/slack-xoxp"   # auth = user_oauth
+workspace_url = "https://acme.slack.com"         # auth = session
+channel_id    = "D0123456789"      # the self-DM's D… id
+poll_interval = "5s"
 
 [gateway]
 state_dir         = "~/.config/pi-gateway"
@@ -915,6 +932,46 @@ and the payload handling is testable with recorded envelopes. No Slack envelope,
 block or Socket Mode type crosses the seam; `ReplyTo` and `Update` are opaque strings the
 core passes back untouched.
 
+**Two credentials, one surface.** The self-DM surface acts as a person either way,
+and the adapter does not care which: `auth = "session"` supplies a pasted browser
+session (`xoxc` + `d`), `auth = "user_oauth"` an OAuth user token from the team's
+app. The second mode has a second binary beside the daemon: `cmd/pi-chat-oauth`,
+the token broker the app owner runs, which exchanges the authorization code and
+shows each person their own token once. It is deliberately the confidential-client
+flow (`oauth/v2/authorize` with `user_scope`, exchanged through `oauth.v2.access`,
+token read from `authed_user`), so it works with an app that also has a bot user and
+needs no PKCE; Slack's `v2_user`/`oauth.v2.user.access` flow is the public-client
+variant and is not required. Ingress stays polling in both modes: Socket Mode belongs
+to the app and spreads payloads across all of its connections, so it cannot be shared
+by several people's daemons (`docs/slack-user-token-setup.md`).
+`Platform`, and `MultiPlatform` (internal/slack/mux.go) is what stands in front of them:
+it routes `StartTurn`, `Post` and `OpenThread` by channel id, with the app as the default
+and the configured self-DM channel as the one exception. Routing by channel rather than
+by process is what keeps one store, one gateway pool and one warm-session cap, and it
+works only because a thread's channel is part of its key. The optional capabilities
+(§4 observation, §6 status and suggestions) are claimed by the mux on behalf of the
+surfaces: it delegates where the surface implements the interface and reports the empty
+answer — no conversation, no status, no prompts — where it does not, which is exactly
+what the core sees from a platform that never implemented it.
+
+The app surface is optional in a soft sense (a missing token file turns it off with a
+warning) because it is the pre-existing default and an upgrade must not break it. The
+self-DM surface is opt-in — off unless `slack.self_dm.enabled` asks for it — and strict
+about *configuration*: a shape it cannot use is a startup error rather than something
+ignored. A credential it cannot *use* is a different thing: at startup that disables the
+surface with an error log while the app surface can still serve, and is fatal only when it
+is the only surface, because a stale cookie must neither take the app down nor make
+systemd flap on a restart loop. Once running, the poller retries with backoff and says
+what to fix, so an expiry is a log line rather than an outage. Its differences from the app are not
+incidental and the adapter owns them rather than hiding them: a reply is patched into one
+message instead of streamed, a `Notice`'s buttons become a numbered list answered by a
+number (the synthesized `Action` carries an event id so the core's dedupe still works),
+notices are posted rather than shown ephemerally, and there is no `Observer` — in a self-DM
+every message is addressed to the agent, so there is nothing to overhear. Its durable
+state is its own: a cursor and a per-thread cursor, plus a ledger of what the daemon
+posted, because in that conversation the agent and the human are the same author and only
+the ledger can tell them apart (`surface_kv` and `surface_posted`, DESIGN.md §7).
+
 ---
 
 ## 13. Build phasing
@@ -972,3 +1029,6 @@ drive the adapter without a workspace.
 | 12 | Native Slack streaming primary, patched message as fallback | `task_update` chunks map tool executions onto a real timeline and pi's markdown passes through unmodified — strictly better than a mrkdwn conversion table. |
 | 13 | Two trigger tokens, one vocabulary: `/pi <cmd>` at root, `@pi /<cmd>` in a thread; sessions are thread-scoped | Slack forbids developer slash commands in threads and omits `thread_ts` from their payload; this is the only consistent grammar the platform allows. |
 | 14 | Phase 0 is the thinnest vertical slice through the real seam | The two unknowns (Slack ingress/egress, gateway integration) only meet at the seam; proving them one at a time proves neither. |
+| 15 | Two optional surfaces in one daemon, routed by channel; the app surface is disabled by a missing token, the self-DM is opt-in and strict about configuration | One store, one warm cap, one place to reason about senders; the seam already routes by thread, and the channel is part of a thread's key. Missing app tokens are a switch rather than a fault; a self-DM that cannot start is disabled with an error log while the app can still serve, and is fatal only when it is the only surface — a stale cookie must not take the app down or flap under systemd. |
+| 16 | The self-DM is polled, not websocketed, and its interactivity is numbered replies | Polling needs no undocumented client endpoints; the surface has no notification (Slack never marks your own message unread) and no response URL, so text is the honest interface. The costs — an account-wide credential and Slack's documented detection of non-official clients — are why the surface is off by default and documented rather than recommended. |
+| 17 | Self-DM credentials come in two modes, with a per-person OAuth broker as the team shape | The session mode needs no app and stays the single-machine default; the user-token mode is scoped, revocable and one-per-person, which is what lets one app serve many people. The broker is a separate tiny binary because it is the only part that must be reachable from the internet; each daemon still polls its own token, because Socket Mode's fan-out cannot be partitioned per authorization. |

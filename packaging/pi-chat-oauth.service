@@ -1,0 +1,41 @@
+# pi-chat's optional OAuth token broker, as a systemd user unit.
+#
+# This is NOT part of a normal pi-chat install. Run it only if you are the
+# person who owns the Slack app and you want to hand out per-person tokens for
+# the self-DM surface (docs/slack-user-token-setup.md). It listens on a port,
+# and its pages show people their credentials, so it belongs behind something
+# that terminates TLS: Slack's redirect URL must be HTTPS.
+#
+# Configure it in ~/.config/pi-chat/oauth.env (mode 0600):
+#
+#   SLACK_CLIENT_ID=1234567890.1234567890
+#   SLACK_CLIENT_SECRET=abcdef…
+#   PI_CHAT_OAUTH_ARGS=--addr 127.0.0.1:8080 --redirect-url https://pi-chat.example.com/callback
+#
+# Install:
+#   make install && make install-unit-oauth
+#   systemctl --user enable --now pi-chat-oauth
+#
+# Inspect:
+#   journalctl --user -u pi-chat-oauth -f
+[Unit]
+Description=pi-chat OAuth token broker (Slack user tokens for the self-DM surface)
+Documentation=https://github.com/tigersoldier/pi-chat
+After=default.target network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/pi-chat/oauth.env
+# The arguments come from the environment file, because the client secret must
+# not be in a command line (or in a unit readable by anyone).
+ExecStart=%h/.local/bin/pi-chat-oauth $PI_CHAT_OAUTH_ARGS
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
