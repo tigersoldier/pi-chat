@@ -23,8 +23,8 @@ import (
 //	                  mentions the bot, rather than our reading of its text. The
 //	                  message event carrying the same ts is that same request
 //	                  arriving a second time; everything else in a room — plain
-//	                  text, a reply in a thread — is conversation, which the next
-//	                  turn fetches as context (DESIGN.md §4, §5).
+//	                  text, a reply in a thread — is conversation, ignored without
+//	                  a reply and fetched as context on the next turn (DESIGN.md §4, §5).
 //
 // Dropping the other delivery is what makes one message one turn, instead of two
 // turns deduped after the fact. The core still claims a turn by the message's
@@ -53,9 +53,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 			ThreadTS    string `json:"thread_ts"`
 			Channel     string `json:"channel"`
 			ChannelType string `json:"channel_type"`
-			Files       []struct {
-				ID string `json:"id"`
-			} `json:"files"`
+			Files       []File `json:"files"`
 		} `json:"event"`
 	}
 	if err := json.Unmarshal(env.Payload, &callback); err != nil {
@@ -66,7 +64,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	switch {
 	case event.Type != "app_mention" && event.Type != "message":
 		return bot.Message{}, false
-	case event.BotID != "" || event.Subtype != "":
+	case event.BotID != "" || (event.Subtype != "" && event.Subtype != "file_share"):
 		// Our own post, an edit, a channel join: none of them is a prompt.
 		return bot.Message{}, false
 	case event.User == "", event.Channel == "", event.TS == "":
@@ -91,10 +89,8 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 	//
 	// A `message` event that mentions the bot is the twin of that same request, so it
 	// is dropped here. One that does *not* mention the bot is the room's own
-	// conversation, and it is handed to the core rather than discarded: the core is
-	// the side that knows whether this thread has a session, and somebody typing at
-	// a bot in a thread it owns has to be told why nothing happens — which cannot
-	// happen in a code path that throws the message away (DESIGN.md §5).
+	// conversation: the core ignores it without a reply, and the next turn reads the
+	// thread back as context (DESIGN.md §4, §5).
 	switch {
 	case direct && event.Type == "app_mention":
 		// Slack does not send this for a DM; the message event owns it.
@@ -132,7 +128,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 		Text:      strings.TrimSpace(text),
 		Mentioned: mentioned,
 		Direct:    direct,
-		Files:     len(event.Files),
+		Files:     attachments(event.Files),
 	}, true
 }
 

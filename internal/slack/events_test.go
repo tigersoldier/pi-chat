@@ -59,9 +59,8 @@ func TestParseMessagePlainRoomTextIsHandedOverUnaddressed(t *testing.T) {
 	// over again and is dropped here.
 	//
 	// What is left is the room's own conversation, and it is handed to the core
-	// *unaddressed* rather than discarded: the core is the side that knows whether
-	// the thread has a session, and somebody typing in a thread pi-chat opened has to
-	// be told why nothing happens (DESIGN.md §5).
+	// *unaddressed* rather than discarded. The core ignores it without a notice;
+	// the next addressed turn reads it back as context (DESIGN.md §4, §5).
 	mention := eventsAPI(`{"type":"message","user":"U1","text":"<@U0BOT> again",` +
 		`"ts":"1721609800.000400","thread_ts":"1721609600.000100","channel":"C1","channel_type":"channel"}`)
 	if _, ok := parseMessage(mention, botUser); ok {
@@ -142,8 +141,8 @@ func TestParseMessageDirectMessages(t *testing.T) {
 		}
 
 		// A reply inside one of its threads is handed over unaddressed, for the same
-		// reason a channel thread's is: the core knows whether that thread has a
-		// session, and only a mention is a request here.
+		// reason a channel thread's is: it is conversation, not a request, and the
+		// next addressed turn reads it as context.
 		reply := eventsAPI(`{"type":"message","user":"U1","text":"I think so too",` +
 			`"ts":"1721609960.000700","thread_ts":"1721609960.000600",` +
 			`"channel":"G1","channel_type":"mpim"}`)
@@ -226,7 +225,7 @@ func TestParseMessageRejectsWhatIsNotAddressedToTheBot(t *testing.T) {
 	}
 }
 
-func TestParseMessageCountsFiles(t *testing.T) {
+func TestParseMessagePreservesFileIdentities(t *testing.T) {
 	env := eventsAPI(`{"type":"app_mention","user":"U1","text":"<@U0BOT> look",` +
 		`"ts":"1","channel":"C1","files":[{"id":"F1"},{"id":"F2"}]}`)
 
@@ -234,8 +233,8 @@ func TestParseMessageCountsFiles(t *testing.T) {
 	if !ok {
 		t.Fatal("a mention with files should still parse")
 	}
-	if message.Files != 2 {
-		t.Fatalf("files = %d, want 2", message.Files)
+	if len(message.Files) != 2 {
+		t.Fatalf("files = %d, want 2", len(message.Files))
 	}
 }
 

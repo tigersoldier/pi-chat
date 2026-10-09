@@ -53,6 +53,14 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// before the prompt — because the prompt is the only place a transcript can
 	// go, and because the reply is already on screen while it is read.
 	obs := th.observe(ctx, m)
+	prepared, err := th.preparePrompt(ctx, m, obs)
+	if err != nil {
+		return err
+	}
+	if len(prepared.warnings) > 0 {
+		th.b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
+			Text: "Some attachments could not be read:\n" + strings.Join(prepared.warnings, "\n")})
+	}
 
 	// The instruction that explains the transcript travels once per session:
 	// the one we create carries it in its system prompt, and one we adopted gets
@@ -62,11 +70,11 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// Only now do the session's events belong to this turn, and only now may the
 	// flusher render them.
 	st.prompted.Store(true)
-	prompt := obs.prompt(trimPrompt(m.Text))
+	prompt := prepared.text
 	if instruction != "" {
 		prompt = instruction + "\n\n" + prompt
 	}
-	if _, err := client.Prompt(ctx, trimPrompt(prompt)); err != nil {
+	if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
 	// The prompt is where those messages went, so this is the first moment the

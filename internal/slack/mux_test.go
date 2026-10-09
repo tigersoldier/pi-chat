@@ -45,6 +45,12 @@ func (fakeRenderer) Fail(context.Context, error) error    { return nil }
 // capablePlatform adds the optional capabilities the mux has to delegate.
 type capablePlatform struct {
 	fakePlatform
+	acks []bool
+}
+
+func (c *capablePlatform) AcknowledgeRequest(_ context.Context, _ bot.Message, allowed bool) error {
+	c.acks = append(c.acks, allowed)
+	return nil
 }
 
 func (c *capablePlatform) Conversation(_ context.Context, _ bot.Thread, _ string) ([]bot.Said, error) {
@@ -134,6 +140,17 @@ func TestMuxCapabilitiesFollowTheSurface(t *testing.T) {
 	dm := &capablePlatform{}
 	dm.observed = []bot.Said{{TS: "1.0", Text: "hello"}}
 	mux := NewMultiPlatform(discardLogger(), app, map[string]bot.Platform{"D1": dm})
+
+	message := bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "1.1"}, TS: "1.2"}
+	if err := mux.AcknowledgeRequest(ctx, message, false); err != nil {
+		t.Fatalf("AcknowledgeRequest on the capable surface: %v", err)
+	}
+	if len(dm.acks) != 1 || dm.acks[0] {
+		t.Errorf("acknowledgements = %v, want one denied request", dm.acks)
+	}
+	if err := mux.AcknowledgeRequest(ctx, bot.Message{Thread: bot.Thread{Channel: "C9"}}, true); err != nil {
+		t.Errorf("AcknowledgeRequest on a surface without the capability must be a no-op, got: %v", err)
+	}
 
 	said, err := mux.Conversation(ctx, bot.Thread{Channel: "D1"}, "")
 	if err != nil || len(said) != 1 {

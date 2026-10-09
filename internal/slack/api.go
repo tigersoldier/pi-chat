@@ -311,6 +311,15 @@ func (a *API) PostBlocks(ctx context.Context, channel, threadTS, text string, bl
 	return out.TS, nil
 }
 
+// AddReaction adds a named emoji reaction to one message.
+func (a *API) AddReaction(ctx context.Context, channel, ts, name string) error {
+	return a.call(ctx, "reactions.add", map[string]any{
+		"channel":   channel,
+		"timestamp": ts,
+		"name":      name,
+	}, nil)
+}
+
 // PostEphemeral posts text only the named user can see: refusals, hints and
 // command answers should not appear to everyone else in the channel. An empty
 // threadTS posts at the channel root.
@@ -424,10 +433,11 @@ type Message struct {
 	Text        string `json:"text"`
 	ReplyCount  int    `json:"reply_count"`
 	LatestReply string `json:"latest_reply"`
-	Files       []struct {
-		ID string `json:"id"`
-	} `json:"files"`
+	Files       []File `json:"files"`
 }
+
+// Reply is retained as the name for a message returned by conversations.replies.
+type Reply = Message
 
 // Bounds on reading a thread back. The page size is Slack's maximum, and the
 // fetch limit is a sanity cap: a thread longer than this is a conversation the

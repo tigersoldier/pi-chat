@@ -98,20 +98,20 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	if !m.Mentioned && !m.Direct {
 		b.log.Debug("not addressed to the bot; the next turn will read it as context",
 			"thread", m.Thread.Key(), "user", m.UserID)
-		// Nothing runs — and, in a thread pi-chat has a session in, the person who
-		// typed is told why. Silence there looks like a broken bot, because the bot
-		// may be the one who opened the thread (DESIGN.md §5).
-		b.hintUnaddressed(ctx, m)
 		return
 	}
 
-	// The claim comes before the allowlist, so a refused request is recorded as
-	// handled too and a redelivery of it is not refused a second time.
+	// The claim comes before acknowledgement and the allowlist, so a redelivery
+	// does not add duplicate reactions or repeat a refusal.
 	if !b.claim(ctx, messageClaim(m)) {
 		return
 	}
 
-	if !b.allowed(m.UserID, m.Thread.Channel) {
+	allowed := b.allowed(m.UserID, m.Thread.Channel)
+	if m.Mentioned {
+		b.acknowledgeRequest(ctx, m, allowed)
+	}
+	if !allowed {
 		b.refuse(ctx, m.UserID, m.Thread.Channel, &m.Thread, "")
 		return
 	}
@@ -148,17 +148,18 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	}
 
 	switch {
-	case strings.TrimSpace(m.Text) == "" && m.Files == 0:
+	case strings.TrimSpace(m.Text) == "" && len(m.Files) == 0:
 		// A bare mention: the user introduced the bot without asking anything.
 		// Answering costs nothing, and it is how the grammar is discovered from
 		// inside Slack.
 		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: mentionHelp})
 		return
 	case strings.TrimSpace(m.Text) == "":
-		// Attachments only, which this build cannot read.
-		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
-			Text: "I cannot read attachments yet — send the text instead."})
-		return
+		if _, ok := b.plat.(ImageReader); !ok {
+			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
+				Text: "This platform cannot read attachments — send the text instead."})
+			return
+		}
 	}
 
 	// A mention whose whole text is a control command's name is a near miss:
@@ -172,43 +173,11 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		}
 	}
 
-	if m.Files > 0 {
-		b.log.Warn("this message carries attachments, which this build ignores",
-			"count", m.Files, "thread", m.Thread.Key())
-	}
 	b.startTurn(ctx, th, m)
 }
 
 // HandleCommand answers a command: a slash command at a channel or DM root, or
 // `@pi /<command>` inside a thread (DESIGN.md §5).
-// hintUnaddressed tells somebody who typed in a thread pi-chat has a session in,
-// without addressing the bot, why nothing is happening.
-//
-// In a channel only a mention is a request (DESIGN.md §5), and nothing outside
-// says so: a bot that opened the thread looks like it is waiting for a reply. The
-// note is ephemeral — it is for the person who typed, not for the channel — and it
-// is asked once per person per thread, recorded in the same table that dedupes
-// messages, so a side conversation running alongside a session gets one answer and
-// then silence.
-func (b *Bot) hintUnaddressed(ctx context.Context, m Message) {
-	if _, ok := b.tracked(m.Thread); !ok {
-		// No session here: nobody has ever been answered in this thread, so there is
-		// nothing to explain, and asking would write a row for a thread pi-chat has
-		// never worked in.
-		return
-	}
-	if !b.claim(ctx, "hint:"+m.Thread.Key()+":"+m.UserID) {
-		return
-	}
-	b.reply(ctx, Notice{
-		Thread:    &m.Thread,
-		Channel:   m.Thread.Channel,
-		Ephemeral: true,
-		UserID:    m.UserID,
-		Text:      channelReplyHint,
-	})
-}
-
 func (b *Bot) HandleCommand(ctx context.Context, c Command) {
 	if !b.claim(ctx, c.EventID) {
 		return
@@ -657,6 +626,19 @@ func (b *Bot) stopTurn(ctx context.Context, a Action) {
 	// Nothing was running, so the indicator was stale: clear it rather than
 	// leaving a spinner that will never stop.
 	b.setStatus(ctx, th, StatusIdle)
+}
+
+// acknowledgeRequest asks the platform to acknowledge a tagged request. The
+// reaction is a receipt, not part of authorization or turn execution, so a
+// platform failure is logged and never blocks either.
+func (b *Bot) acknowledgeRequest(ctx context.Context, m Message, allowed bool) {
+	reporter, ok := b.plat.(RequestAcknowledger)
+	if !ok {
+		return
+	}
+	if err := reporter.AcknowledgeRequest(ctx, m, allowed); err != nil {
+		b.log.Warn("cannot acknowledge the request", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
+	}
 }
 
 // reply posts a notice, logging a failure instead of returning it: nothing the

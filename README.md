@@ -112,18 +112,31 @@ inside message threads, which is why the two forms differ.
 |---|---|---|
 | Channel or DM root | `/pi <command>` | `/pi status`, `/pi resume`, `/pi help` |
 | Channel or DM thread | `@pi /<command>` | `@pi /status`, `@pi /skill:grill-me` |
-| Channel root | `@pi <text>` | starts a thread and a session |
-| Channel thread | `@pi <text>` | continues that thread's session |
-| DM thread | plain text | continues that thread's session |
+| Channel root or group DM root | `@pi <text>` | starts a thread and a session |
+| Channel or group DM thread | `@pi <text>` | continues that thread's session |
+| One-to-one DM root | plain text | starts a thread and a session |
+| One-to-one DM thread | plain text | continues that thread's session |
 
 A session is always thread-scoped; a root command never touches one. `/pi help`
 and `@pi /help` print the current list.
 
-In a **direct message**, mention the bot to start a thread (`@pi <prompt>`); after that,
-plain text in that DM thread continues the session — no mention needed. Plain text in a
-channel or DM *root* is ignored: roots are session-less, which is what keeps a busy
-channel from turning every later message into a prompt. Plain text in a **channel thread**
-is a prompt only if that thread already has a session.
+In a **one-to-one DM**, plain text starts a session at the root and continues it in a
+thread — no mention needed. In a **channel or group DM**, only a message that mentions pi
+starts work; other replies are silently ignored as requests and read as context the next
+time pi is addressed. Mentions get an `eyes` reaction when access is allowed; requests
+outside the access policy get a `shrug` reaction and a private refusal. Plain text at
+channel or group DM roots is ignored, which keeps busy rooms from turning every later
+message into a prompt.
+
+### Images
+
+Attach a PNG, JPEG, GIF or WebP to a mention (or a DM message) and the agent
+receives the actual image, including image-only requests. Screenshots posted earlier
+in the thread are included as conversation context when you next address the bot.
+A turn carries up to four images, at most 5 MiB each and 10 MiB total; unavailable,
+oversized and unsupported attachments produce a visible warning. Other file types
+are not supported yet. The bot needs the `files:read` scope (included in both app
+manifests); reinstall the Slack app if your existing token does not have it.
 
 State lives in SQLite at `paths.db_path` (created on first run, inside a 0700 directory). It
 holds thread keys, session identities, cursors and handled event IDs — never

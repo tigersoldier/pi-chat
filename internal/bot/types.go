@@ -3,6 +3,8 @@ package bot
 import (
 	"context"
 	"strings"
+
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // platformName is the platform this build speaks. It names the sessions
@@ -51,8 +53,9 @@ func slugName(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// Message is one inbound message that addresses the bot: a mention, or plain
-// text in a thread the bot already owns.
+// Message is one inbound message delivered to the core. Room messages that do
+// not address the bot are carried here only to be ignored; the observer fetches
+// them later as context.
 type Message struct {
 	EventID string // platform event ID, used to drop redeliveries
 	Thread  Thread
@@ -66,17 +69,29 @@ type Message struct {
 	// Thread.Workspace carries, and streaming to a channel needs it.
 	Workspace string
 	Text      string // the prompt, with the bot's own mention removed
-	Files     int    // attachments
+	Files     []Attachment
 
 	// Mentioned records that the sender addressed the bot by name. It is what
 	// separates `@pi status` (which earns a "did you mean @pi /status?") from
 	// the same word typed inside a conversation, where it is just a word.
 	Mentioned bool
 
-	// Direct records that the message arrived in a one-to-one (or group) DM
-	// rather than in a channel. A DM thread needs no mention: the conversation
-	// is already the address (DESIGN.md §5).
+	// Direct records a one-to-one DM. A group DM is a room, not an address, so
+	// it remains false and requires a mention just like a channel (DESIGN.md §5).
 	Direct bool
+}
+
+// Attachment identifies a platform file. The adapter resolves its ID when asked
+// to read it; private URLs and credentials never enter the core or prompt.
+type Attachment struct {
+	ID   string
+	Name string
+}
+
+// ImageReader is implemented by platforms that can download image attachments.
+// Reads happen only after the core has authorized and started a turn.
+type ImageReader interface {
+	ReadImage(ctx context.Context, file Attachment) (protocol.ImageContent, error)
 }
 
 // Command is one inbound command: a slash command at a channel or DM root, or
@@ -138,6 +153,7 @@ type Said struct {
 	UserID string // who said it, empty for a platform that has no identity to give
 	Name   string // display name, empty when the platform cannot resolve one
 	Text   string
+	Files  []Attachment
 	// FromBot marks pi-chat's own message. The core leaves them out of a
 	// transcript — the agent has them in its own history — and only the adapter
 	// can tell which messages are its own.
@@ -204,6 +220,12 @@ const (
 // and not again (the adapter remembers its own refusal).
 type StatusReporter interface {
 	SetStatus(ctx context.Context, t Thread, s Status) error
+}
+
+// RequestAcknowledger acknowledges an addressed message before the core starts
+// work or refuses it. Platforms choose how to present the acknowledgement.
+type RequestAcknowledger interface {
+	AcknowledgeRequest(ctx context.Context, m Message, allowed bool) error
 }
 
 // Suggestion is one prompt a platform offers before the user types: a title for

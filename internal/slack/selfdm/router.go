@@ -73,6 +73,14 @@ func (r *Router) Handle(ctx context.Context, m slack.Message) {
 	}
 
 	thread := &bot.Thread{Workspace: r.id.TeamID, Channel: r.channel, ThreadTS: threadTS}
+	files := make([]bot.Attachment, 0, len(m.Files))
+	for _, file := range m.Files {
+		name := file.Name
+		if name == "" {
+			name = file.Title
+		}
+		files = append(files, bot.Attachment{ID: file.ID, Name: name})
+	}
 	if command, ok := parseSelfCommand(text); ok {
 		var scope *bot.Thread
 		if threadTS != m.TS {
@@ -106,7 +114,7 @@ func (r *Router) Handle(ctx context.Context, m slack.Message) {
 		// address: plain text is a turn whether or not it says anybody's name.
 		Mentioned: true,
 		Direct:    true,
-		Files:     len(m.Files),
+		Files:     files,
 	})
 }
 

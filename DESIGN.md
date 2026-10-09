@@ -229,6 +229,26 @@ and puts it in front of the request.
   That is the open question below, settled this way in the code: the mention usually refers
   to what was just said.
 
+### Images from Slack (2026-10-03)
+
+- Preserve file identities and names on inbound messages and thread replies, including
+  Slack's `file_share` subtype. Images in the trigger and in retained conversation lines
+  travel as pi's native `images` prompt content, not private URLs the model cannot open.
+- The optional platform `ImageReader` resolves each file through `files.info` and downloads
+  `url_private_download` (or `url_private`) with the bot token. Only HTTPS Slack file hosts
+  are allowed, including redirects; pi-chat does not log or save tokens, private URLs or
+  image bytes. pi retains native image prompts in its session history as usual.
+  The install needs `files:read`, already declared in both manifests.
+- Trigger images have priority, then the newest retained conversation images; deduplicate
+  by file identity. Bound a turn to four images, 5 MiB per image and 10 MiB total before
+  base64 encoding, safely below the gateway's 16 MiB frame cap. Accept PNG, JPEG, GIF and
+  WebP, checking downloaded bytes rather than trusting Slack's MIME label.
+- Text identifies each attached image's author/source and position. Conversation images
+  remain context, not requests. A bare image request gets a default inspection prompt.
+  Unsupported, inaccessible or oversized files are reported visibly rather than silently
+  discarded; a text request can still proceed, but an image-only request with no readable
+  images does not spend a model turn. Downloads happen only inside an authorized turn.
+
 ### The instruction that explains the conversation (built, 2026-09-27)
 
 The transcript and the request arrive in one prompt, so the agent has to be told what the
@@ -382,6 +402,8 @@ commands inside message threads** and its slash-command payload carries no `thre
    answering their colleague in a thread the bot happens to be in must not draw a visible
    reply about somebody's allowlist. Their *mention*, or their DM, is a request, and a
    refusal is the answer to it.
+8. **A mention is acknowledged before work or refusal.** Slack reacts `:eyes:` when the
+   sender is allowed; otherwise it reacts `:shrug:` and sends that person a private refusal.
 
 What reaches a session, and what does not:
 
@@ -389,10 +411,10 @@ What reaches a session, and what does not:
 |---|---|
 | Channel root, plain text | **Dropped.** Roots are session-less, so a bare message must not start one — the bot sits in busy channels |
 | DM (one-to-one), plain text | A prompt, rooted at that message. In a conversation the bot was added to, the conversation *is* the address — and this is the shape a suggested prompt takes |
-| Group DM, plain text | **Dropped** — observed as context, never a turn: with two or more people in it, the conversation is no longer only the bot's address. Only a mention turns there, exactly as in a channel |
+| Group DM, plain text | **Observed only, never a prompt or notice**: with two or more people in it, the conversation is no longer only the bot's address. Only a mention turns there, exactly as in a channel |
 | Channel root, `@pi <text>` | Starts a thread rooted at the mention, and a session in it |
 | DM root, `@pi <text>` | Same, and the thread is a DM thread |
-| Channel thread, plain text | **Observed only, never a prompt**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark. In a thread that already has a session, the first such message from one person earns exactly one **ephemeral note** saying that only mentions are requests |
+| Channel thread, plain text | **Observed only, never a prompt or notice**: the bot sits in busy channels, and a reply meant for somebody else must not spend a turn. It reaches the next turn as context, through the observation watermark |
 | Channel thread, `@pi <text>` | A prompt; the mention is optional but harmless |
 | DM thread, plain text | A prompt: in a DM the conversation is already the address |
 | Any thread, a message that addresses nobody | **Dropped**, and before the allowlist is consulted: whoever sent it, it is not a request, so there is nothing to answer and nothing to refuse
@@ -968,7 +990,8 @@ the ledger can tell them apart (`surface_kv` and `surface_posted`, DESIGN.md §7
   `@pi /model`; interactive approvals (buttons + modal); concurrency cap with eviction
   and bounded queue; streaming → patch fallback.
 - **Phase 3.** Message shortcut for in-thread discovery; `setTitle`/`setStatus` and
-  suggested prompts; image/attachment passthrough; `/pi resume` picker polish; metrics.
+  suggested prompts; image passthrough (built); general attachments; `/pi resume` picker
+  polish; metrics.
 
 Testing: run the real `pi-gatewayd` pointed at a stub `pi` binary (`--pi`), so the
 gateway contract is exercised for real while the agent is fake; recorded Slack payloads

@@ -62,6 +62,19 @@ func (m *MultiPlatform) Post(ctx context.Context, n bot.Notice) error {
 	return platform.Post(ctx, n)
 }
 
+// AcknowledgeRequest reacts to the message through the surface that owns it.
+func (m *MultiPlatform) AcknowledgeRequest(ctx context.Context, msg bot.Message, allowed bool) error {
+	platform, err := m.forChannel(msg.Thread.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.RequestAcknowledger)
+	if !ok {
+		return nil
+	}
+	return reporter.AcknowledgeRequest(ctx, msg, allowed)
+}
+
 // OpenThread opens the thread on the surface that owns the channel it is
 // opened in.
 func (m *MultiPlatform) OpenThread(ctx context.Context, channel, text string) (bot.Thread, error) {
@@ -72,7 +85,7 @@ func (m *MultiPlatform) OpenThread(ctx context.Context, channel, text string) (b
 	return platform.OpenThread(ctx, channel, text)
 }
 
-// The three optional capabilities below are claimed by the mux on behalf of the
+// Optional capabilities below are claimed by the mux on behalf of the
 // surfaces, because the core asks the platform it holds and cannot ask per
 // thread (DESIGN.md §12). A surface that does not implement one means "nothing
 // to do here", not "failed": there is no conversation to read back on the

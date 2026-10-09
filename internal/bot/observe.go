@@ -54,6 +54,9 @@ type observation struct {
 	// message this turn has been shown. Empty means "do not move it", which is
 	// how a failed fetch keeps everything for the next turn.
 	ts string
+	// files belongs only to conversation lines retained in block. Downloads are
+	// deferred until after filtering the trigger, our own posts and old messages.
+	files []observedFile
 }
 
 // prompt is what a turn sends: the conversation it should know about, then the
@@ -113,6 +116,7 @@ func (th *thread) compose(said []Said, triggerTS string) observation {
 	lines := make([]string, 0, len(ordered))
 	full := make([]string, 0, len(ordered))
 	truncated := false
+	messages := make([]Said, 0, len(ordered))
 	for _, s := range ordered {
 		if compareTS(s.TS, watermark) > 0 {
 			watermark = s.TS
@@ -122,16 +126,16 @@ func (th *thread) compose(said []Said, triggerTS string) observation {
 			// The agent's own answers are already in its history, and the
 			// trigger is the prompt: neither is news.
 			continue
-		case strings.TrimSpace(s.Text) == "":
-			// A message with no text at all (an attachment this build cannot
-			// read). It is still covered by the watermark.
+		case strings.TrimSpace(s.Text) == "" && len(s.Files) == 0:
 			continue
 		}
-		whole := label(s) + " " + oneLine(s.Text)
-		shown := label(s) + " " + truncateSaid(s.Text)
+		summary := attachmentSummary(s.Files)
+		whole := strings.TrimSpace(label(s) + " " + oneLine(s.Text) + summary)
+		shown := strings.TrimSpace(label(s) + " " + truncateSaid(s.Text) + summary)
 		truncated = truncated || shown != whole
 		full = append(full, whole)
 		lines = append(lines, shown)
+		messages = append(messages, s)
 	}
 	if len(lines) == 0 {
 		return observation{ts: watermark}
@@ -172,7 +176,14 @@ func (th *thread) compose(said []Said, triggerTS string) observation {
 			note += "; the whole thread is at " + path + "]"
 		}
 	}
-	return observation{block: transcriptBlock(note, kept), ts: watermark}
+	obs := observation{block: transcriptBlock(note, kept), ts: watermark}
+	// Prefer the newest context images when there are more than a turn can carry.
+	for i := len(messages) - 1; i >= dropped; i-- {
+		for _, f := range messages[i].Files {
+			obs.files = append(obs.files, observedFile{file: f, source: label(messages[i])})
+		}
+	}
+	return obs
 }
 
 // transcriptBlock renders the section that goes in front of a prompt.

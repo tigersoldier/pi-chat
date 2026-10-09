@@ -58,8 +58,8 @@ oauth_config:
       - mpim:history
       - users:read           # names beside a message, not just the ID
       - assistant:write      # app_context_changed + legacy methods
-      - files:read           # phase 3: attachments
-      - reactions:write      # phase 3: a 👀 receipt while the agent works
+      - files:read           # download images sent to the agent or shared in its thread
+      - reactions:write      # 👀 for accepted mentions; 🤷 when access is denied
     # Only for the team self-DM mode, where a person's own token drives their
     # own "Notes to self" (docs/slack-user-token-setup.md). Not requested by the
     # app's install link, so a normal install does not ask anyone for these.
