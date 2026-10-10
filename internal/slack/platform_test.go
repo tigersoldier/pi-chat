@@ -412,6 +412,57 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 	}
 }
 
+func TestFailBeforeStartPostsFailureInThread(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+	cause := "create the session: gwclient: find pi binary: no such file"
+
+	if err := r.Fail(ctx, errors.New(cause)); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
+		t.Fatalf("calls = %v, want a new failure message without an update", stub.methods())
+	}
+	if got := calls[0].params["thread_ts"]; got != testMessage().Thread.ThreadTS {
+		t.Errorf("thread_ts = %v, want %q", got, testMessage().Thread.ThreadTS)
+	}
+	if got := calls[0].params["text"]; got != ":warning: pi-chat: "+cause {
+		t.Errorf("failure text = %v, want the full cause", got)
+	}
+}
+
+func TestFailDeletedMessagePostsFailureInThread(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stub.mu.Lock()
+	stub.failed = map[string]string{"chat.update": "message_not_found"}
+	stub.mu.Unlock()
+
+	cause := errors.New("prompt: connection lost")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	if got, want := strings.Join(stub.methods(), ","), "chat.postMessage,chat.update,chat.postMessage"; got != want {
+		t.Fatalf("calls = %s, want %s", got, want)
+	}
+	last := calls[len(calls)-1]
+	if got := last.params["thread_ts"]; got != testMessage().Thread.ThreadTS {
+		t.Errorf("fallback thread_ts = %v, want %q", got, testMessage().Thread.ThreadTS)
+	}
+	if got, want := last.params["text"], ":warning: pi-chat: "+cause.Error(); got != want {
+		t.Errorf("fallback text = %v, want %q", got, want)
+	}
+}
+
 func TestDeltaChunksLongText(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")

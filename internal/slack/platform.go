@@ -410,7 +410,18 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	}
 	r.text.Reset()
 	r.text.WriteString(text)
-	return r.patch(ctx)
+	if r.ts != "" {
+		if err := r.patch(ctx); err == nil || !IsCode(err, "message_not_found") {
+			return err
+		}
+	}
+
+	ts, err := r.api.PostMessage(ctx, r.channel, r.threadTS, truncate(r.text.String(), maxMessage))
+	if err != nil {
+		return fmt.Errorf("post failure message: %w", err)
+	}
+	r.ts = ts
+	return nil
 }
 
 // appendStream sends text in pieces Slack will accept, so one long delta

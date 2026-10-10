@@ -365,7 +365,20 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	text += ":warning: pi-chat: " + cause.Error()
 	r.text.Reset()
 	r.text.WriteString(text)
-	return r.flush(ctx)
+	if r.ts != "" {
+		if err := r.flush(ctx); err == nil || !slack.IsCode(err, "message_not_found") {
+			return err
+		}
+	}
+
+	pieces := splitForSlack(r.text.String())
+	ts, err := r.plat.post(ctx, r.channel, r.threadTS, pieces[0])
+	if err != nil {
+		return fmt.Errorf("post failure message: %w", err)
+	}
+	r.ts = ts
+	r.lastFlush = time.Now()
+	return nil
 }
 
 // flush replaces the message with what has been rendered so far.
