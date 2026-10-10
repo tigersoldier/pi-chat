@@ -391,7 +391,8 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 }
 
 // Fail reports a failed turn in the same message, keeping whatever partial
-// answer arrived first.
+// answer arrived first. When no message exists yet or the message was deleted,
+// it posts a new message into the thread instead.
 func (r *renderer) Fail(ctx context.Context, cause error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -410,7 +411,30 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	}
 	r.text.Reset()
 	r.text.WriteString(text)
-	return r.patch(ctx)
+
+	if r.ts == "" {
+		ts, err := r.api.PostMessage(ctx, r.channel, r.threadTS, truncate(text, maxMessage))
+		if err != nil {
+			return err
+		}
+		r.ts = ts
+		return nil
+	}
+
+	err := r.patch(ctx)
+	if err == nil {
+		return nil
+	}
+	if IsCode(err, "message_not_found") {
+		r.log.Warn("cannot update the message; posting the failure instead", "error", err)
+		ts, perr := r.api.PostMessage(ctx, r.channel, r.threadTS, truncate(text, maxMessage))
+		if perr != nil {
+			return perr
+		}
+		r.ts = ts
+		return nil
+	}
+	return err
 }
 
 // appendStream sends text in pieces Slack will accept, so one long delta

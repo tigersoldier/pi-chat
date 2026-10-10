@@ -412,6 +412,137 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 	}
 }
 
+func TestFailWithoutReplyPostsNewMessage(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	// Start was never called, so r.ts is empty.
+	cause := errors.New("gateway unavailable")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail returned error: %v", err)
+	}
+
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
+		t.Fatalf("calls = %v, want one chat.postMessage", stub.methods())
+	}
+	params := calls[0].params
+	if params["channel"] != "C1" {
+		t.Errorf("channel = %v, want C1", params["channel"])
+	}
+	if params["thread_ts"] != "1700000000.000100" {
+		t.Errorf("thread_ts = %v, want 1700000000.000100", params["thread_ts"])
+	}
+	text, _ := params["text"].(string)
+	if !strings.Contains(text, ":warning: pi-chat: gateway unavailable") {
+		t.Errorf("text = %q, want cause text", text)
+	}
+	if r.Progress() != "1700000000.000001" {
+		t.Errorf("r.Progress() = %q, want 1700000000.000001", r.Progress())
+	}
+}
+
+func TestFailMessageNotFoundFallsBackToPost(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "half an answer"); err != nil {
+		t.Fatal(err)
+	}
+
+	stub.mu.Lock()
+	stub.failed = map[string]string{"chat.update": "message_not_found"}
+	stub.mu.Unlock()
+
+	cause := errors.New("gateway connection lost")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail returned error: %v", err)
+	}
+
+	methods := stub.methods()
+	want := []string{"chat.postMessage", "chat.update", "chat.update", "chat.postMessage"}
+	if strings.Join(methods, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", methods, want)
+	}
+
+	lastCall := stub.recorded()[len(stub.recorded())-1]
+	if lastCall.method != "chat.postMessage" {
+		t.Fatalf("last call method = %q, want chat.postMessage", lastCall.method)
+	}
+	params := lastCall.params
+	if params["channel"] != "C1" {
+		t.Errorf("channel = %v, want C1", params["channel"])
+	}
+	if params["thread_ts"] != "1700000000.000100" {
+		t.Errorf("thread_ts = %v, want 1700000000.000100", params["thread_ts"])
+	}
+	text, _ := params["text"].(string)
+	if !strings.Contains(text, "half an answer") || !strings.Contains(text, "gateway connection lost") {
+		t.Errorf("text = %q, want partial answer and cause", text)
+	}
+	if r.Progress() != "1700000000.000001" {
+		t.Errorf("r.Progress() = %q, want 1700000000.000001", r.Progress())
+	}
+}
+
+func TestFailStreamingMessageNotFoundFallsBackToPost(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	stub.mu.Lock()
+	stub.failed = map[string]string{"chat.update": "message_not_found"}
+	stub.mu.Unlock()
+
+	cause := errors.New("stream failed")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail returned error: %v", err)
+	}
+
+	methods := stub.methods()
+	want := []string{"chat.startStream", "chat.stopStream", "chat.update", "chat.postMessage"}
+	if strings.Join(methods, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", methods, want)
+	}
+}
+
+func TestFailPropagatesOtherUpdateErrors(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	stub.mu.Lock()
+	stub.failed = map[string]string{"chat.update": "not_in_channel"}
+	stub.mu.Unlock()
+
+	err := r.Fail(ctx, errors.New("failure"))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !IsCode(err, "not_in_channel") {
+		t.Fatalf("err = %v, want not_in_channel", err)
+	}
+
+	for _, call := range stub.recorded()[1:] {
+		if call.method == "chat.postMessage" {
+			t.Fatalf("unexpected chat.postMessage call after update error")
+		}
+	}
+}
+
 func TestDeltaChunksLongText(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")
