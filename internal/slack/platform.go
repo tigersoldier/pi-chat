@@ -396,11 +396,7 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	text := r.text.String()
-	if text != "" {
-		text += "\n\n"
-	}
-	text += ":warning: pi-chat: " + cause.Error()
+	text := failureText(r.text.String(), cause)
 
 	if r.streaming {
 		if err := r.api.StopStream(ctx, r.channel, r.ts); err != nil {
@@ -422,6 +418,35 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	}
 	r.ts = ts
 	return nil
+}
+
+// failureText reserves room for the cause before truncating a partial answer.
+func failureText(partial string, cause error) string {
+	failure := ":warning: pi-chat: " + cause.Error()
+	if len(failure) > maxMessage {
+		return truncate(failure, maxMessage)
+	}
+
+	const separator = "\n\n"
+	available := maxMessage - len(separator) - len(failure)
+	if available <= 0 {
+		return failure
+	}
+	if len(partial) > available {
+		const marker = "\n\n… _(truncated)_"
+		cut := available
+		if cut >= len(marker) {
+			cut = cutAtRune(partial, cut-len(marker))
+			partial = partial[:cut] + marker
+		} else {
+			cut = cutAtRune(partial, cut)
+			partial = partial[:cut]
+		}
+	}
+	if partial == "" {
+		return failure
+	}
+	return partial + separator + failure
 }
 
 // appendStream sends text in pieces Slack will accept, so one long delta
