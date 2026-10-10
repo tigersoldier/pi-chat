@@ -412,6 +412,89 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 	}
 }
 
+func TestFailKeepsCauseWhenPartialAnswerIsLong(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.text.WriteString(strings.Repeat("p", maxMessage))
+	cause := errors.New("create the session: pi binary not found")
+
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	text := calls[len(calls)-1].params["text"].(string)
+	if !strings.Contains(text, cause.Error()) {
+		t.Fatalf("failure text omitted cause %q", cause)
+	}
+	if !strings.Contains(text, "truncated") {
+		t.Fatalf("failure text should mark the partial answer as truncated: %q", text)
+	}
+	if len(text) > maxMessage {
+		t.Fatalf("failure text is %d bytes, exceeds %d", len(text), maxMessage)
+	}
+}
+
+func TestFailBeforeStartPostsFailureInThread(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+	cause := "create the session: gwclient: find pi binary: no such file"
+
+	if err := r.Fail(ctx, errors.New(cause)); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
+		t.Fatalf("calls = %v, want a new failure message without an update", stub.methods())
+	}
+	if got := calls[0].params["thread_ts"]; got != testMessage().Thread.ThreadTS {
+		t.Errorf("thread_ts = %v, want %q", got, testMessage().Thread.ThreadTS)
+	}
+	if got := calls[0].params["text"]; got != ":warning: pi-chat: "+cause {
+		t.Errorf("failure text = %v, want the full cause", got)
+	}
+}
+
+func TestFailDeletedMessagePostsFailureInThread(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.text.WriteString(strings.Repeat("p", maxMessage))
+	stub.mu.Lock()
+	stub.failed = map[string]string{"chat.update": "message_not_found"}
+	stub.mu.Unlock()
+
+	cause := errors.New("prompt: connection lost")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	if got, want := strings.Join(stub.methods(), ","), "chat.postMessage,chat.update,chat.postMessage"; got != want {
+		t.Fatalf("calls = %s, want %s", got, want)
+	}
+	last := calls[len(calls)-1]
+	if got := last.params["thread_ts"]; got != testMessage().Thread.ThreadTS {
+		t.Errorf("fallback thread_ts = %v, want %q", got, testMessage().Thread.ThreadTS)
+	}
+	text := last.params["text"].(string)
+	if !strings.Contains(text, cause.Error()) || !strings.Contains(text, "truncated") {
+		t.Errorf("fallback text = %q, want truncated partial answer and full cause", text)
+	}
+	if len(text) > maxMessage {
+		t.Errorf("fallback text is %d bytes, exceeds %d", len(text), maxMessage)
+	}
+}
+
 func TestDeltaChunksLongText(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")

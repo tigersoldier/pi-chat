@@ -358,14 +358,60 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	text := r.text.String()
-	if text != "" {
-		text += "\n\n"
-	}
-	text += ":warning: pi-chat: " + cause.Error()
+	text := failureText(r.text.String(), cause)
 	r.text.Reset()
 	r.text.WriteString(text)
-	return r.flush(ctx)
+	if r.ts != "" {
+		if err := r.flush(ctx); err == nil || !slack.IsCode(err, "message_not_found") {
+			return err
+		}
+	}
+
+	pieces := splitForSlack(r.text.String())
+	ts, err := r.plat.post(ctx, r.channel, r.threadTS, pieces[0])
+	if err != nil {
+		return fmt.Errorf("post failure message: %w", err)
+	}
+	r.ts = ts
+	r.lastFlush = time.Now()
+	return nil
+}
+
+// failureText reserves room for the cause before trimming a partial answer to
+// the one message a failed turn can update or post.
+func failureText(partial string, cause error) string {
+	failure := ":warning: pi-chat: " + cause.Error()
+	const marker = "\n\n… _(truncated)_"
+	if len(failure) > maxMessage {
+		cut := maxMessage - len(marker)
+		for cut > 0 && !utf8.RuneStart(failure[cut]) {
+			cut--
+		}
+		return failure[:cut] + marker
+	}
+
+	const separator = "\n\n"
+	available := maxMessage - len(separator) - len(failure)
+	if available <= 0 {
+		return failure
+	}
+	if len(partial) > available {
+		cut := available
+		notice := marker
+		if cut >= len(notice) {
+			cut -= len(notice)
+		} else {
+			notice = ""
+		}
+		for cut > 0 && !utf8.RuneStart(partial[cut]) {
+			cut--
+		}
+		partial = partial[:cut] + notice
+	}
+	if partial == "" {
+		return failure
+	}
+	return partial + separator + failure
 }
 
 // flush replaces the message with what has been rendered so far.

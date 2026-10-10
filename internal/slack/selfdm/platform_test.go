@@ -272,5 +272,103 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 	}
 }
 
+func TestFailKeepsCauseWhenPartialAnswerIsLong(t *testing.T) {
+	s, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+		"chat.update":      func(url.Values) string { return `{"ok":true}` },
+	})
+	ctx := context.Background()
+	s.plat.flush = time.Hour
+	r, err := s.plat.StartTurn(ctx, bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "5.0"}})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	r.(*renderer).text.WriteString(strings.Repeat("p", maxMessage))
+	cause := fmt.Errorf("create the session: pi binary not found")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+
+	text := stub.params("chat.update", 0).Get("text")
+	if !strings.Contains(text, cause.Error()) {
+		t.Fatalf("failure text omitted cause %q", cause)
+	}
+	if !strings.Contains(text, "truncated") {
+		t.Fatalf("failure text should mark the partial answer as truncated: %q", text)
+	}
+	if len(text) > maxMessage {
+		t.Fatalf("failure text is %d bytes, exceeds %d", len(text), maxMessage)
+	}
+}
+
+func TestFailBeforeStartPostsFailureInThread(t *testing.T) {
+	s, _, stub, st := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+		"chat.update":      func(url.Values) string { return `{"ok":true}` },
+	})
+	ctx := context.Background()
+	r, err := s.plat.StartTurn(ctx, bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "5.0"}})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	cause := "create the session: gwclient: find pi binary: no such file"
+	if err := r.Fail(ctx, fmt.Errorf("%s", cause)); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+
+	if got := stub.count("chat.postMessage"); got != 1 {
+		t.Fatalf("chat.postMessage called %d times, want one fallback", got)
+	}
+	if got := stub.count("chat.update"); got != 0 {
+		t.Fatalf("chat.update called %d times, want none", got)
+	}
+	if got := stub.params("chat.postMessage", 0).Get("thread_ts"); got != "5.0" {
+		t.Errorf("thread_ts = %q, want 5.0", got)
+	}
+	if got, want := stub.params("chat.postMessage", 0).Get("text"), ":warning: pi-chat: "+cause; got != want {
+		t.Errorf("failure text = %q, want %q", got, want)
+	}
+	if !st.posted[SurfaceName+"/9.1"] {
+		t.Error("fallback failure message was not recorded in the surface ledger")
+	}
+}
+
+func TestFailDeletedMessagePostsFailureInThread(t *testing.T) {
+	s, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+		"chat.update":      func(url.Values) string { return `{"ok":false,"error":"message_not_found"}` },
+	})
+	ctx := context.Background()
+	s.plat.flush = time.Hour
+	r, err := s.plat.StartTurn(ctx, bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "5.0"}})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	r.(*renderer).text.WriteString(strings.Repeat("p", maxMessage))
+	if err := r.Fail(ctx, errNotEnough); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+
+	if got := stub.count("chat.postMessage"); got != 2 {
+		t.Fatalf("chat.postMessage called %d times, want placeholder and fallback", got)
+	}
+	if got := stub.params("chat.postMessage", 1).Get("thread_ts"); got != "5.0" {
+		t.Errorf("fallback thread_ts = %q, want 5.0", got)
+	}
+	text := stub.params("chat.postMessage", 1).Get("text")
+	if !strings.Contains(text, errNotEnough.Error()) || !strings.Contains(text, "truncated") {
+		t.Errorf("fallback text = %q, want truncated partial answer and full cause", text)
+	}
+	if len(text) > maxMessage {
+		t.Errorf("fallback text is %d bytes, exceeds %d", len(text), maxMessage)
+	}
+}
+
 // errNotEnough stands in for a gateway failure.
 var errNotEnough = fmt.Errorf("not enough context")
