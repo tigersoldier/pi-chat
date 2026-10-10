@@ -274,11 +274,15 @@ func (r *recordingRenderer) Delta(_ context.Context, text string) error {
 }
 
 func (r *recordingRenderer) Finish(_ context.Context, final string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.finals = append(r.finals, final)
 	return nil
 }
 
 func (r *recordingRenderer) Fail(_ context.Context, cause error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.failure = cause.Error()
 	return nil
 }
