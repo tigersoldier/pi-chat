@@ -25,7 +25,7 @@ func TestParseMessageRootMentionStartsTheThread(t *testing.T) {
 	if !ok {
 		t.Fatal("a root mention should be answered")
 	}
-	want := bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1721609600.000100"}
+	want := bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1721609600.000100", Surface: bot.SurfaceApp}
 	if message.Thread != want {
 		t.Fatalf("thread = %+v, want %+v", message.Thread, want)
 	}

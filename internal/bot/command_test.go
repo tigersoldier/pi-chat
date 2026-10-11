@@ -69,7 +69,7 @@ func TestCommandScope(t *testing.T) {
 		{"status", false, true},
 		{"status", true, true},
 		{"resume", false, true},
-		{"resume", true, false},
+		{"resume", true, true},
 		{"delete", false, false},
 		{"delete", true, true},
 	}
@@ -188,9 +188,16 @@ func TestDispatchResumeOffersOnlyAdoptableSessions(t *testing.T) {
 		ThreadKey: "T1:C1:1", WorkspaceID: "T1", ChannelID: "C1", ThreadTS: "1",
 		SessionPath: "/sessions/ours.jsonl", State: store.StateCold,
 	})
+	if err := st.RetireSession(context.Background(), store.RetiredSession{
+		SessionPath: "/sessions/retired-outside.jsonl", ThreadKey: "T1:C2:2",
+		SessionName: "retired-outside", ProjectDir: "",
+	}); err != nil {
+		t.Fatalf("RetireSession: %v", err)
+	}
 	b.gw = &fakeGateway{rows: []gwclient.SessionRow{
 		{Path: "/sessions/ours.jsonl", Cwd: "/somewhere"},
 		{Path: "/sessions/made-by-pi-chat.jsonl", Cwd: b.cfg.Paths.ProjectsRoot + "/2026-09-27-x"},
+		{Path: "/sessions/retired-outside.jsonl", Name: "retired-outside", Cwd: "/home/pi/code/old"},
 		{Path: "/sessions/theirs.jsonl", Name: "their-session", Cwd: "/home/pi/code/thing"},
 	}}
 
@@ -210,6 +217,80 @@ func TestDispatchResumeOffersOnlyAdoptableSessions(t *testing.T) {
 	if notice.Buttons[0].ActionID != ActionResume {
 		t.Errorf("button action = %q, want %q", notice.Buttons[0].ActionID, ActionResume)
 	}
+}
+
+func TestDispatchResumeInThreadOffersOnlyThatThreadsRetiredSessions(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	if _, err := b.threadFor(thread); err != nil {
+		t.Fatalf("threadFor: %v", err)
+	}
+	if err := st.RetireSession(context.Background(), store.RetiredSession{
+		SessionPath: "/sessions/old.jsonl", ThreadKey: thread.Key(), SessionName: "old-session", ProjectDir: "/work/old",
+	}); err != nil {
+		t.Fatalf("RetireSession: %v", err)
+	}
+	if err := st.RetireSession(context.Background(), store.RetiredSession{
+		SessionPath: "/sessions/other-thread.jsonl", ThreadKey: "T1:C2:other", SessionName: "other-session",
+	}); err != nil {
+		t.Fatalf("RetireSession: %v", err)
+	}
+	b.gw = &fakeGateway{rows: []gwclient.SessionRow{
+		{Path: "/sessions/old.jsonl", Name: "old-session"},
+		{Path: "/sessions/other-thread.jsonl", Name: "other-session"},
+	}}
+
+	b.HandleCommand(context.Background(), commandRequest(thread.ThreadTS, "/resume"))
+	waitFor(t, "the retired picker", func() bool { return len(platform.postedNotices()) == 1 })
+	notice := platform.postedNotices()[0]
+	if len(notice.Buttons) != 1 || notice.Buttons[0].Value != "/sessions/old.jsonl" || notice.Buttons[0].ActionID != ActionResumeRetired {
+		t.Fatalf("retired picker = %+v, want only this thread's old session", notice.Buttons)
+	}
+	if notice.Thread == nil || notice.Thread.ThreadTS != thread.ThreadTS {
+		t.Errorf("retired picker was not posted in the original thread: %+v", notice.Thread)
+	}
+}
+
+func TestResumeRetiredSessionRestoresOriginalThreadEvenIfGatewayAttachMustRetry(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	th, err := b.threadFor(thread)
+	if err != nil {
+		t.Fatalf("threadFor: %v", err)
+	}
+	const path = "/sessions/old.jsonl"
+	if err := st.RetireSession(context.Background(), store.RetiredSession{
+		SessionPath: path, ThreadKey: thread.Key(), SessionName: "old-session", ProjectDir: "/work/old",
+		ObservedTS: "1700000000.000500", LastSeq: 42, LeafID: "leaf-42",
+	}); err != nil {
+		t.Fatalf("RetireSession: %v", err)
+	}
+	b.gw = &fakeGateway{rows: []gwclient.SessionRow{{Path: path, Name: "old-session", ID: "sid-old", Cwd: "/work/old/wt"}}}
+
+	b.HandleAction(context.Background(), Action{
+		EventID: "Ev-resume-retired", Channel: thread.Channel, Thread: &thread, UserID: "U1", Workspace: thread.Workspace,
+		ActionID: ActionResumeRetired, Value: path, MessageTS: "1700000000.000900",
+	})
+	waitFor(t, "restored row", func() bool { return th.snapshot().SessionPath == path })
+	row, found, err := st.Thread(context.Background(), thread.Key())
+	if err != nil || !found {
+		t.Fatalf("restored thread: found=%v err=%v", found, err)
+	}
+	if row.SessionID != "sid-old" || row.Cwd != "/work/old/wt" || row.ProjectDir != "/work/old" ||
+		row.ObservedTS != "1700000000.000500" || row.LastSeq != 42 || row.LeafID != "leaf-42" {
+		t.Errorf("restored thread lost its session context: %+v", row)
+	}
+	if retired, err := st.RetiredSessions(context.Background(), thread.Key()); err != nil || len(retired) != 0 {
+		t.Errorf("retired rows after restore = %+v, %v", retired, err)
+	}
+	waitFor(t, "the attach retry notice", func() bool {
+		for _, notice := range platform.postedNotices() {
+			if strings.Contains(notice.Text, "could not attach to it yet") {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestDispatchResumeWithoutCandidates(t *testing.T) {
@@ -316,13 +397,13 @@ func TestDispatchExplainsWrongPlaces(t *testing.T) {
 		}
 	})
 
-	t.Run("root command in a thread", func(t *testing.T) {
+	t.Run("resume in a thread", func(t *testing.T) {
 		b, platform, _ := newTestBot(t)
 		b.HandleCommand(context.Background(), commandRequest("1700000000.000100", "/resume"))
 
-		waitFor(t, "the hint", func() bool { return len(platform.postedNotices()) == 1 })
-		if text := platform.postedNotices()[0].Text; !strings.Contains(text, "/pi resume") {
-			t.Errorf("the hint does not point at the root form: %q", text)
+		waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
+		if text := platform.postedNotices()[0].Text; !strings.Contains(text, "no sessions retired") {
+			t.Errorf("the thread picker did not explain the empty result: %q", text)
 		}
 	})
 }
@@ -399,6 +480,29 @@ func TestPiArgsAddsApproveWhenApprovalsAreAutomatic(t *testing.T) {
 	}
 	if !slices.Contains(args, "--append-system-prompt") {
 		t.Errorf("the injected prompt is missing from %v", args)
+	}
+}
+
+func TestPiArgsAddsChatToolsExtensionOnlyWhenEnabled(t *testing.T) {
+	path := "/opt/pi-chat/chat-tools.ts"
+	b, _, _ := newTestBotWith(t, func(cfg *config.Config) {
+		cfg.ChatTools.Enabled = true
+		cfg.ChatTools.ExtensionPath = path
+		cfg.Gateway.PiArgs = []string{"--extension", path}
+	})
+	args := b.piArgs(workspaceProject(t, b, "read the chat"))
+	if got := countFlag(args, "--extension"); got != 1 {
+		t.Errorf("chat-tools extension appears %d times in %v, want once", got, args)
+	}
+	if !slices.Contains(args, path) {
+		t.Errorf("extension path %q is missing from %v", path, args)
+	}
+
+	b.cfg.ChatTools.Enabled = false
+	b.cfg.Gateway.PiArgs = nil
+	args = b.piArgs(workspaceProject(t, b, "read without tools"))
+	if slices.Contains(args, "--extension") {
+		t.Errorf("disabled chat tools added an extension: %v", args)
 	}
 }
 

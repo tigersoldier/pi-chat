@@ -23,10 +23,11 @@ const (
 // zero ThreadRow is not valid: ThreadKey and the three platform identifiers
 // are what make it a thread.
 type ThreadRow struct {
-	ThreadKey   string // workspace:channel:thread_ts
+	ThreadKey   string // app: workspace:channel:thread_ts; self-DM: namespaced
 	WorkspaceID string
 	ChannelID   string
 	ThreadTS    string
+	Surface     string // app | self_dm; part of the chat origin identity
 
 	SessionName string // deterministic for bot-created sessions
 	SessionPath string // the gateway's identity for the session
@@ -92,11 +93,21 @@ func (s *Store) Threads(ctx context.Context) ([]ThreadRow, error) {
 // PutThread inserts or updates a thread. It is the one write path for the
 // table, so a caller cannot forget a column: read, change, put.
 func (s *Store) PutThread(ctx context.Context, row ThreadRow) error {
+	return putThread(ctx, s.db, row)
+}
+
+// putThread is shared with the transaction that commits a thread and its tool
+// binding together. A tool-enabled session must never be promptable after only
+// one half of its durable identity was written.
+func putThread(ctx context.Context, exec execContext, row ThreadRow) error {
 	if row.ThreadKey == "" {
 		return errors.New("store: a thread row needs a key")
 	}
 	if row.State == "" {
 		row.State = StateCold
+	}
+	if row.Surface == "" {
+		row.Surface = "app"
 	}
 	if row.CreatedAt.IsZero() {
 		row.CreatedAt = time.Now()
@@ -104,16 +115,17 @@ func (s *Store) PutThread(ctx context.Context, row ThreadRow) error {
 	if row.LastActive.IsZero() {
 		row.LastActive = row.CreatedAt
 	}
-	_, err := s.db.ExecContext(ctx, `
-        INSERT INTO threads (thread_key, workspace_id, channel_id, thread_ts,
+	_, err := exec.ExecContext(ctx, `
+        INSERT INTO threads (thread_key, workspace_id, channel_id, thread_ts, surface,
                              session_name, session_path, session_id, cwd, project_dir,
                              state, last_seq, leaf_id, progress_ts, observed_ts,
                              created_at, last_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_key) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             channel_id   = excluded.channel_id,
             thread_ts    = excluded.thread_ts,
+            surface      = excluded.surface,
             session_name = excluded.session_name,
             session_path = excluded.session_path,
             session_id   = excluded.session_id,
@@ -125,7 +137,7 @@ func (s *Store) PutThread(ctx context.Context, row ThreadRow) error {
             progress_ts  = excluded.progress_ts,
             observed_ts  = excluded.observed_ts,
             last_active  = excluded.last_active`,
-		row.ThreadKey, row.WorkspaceID, row.ChannelID, row.ThreadTS,
+		row.ThreadKey, row.WorkspaceID, row.ChannelID, row.ThreadTS, row.Surface,
 		row.SessionName, row.SessionPath, row.SessionID, row.Cwd, row.ProjectDir,
 		row.State, row.LastSeq, row.LeafID, row.ProgressTS, row.ObservedTS,
 		row.CreatedAt.Unix(), row.LastActive.Unix())
@@ -133,6 +145,11 @@ func (s *Store) PutThread(ctx context.Context, row ThreadRow) error {
 		return fmt.Errorf("store: write thread %s: %w", row.ThreadKey, err)
 	}
 	return nil
+}
+
+type execContext interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 // SetThreadState records warm, cold or deleted without touching the cursor or
@@ -217,7 +234,7 @@ func (s *Store) MarkThreadsCold(ctx context.Context) (int64, error) {
 var ErrNoThread = errors.New("no such thread")
 
 const selectThread = `
-    SELECT thread_key, workspace_id, channel_id, thread_ts,
+    SELECT thread_key, workspace_id, channel_id, thread_ts, surface,
            session_name, session_path, session_id, cwd, project_dir,
            state, last_seq, leaf_id, progress_ts, observed_ts, created_at, last_active
     FROM threads`
@@ -230,7 +247,7 @@ func scanThread(src scanner) (ThreadRow, error) {
 		row                   ThreadRow
 		createdAt, lastActive int64
 	)
-	err := src.Scan(&row.ThreadKey, &row.WorkspaceID, &row.ChannelID, &row.ThreadTS,
+	err := src.Scan(&row.ThreadKey, &row.WorkspaceID, &row.ChannelID, &row.ThreadTS, &row.Surface,
 		&row.SessionName, &row.SessionPath, &row.SessionID, &row.Cwd, &row.ProjectDir,
 		&row.State, &row.LastSeq, &row.LeafID, &row.ProgressTS, &row.ObservedTS,
 		&createdAt, &lastActive)

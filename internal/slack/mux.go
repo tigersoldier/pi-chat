@@ -82,7 +82,14 @@ func (m *MultiPlatform) OpenThread(ctx context.Context, channel, text string) (b
 	if err != nil {
 		return bot.Thread{}, err
 	}
-	return platform.OpenThread(ctx, channel, text)
+	thread, err := platform.OpenThread(ctx, channel, text)
+	if err != nil {
+		return bot.Thread{}, err
+	}
+	if identified, ok := platform.(bot.SurfaceIdentifier); ok {
+		thread.Surface = identified.ChatSurface()
+	}
+	return thread, nil
 }
 
 // Optional capabilities below are claimed by the mux on behalf of the

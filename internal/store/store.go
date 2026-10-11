@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 4
+const schemaVersion = 6
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS threads (
     workspace_id TEXT NOT NULL,
     channel_id   TEXT NOT NULL,
     thread_ts    TEXT NOT NULL,
+    surface      TEXT NOT NULL DEFAULT 'app',
     session_name TEXT NOT NULL DEFAULT '',
     session_path TEXT NOT NULL DEFAULT '',
     session_id   TEXT NOT NULL DEFAULT '',
@@ -59,6 +60,21 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE INDEX IF NOT EXISTS threads_session_path ON threads(session_path);
 CREATE INDEX IF NOT EXISTS threads_channel ON threads(workspace_id, channel_id);
 CREATE INDEX IF NOT EXISTS threads_project_dir ON threads(project_dir);
+
+CREATE TABLE IF NOT EXISTS session_tool_bindings (
+    session_path      TEXT PRIMARY KEY,
+    provider          TEXT NOT NULL,
+    surface           TEXT NOT NULL,
+    workspace_id      TEXT NOT NULL,
+    channel_id        TEXT NOT NULL,
+    thread_ts         TEXT NOT NULL,
+    capabilities      TEXT NOT NULL,
+    extension_version TEXT NOT NULL,
+    state             TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+    created_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS session_tool_bindings_state ON session_tool_bindings(state);
 
 CREATE TABLE IF NOT EXISTS seen (
     event_id    TEXT PRIMARY KEY,           -- platform event ID, dedupe key
@@ -88,6 +104,9 @@ CREATE TABLE IF NOT EXISTS retired (
     thread_key   TEXT NOT NULL,
     session_name TEXT NOT NULL DEFAULT '',
     project_dir  TEXT NOT NULL DEFAULT '',
+    observed_ts  TEXT NOT NULL DEFAULT '',
+    last_seq     INTEGER NOT NULL DEFAULT 0,
+    leaf_id      TEXT NOT NULL DEFAULT '',
     retired_at   INTEGER NOT NULL
 );
 
@@ -162,6 +181,27 @@ var migrations = []struct {
         )`,
 		`CREATE INDEX IF NOT EXISTS surface_posted_at ON surface_posted(posted_at)`,
 	}},
+	{to: 5, stmt: []string{
+		`ALTER TABLE threads ADD COLUMN surface TEXT NOT NULL DEFAULT 'app'`,
+		`CREATE TABLE IF NOT EXISTS session_tool_bindings (
+            session_path      TEXT PRIMARY KEY,
+            provider          TEXT NOT NULL,
+            surface           TEXT NOT NULL,
+            workspace_id      TEXT NOT NULL,
+            channel_id        TEXT NOT NULL,
+            thread_ts         TEXT NOT NULL,
+            capabilities      TEXT NOT NULL,
+            extension_version TEXT NOT NULL,
+            state             TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+            created_at        INTEGER NOT NULL
+        )`,
+		`CREATE INDEX IF NOT EXISTS session_tool_bindings_state ON session_tool_bindings(state)`,
+	}},
+	{to: 6, stmt: []string{
+		`ALTER TABLE retired ADD COLUMN observed_ts TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE retired ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE retired ADD COLUMN leaf_id TEXT NOT NULL DEFAULT ''`,
+	}},
 }
 
 // Store is the open database.
@@ -233,11 +273,24 @@ func (s *Store) init(ctx context.Context) error {
 	}
 	// Every statement in the schema is IF NOT EXISTS, so running it after a
 	// migration creates whatever a migration did not — a table a later version
-	// added — and leaves existing tables alone.
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	// added — and leaves existing tables alone. Keep the whole schema and its
+	// version stamp in one transaction so a fresh database can retry after an
+	// interrupted first open.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin applying the schema: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("apply the schema: %w", err)
 	}
-	return s.setVersion(ctx, schemaVersion)
+	if err := recordVersion(ctx, tx, schemaVersion); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit the schema: %w", err)
+	}
+	return nil
 }
 
 // migrate applies every migration newer than the database's version.
@@ -246,13 +299,22 @@ func (s *Store) migrate(ctx context.Context, from int) error {
 		if m.to <= from {
 			continue
 		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration to schema %d: %w", m.to, err)
+		}
 		for _, stmt := range m.stmt {
-			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				_ = tx.Rollback()
 				return fmt.Errorf("migrate the schema to %d: %w", m.to, err)
 			}
 		}
-		if err := s.setVersion(ctx, m.to); err != nil {
+		if err := recordVersion(ctx, tx, m.to); err != nil {
+			_ = tx.Rollback()
 			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration to schema %d: %w", m.to, err)
 		}
 	}
 	return nil
@@ -272,15 +334,18 @@ var versionStatements = map[int]string{
 	2: "PRAGMA user_version = 2",
 	3: "PRAGMA user_version = 3",
 	4: "PRAGMA user_version = 4",
+	5: "PRAGMA user_version = 5",
+	6: "PRAGMA user_version = 6",
 }
 
-// setVersion stamps the schema version.
-func (s *Store) setVersion(ctx context.Context, version int) error {
+// recordVersion stamps the schema version on the same executor as the schema
+// changes, so a migration and its version cannot be committed separately.
+func recordVersion(ctx context.Context, exec execContext, version int) error {
 	stmt, ok := versionStatements[version]
 	if !ok {
 		return fmt.Errorf("no statement records schema version %d", version)
 	}
-	if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := exec.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("record the schema version: %w", err)
 	}
 	return nil

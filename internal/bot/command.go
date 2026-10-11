@@ -23,10 +23,13 @@ const (
 	threadForm = "@pi /"
 )
 
-// ActionResume is the button that adopts a session listed by /pi resume. The
-// adapter round-trips it; keeping the constant here keeps the vocabulary in
-// one place.
+// ActionResume is the button that adopts an outside session from a root
+// /pi resume picker.
 const ActionResume = "resume"
+
+// ActionResumeRetired restores a session this thread previously retired with
+// /new. Its path is checked against the thread's durable retired-session rows.
+const ActionResumeRetired = "resume-retired"
 
 // ActionStop is the platform's own stop control rather than a button pi-chat
 // posted: Slack shows one while an agent session is `processing`, and pressing
@@ -124,8 +127,8 @@ func controls() map[string]control {
 			run:     (*Bot).cmdStatus,
 		},
 		"resume": {
-			scope:   scopeRoot,
-			summary: "adopt a session that was started outside pi-chat",
+			scope:   scopeRoot | scopeThread,
+			summary: "adopt an outside session at the root, or restore one retired here",
 			run:     (*Bot).cmdResume,
 		},
 		"new": {
@@ -171,9 +174,12 @@ func (b *Bot) cmdStatus(ctx context.Context, r request, _ string) error {
 	return b.statusThread(ctx, r)
 }
 
-// cmdResume answers /pi resume: the picker of sessions started outside
-// pi-chat.
+// cmdResume answers /pi resume with outside sessions at the root and this
+// thread's retired sessions inside a thread.
 func (b *Bot) cmdResume(ctx context.Context, r request, _ string) error {
+	if r.inThread() {
+		return b.pickRetired(ctx, r)
+	}
 	return b.pickResumable(ctx, r)
 }
 
@@ -389,10 +395,13 @@ func deleteAnswer(row store.ThreadRow, report deleteReport) string {
 		b.WriteString(" Its project directory was empty and is gone.")
 	}
 	if len(report.Cleanup.LeftBehind) > 0 {
-		b.WriteString("\n" + leftBehindText(report.Cleanup.LeftBehind))
+		b.WriteByte('\n')
+		b.WriteString(leftBehindText(report.Cleanup.LeftBehind))
 	}
 	if report.CleanupErr != nil {
-		b.WriteString("\nThe cleanup did not finish: " + report.CleanupErr.Error())
+		b.WriteByte('\n')
+		b.WriteString("The cleanup did not finish: ")
+		b.WriteString(report.CleanupErr.Error())
 	}
 	b.WriteString("\nThe next message here starts a fresh session.")
 	return b.String()
@@ -689,6 +698,63 @@ func (b *Bot) pickResumable(ctx context.Context, r request) error {
 	return b.plat.Post(ctx, n)
 }
 
+// pickRetired answers @pi /resume with the sessions this thread replaced with
+// /new. Unlike root adoption, each choice returns to the same chat identity.
+func (b *Bot) pickRetired(ctx context.Context, r request) error {
+	th, ok := b.tracked(*r.thread)
+	if !ok {
+		b.answer(ctx, r, "There are no sessions retired from this thread. Root `/pi resume` can adopt a session started outside pi-chat.")
+		return nil
+	}
+	if th.snapshot().SessionPath != "" {
+		b.answer(ctx, r, "This thread already has a session. Use `@pi /new` to retire it before restoring an older one.")
+		return nil
+	}
+	retired, err := b.store.RetiredSessions(ctx, th.key)
+	if err != nil {
+		return fmt.Errorf("read this thread's retired sessions: %w", err)
+	}
+	if len(retired) == 0 {
+		b.answer(ctx, r, "There are no sessions retired from this thread. Root `/pi resume` adopts sessions started outside pi-chat.")
+		return nil
+	}
+	catalog, err := b.gw.Sessions(ctx)
+	if err != nil {
+		return fmt.Errorf("read the session catalog: %w", err)
+	}
+	byPath := make(map[string]gwclient.SessionRow, len(catalog))
+	for _, row := range catalog {
+		byPath[row.Path] = row
+	}
+	n := Notice{
+		Thread:    r.thread,
+		Channel:   r.channel,
+		UserID:    r.userID,
+		Ephemeral: true,
+		ReplyTo:   r.replyTo,
+		Text:      "*Sessions retired from this thread* — pick one to restore it here:",
+	}
+	for _, old := range retired {
+		row, ok := byPath[old.SessionPath]
+		if !ok {
+			continue // gateway already forgot it; do not offer a stale button
+		}
+		n.Buttons = append(n.Buttons, Button{
+			ActionID: ActionResumeRetired,
+			Text:     sessionLabel(row),
+			Value:    old.SessionPath,
+		})
+		if len(n.Buttons) == resumeLimit {
+			break
+		}
+	}
+	if len(n.Buttons) == 0 {
+		b.answer(ctx, r, "None of this thread's retired sessions are in the gateway catalog any more.")
+		return nil
+	}
+	return b.plat.Post(ctx, n)
+}
+
 // resumeSession adopts the session a /pi resume button named.
 func (b *Bot) resumeSession(ctx context.Context, a Action) {
 	r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo}
@@ -737,13 +803,97 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		b.reply(ctx, Notice{Thread: &thread, Text: "I found that session but could not attach to it: " + err.Error()})
 		return
 	}
-	b.reply(ctx, resumeNotice(thread, *chosen, a.Direct))
+	b.reply(ctx, b.resumeNoticeForSession(ctx, thread, *chosen, a.Direct))
 	// The picker is replaced rather than left behind, so the same session
 	// cannot be adopted twice by an old button.
 	if a.MessageTS != "" || a.ReplyTo != "" {
 		b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
 			ReplyTo: a.ReplyTo, Update: a.MessageTS,
 			Text: fmt.Sprintf("Adopted `%s`. Continue in the new thread.", sessionName(*chosen))})
+	}
+}
+
+// resumeRetiredSession restores a choice made by an in-thread /resume picker.
+// The path is input from the adapter, so it is rechecked against both the
+// thread's retired records and the gateway catalog before moving its binding.
+func (b *Bot) resumeRetiredSession(ctx context.Context, a Action) {
+	r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo, thread: a.Thread}
+	if a.Thread == nil || a.Thread.ThreadTS == "" || a.Value == "" {
+		b.answer(ctx, r, "That retired-session choice no longer identifies a thread. Ask for `@pi /resume` again.")
+		return
+	}
+	th, ok := b.tracked(*a.Thread)
+	if !ok {
+		b.answer(ctx, r, "I cannot find this thread's state, so I did not restore anything.")
+		return
+	}
+	r.thread = &th.t
+	if !th.turnMu.TryLock() {
+		b.answer(ctx, r, "A turn is running here. Wait for it to finish before restoring an older session.")
+		return
+	}
+	defer th.turnMu.Unlock()
+	if th.snapshot().SessionPath != "" {
+		b.answer(ctx, r, "This thread already has a session. Use `@pi /new` before restoring an older one.")
+		return
+	}
+	retired, err := b.store.RetiredSessions(ctx, th.key)
+	if err != nil {
+		b.answer(ctx, r, "I cannot read this thread's retired sessions: "+err.Error())
+		return
+	}
+	var selected *store.RetiredSession
+	for i := range retired {
+		if retired[i].SessionPath == a.Value {
+			selected = &retired[i]
+			break
+		}
+	}
+	if selected == nil {
+		b.answer(ctx, r, "That session is not retired from this thread any more. Ask for `@pi /resume` again.")
+		return
+	}
+	catalog, err := b.gw.Sessions(ctx)
+	if err != nil {
+		b.answer(ctx, r, "I cannot read the session catalog: "+err.Error())
+		return
+	}
+	var chosen *gwclient.SessionRow
+	for i := range catalog {
+		if catalog[i].Path == selected.SessionPath {
+			chosen = &catalog[i]
+			break
+		}
+	}
+	if chosen == nil {
+		b.answer(ctx, r, "That session is no longer in the gateway catalog. It was not restored.")
+		return
+	}
+	row, restored, err := b.store.RestoreRetiredSession(ctx, th.key, selected.SessionPath, chosen.ID, chosen.Cwd)
+	if err != nil {
+		b.answer(ctx, r, "I could not restore the session: "+err.Error())
+		return
+	}
+	if !restored {
+		b.answer(ctx, r, "That session or thread changed before I could restore it. Ask for `@pi /resume` again.")
+		return
+	}
+	th.rowMu.Lock()
+	th.row = row
+	th.rowMu.Unlock()
+	if _, err := th.ensure(ctx, ""); err != nil {
+		b.answer(ctx, r, "I restored the session to this thread, but could not attach to it yet: "+err.Error())
+		return
+	}
+	message := fmt.Sprintf("Restored `%s` in this thread. Continue the conversation here.", sessionName(*chosen))
+	if note := b.chatToolsUnavailableNotice(ctx, chosen.Path); note != "" {
+		message += "\n" + note
+	}
+	b.answer(ctx, r, message)
+	if a.MessageTS != "" || a.ReplyTo != "" {
+		b.reply(ctx, Notice{Thread: &th.t, Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+			ReplyTo: a.ReplyTo, Update: a.MessageTS,
+			Text: fmt.Sprintf("Restored `%s` in this thread.", sessionName(*chosen))})
 	}
 }
 
@@ -761,6 +911,28 @@ const (
 // well as the thread, because a notice that names only its thread leaves the
 // adapter with nowhere to post it — which is how the first live adoption ended in
 // `channel_not_found` and silence.
+func (b *Bot) resumeNoticeForSession(ctx context.Context, t Thread, row gwclient.SessionRow, direct bool) Notice {
+	notice := resumeNotice(t, row, direct)
+	if note := b.chatToolsUnavailableNotice(ctx, row.Path); note != "" {
+		notice.Text += "\n" + note
+	}
+	return notice
+}
+
+func (b *Bot) chatToolsUnavailableNotice(ctx context.Context, sessionPath string) string {
+	if !b.cfg.ChatTools.Enabled {
+		return ""
+	}
+	binding, found, err := b.store.SessionToolBinding(ctx, sessionPath)
+	if err != nil {
+		return "I could not verify chat-tool access for this session; treat chat tools as unavailable. `@pi /new` starts a session with them enabled."
+	}
+	if found && binding.State == store.ToolBindingActive {
+		return ""
+	}
+	return "Chat tools are not available in this session. `@pi /new` starts a session with them enabled."
+}
+
 func resumeNotice(t Thread, row gwclient.SessionRow, direct bool) Notice {
 	howToContinue := continueInChannel
 	if direct {

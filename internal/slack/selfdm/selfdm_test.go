@@ -3,6 +3,7 @@ package selfdm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -44,6 +45,11 @@ func newStub(routes map[string]func(url.Values) string) *stubSlack {
 	}
 	if _, ok := routes["conversations.history"]; !ok {
 		routes["conversations.history"] = func(url.Values) string { return `{"ok":true,"messages":[]}` }
+	}
+	if _, ok := routes["conversations.info"]; !ok {
+		routes["conversations.info"] = func(params url.Values) string {
+			return fmt.Sprintf(`{"ok":true,"channel":{"id":%q,"is_im":true,"user":"U1"}}`, params.Get("channel"))
+		}
 	}
 	return &stubSlack{routes: routes}
 }
@@ -241,6 +247,50 @@ func TestNewRefusesAChannelItCannotRead(t *testing.T) {
 
 // TestNewStartsAFirstRunAtTheNewestMessage: enabling the surface must not replay
 // a personal DM as a batch of prompts.
+func TestChatToolProviderRequiresTheAuthenticatedUsersOwnDM(t *testing.T) {
+	for _, test := range []struct {
+		name, response string
+		wantErr        bool
+	}{
+		{"own self-DM", `{"ok":true,"channel":{"id":"D1","is_im":true,"user":"U1"}}`, false},
+		{"another users DM", `{"ok":true,"channel":{"id":"D1","is_im":true,"user":"U2"}}`, true},
+		{"not a direct message", `{"ok":true,"channel":{"id":"D1","is_im":false,"user":"U1"}}`, true},
+		{"different channel", `{"ok":true,"channel":{"id":"D2","is_im":true,"user":"U1"}}`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			routes := map[string]func(url.Values) string{
+				"conversations.info": func(url.Values) string { return test.response },
+			}
+			stub := newStub(routes)
+			s, err := New(t.Context(), stub.api(t), newMemState(), Config{Channel: "D1"}, discardLogger())
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("New accepted an unsafe conversation: %+v", s)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			provider, err := s.NewChatToolProvider(nil, 50, 16*1024)
+			if err != nil || provider == nil {
+				t.Fatalf("NewChatToolProvider = %v, %v", provider, err)
+			}
+			if got := stub.count("conversations.info"); got != 1 {
+				t.Errorf("conversations.info calls = %d, want 1 startup validation", got)
+			}
+		})
+	}
+}
+
+func TestRouterIgnoresMessagesFromOtherDMParticipants(t *testing.T) {
+	s, core, _, _ := surfaceFor(t, nil)
+	s.router.Handle(t.Context(), slack.Message{TS: "1.0", User: "U2", Text: "read another channel"})
+	if messages, commands, actions := core.got(); messages != 0 || commands != 0 || actions != 0 {
+		t.Errorf("non-owner DM message reached core: messages=%d commands=%d actions=%d", messages, commands, actions)
+	}
+}
+
 func TestNewStartsAFirstRunAtTheNewestMessage(t *testing.T) {
 	routes := map[string]func(url.Values) string{
 		"conversations.history": func(url.Values) string {

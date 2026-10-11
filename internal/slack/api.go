@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,10 @@ type API struct {
 	base   string // the Web API root; empty means APIBase
 	http   *http.Client
 	log    *slog.Logger
+
+	profileMu     sync.Mutex
+	profiles      map[string]userProfileCacheEntry
+	profileDenied bool
 }
 
 // Option adjusts an API client at construction.
@@ -78,9 +83,10 @@ func CookieHeader(value string) string {
 // NewAPI builds a client for the given token.
 func NewAPI(token string, log *slog.Logger, opts ...Option) *API {
 	a := &API{
-		token: token,
-		http:  &http.Client{Timeout: 30 * time.Second},
-		log:   log,
+		token:    token,
+		http:     &http.Client{Timeout: 30 * time.Second},
+		log:      log,
+		profiles: make(map[string]userProfileCacheEntry),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -113,6 +119,10 @@ func IsCode(err error, code string) bool {
 // `user_not_found` — for the bot's own user ID — for as long as this sent JSON.
 // Every method takes a form body; only some take JSON.
 func (a *API) call(ctx context.Context, method string, params map[string]any, out any) error {
+	return a.callToken(ctx, a.token, method, params, out)
+}
+
+func (a *API) callToken(ctx context.Context, token, method string, params map[string]any, out any) error {
 	// The request body is kept as bytes rather than as a reader: an http.Request
 	// consumes its body, so a retry built on the same reader would send no
 	// parameters at all — which is exactly how the rate-limit retry used to fail.
@@ -135,7 +145,7 @@ func (a *API) call(ctx context.Context, method string, params map[string]any, ou
 			return fmt.Errorf("slack %s: %w", method, err)
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Authorization", "Bearer "+a.token)
+		req.Header.Set("Authorization", "Bearer "+token)
 		if a.cookie != "" {
 			req.Header.Set("Cookie", a.cookie)
 		}
@@ -281,9 +291,7 @@ func (a *API) ConnectionsOpen(ctx context.Context, appToken string) (string, err
 // callWith is call with an explicit token, for the one method that needs the
 // app-level token instead of the bot token.
 func (a *API) callWith(ctx context.Context, token, method string, params map[string]any, out any) error {
-	clone := *a
-	clone.token = token
-	return clone.call(ctx, method, params, out)
+	return a.callToken(ctx, token, method, params, out)
 }
 
 // PostMessage posts text into a thread and returns the message's timestamp.
@@ -525,32 +533,11 @@ func (a *API) Replies(ctx context.Context, channel, threadTS, oldest string) ([]
 // transcript. It needs `users:read`; an install without the scope gets an error
 // here and bare IDs in the transcript, which is the deliberate fallback.
 func (a *API) UserInfo(ctx context.Context, userID string) (string, error) {
-	var out struct {
-		User struct {
-			Name     string `json:"name"`
-			RealName string `json:"real_name"`
-			Profile  struct {
-				DisplayName string `json:"display_name"`
-				RealName    string `json:"real_name"`
-			} `json:"profile"`
-		} `json:"user"`
-	}
-	if err := a.call(ctx, "users.info", map[string]any{"user": userID}, &out); err != nil {
+	profile, err := a.UserProfile(ctx, userID)
+	if err != nil {
 		return "", err
 	}
-	// Slack's own preference order: what the person chose to be called, then
-	// their account name.
-	for _, name := range []string{
-		out.User.Profile.DisplayName,
-		out.User.Profile.RealName,
-		out.User.RealName,
-		out.User.Name,
-	} {
-		if name = strings.TrimSpace(name); name != "" {
-			return name, nil
-		}
-	}
-	return "", nil
+	return profile.DisplayName, nil
 }
 
 // suggestion is one suggested prompt, in the shape Slack takes.
