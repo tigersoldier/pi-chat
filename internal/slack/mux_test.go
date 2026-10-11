@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // fakePlatform records what the mux sent it, so a routing test can assert on the
@@ -45,7 +46,8 @@ func (fakeRenderer) Fail(context.Context, error) error    { return nil }
 // capablePlatform adds the optional capabilities the mux has to delegate.
 type capablePlatform struct {
 	fakePlatform
-	acks []bool
+	acks       []bool
+	imageReads []string
 }
 
 func (c *capablePlatform) AcknowledgeRequest(_ context.Context, _ bot.Message, allowed bool) error {
@@ -65,6 +67,13 @@ func (c *capablePlatform) SetStatus(_ context.Context, _ bot.Thread, s bot.Statu
 func (c *capablePlatform) SetSuggestedPrompts(_ context.Context, _, title string, _ []bot.Suggestion) error {
 	c.prompts = append(c.prompts, title)
 	return nil
+}
+
+func (c *capablePlatform) CanReadImage(string) bool { return true }
+
+func (c *capablePlatform) ReadImage(_ context.Context, channel string, file bot.Attachment) (protocol.ImageContent, error) {
+	c.imageReads = append(c.imageReads, channel+":"+file.ID)
+	return protocol.NewImage([]byte(file.ID), "image/png"), nil
 }
 
 // TestMuxRoutesByChannel is the whole rule: the configured self-DM channel goes
@@ -110,6 +119,29 @@ func TestMuxRoutesByChannel(t *testing.T) {
 	}
 }
 
+func TestMuxRoutesImageReadsByChannel(t *testing.T) {
+	ctx := context.Background()
+	app := &capablePlatform{}
+	dm := &capablePlatform{}
+	mux := NewMultiPlatform(discardLogger(), app, map[string]bot.Platform{"D1": dm})
+
+	if _, err := mux.ReadImage(ctx, "D1", bot.Attachment{ID: "self"}); err != nil {
+		t.Fatalf("ReadImage in the self-DM: %v", err)
+	}
+	if _, err := mux.ReadImage(ctx, "C9", bot.Attachment{ID: "app"}); err != nil {
+		t.Fatalf("ReadImage in a channel: %v", err)
+	}
+	if !mux.CanReadImage("D1") || !mux.CanReadImage("C9") {
+		t.Fatal("the mux should expose each capable route")
+	}
+	if len(dm.imageReads) != 1 || dm.imageReads[0] != "D1:self" {
+		t.Errorf("self-DM image reads = %v, want [D1:self]", dm.imageReads)
+	}
+	if len(app.imageReads) != 1 || app.imageReads[0] != "C9:app" {
+		t.Errorf("app image reads = %v, want [C9:app]", app.imageReads)
+	}
+}
+
 // TestMuxWithoutADefaultRefusesAnUnknownChannel: with only the self-DM running,
 // a call for any other channel is a bug in the wiring, not something to guess
 // about.
@@ -150,6 +182,12 @@ func TestMuxCapabilitiesFollowTheSurface(t *testing.T) {
 	}
 	if err := mux.AcknowledgeRequest(ctx, bot.Message{Thread: bot.Thread{Channel: "C9"}}, true); err != nil {
 		t.Errorf("AcknowledgeRequest on a surface without the capability must be a no-op, got: %v", err)
+	}
+	if !mux.CanReadImage("D1") || mux.CanReadImage("C9") {
+		t.Errorf("image support should follow the owning surface: D1=%t C9=%t", mux.CanReadImage("D1"), mux.CanReadImage("C9"))
+	}
+	if _, err := mux.ReadImage(ctx, "C9", bot.Attachment{ID: "F1"}); err == nil {
+		t.Error("ReadImage on a surface without the capability must fail")
 	}
 
 	said, err := mux.Conversation(ctx, bot.Thread{Channel: "D1"}, "")

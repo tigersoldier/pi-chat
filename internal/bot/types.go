@@ -89,9 +89,12 @@ type Attachment struct {
 }
 
 // ImageReader is implemented by platforms that can download image attachments.
-// Reads happen only after the core has authorized and started a turn.
+// The channel identifies the owning surface when a platform multiplexes several
+// surfaces, and lets the core reject image-only requests before starting a turn
+// on a surface that cannot read them.
 type ImageReader interface {
-	ReadImage(ctx context.Context, file Attachment) (protocol.ImageContent, error)
+	CanReadImage(channel string) bool
+	ReadImage(ctx context.Context, channel string, file Attachment) (protocol.ImageContent, error)
 }
 
 // Command is one inbound command: a slash command at a channel or DM root, or

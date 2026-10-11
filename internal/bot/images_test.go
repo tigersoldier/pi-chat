@@ -19,14 +19,21 @@ import (
 
 type imagePlatform struct {
 	*fakePlatform
-	readFiles []string
-	read      func(context.Context, Attachment) (protocol.ImageContent, error)
+	readFiles    []string
+	readChannels []string
+	canRead      func(string) bool
+	read         func(context.Context, string, Attachment) (protocol.ImageContent, error)
 }
 
-func (p *imagePlatform) ReadImage(ctx context.Context, f Attachment) (protocol.ImageContent, error) {
+func (p *imagePlatform) CanReadImage(channel string) bool {
+	return p.canRead == nil || p.canRead(channel)
+}
+
+func (p *imagePlatform) ReadImage(ctx context.Context, channel string, f Attachment) (protocol.ImageContent, error) {
 	p.readFiles = append(p.readFiles, f.ID)
+	p.readChannels = append(p.readChannels, channel)
 	if p.read != nil {
-		return p.read(ctx, f)
+		return p.read(ctx, channel, f)
 	}
 	return protocol.NewImage([]byte(f.ID), "image/png"), nil
 }
@@ -42,7 +49,12 @@ func imageThread(t *testing.T) (*thread, *imagePlatform) {
 
 func TestPreparePromptCarriesTriggerAndConversationImages(t *testing.T) {
 	th, p := imageThread(t)
-	m := Message{TS: "1.3", Text: "fix this", Files: []Attachment{{ID: "trigger", Name: "new.png"}}}
+	m := Message{
+		Thread: Thread{Channel: "C1"},
+		TS:     "1.3",
+		Text:   "fix this",
+		Files:  []Attachment{{ID: "trigger", Name: "new.png"}},
+	}
 	obs := th.compose([]Said{
 		{TS: "1.1", UserID: "U2", Name: "Alice", Files: []Attachment{{ID: "context", Name: "old.png"}}},
 		{TS: "1.2", FromBot: true, Files: []Attachment{{ID: "own"}}},
@@ -52,7 +64,8 @@ func TestPreparePromptCarriesTriggerAndConversationImages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(p.readFiles, []string{"trigger", "context"}) || len(got.images) != 2 {
+	if !slices.Equal(p.readFiles, []string{"trigger", "context"}) ||
+		!slices.Equal(p.readChannels, []string{"C1", "C1"}) || len(got.images) != 2 {
 		t.Fatalf("downloads = %v, images = %v", p.readFiles, got.images)
 	}
 	for _, want := range []string{`[image 1: "new.png", from request]`, `[image 2: "old.png", from [Alice (U2)]]`, "fix this"} {
@@ -87,7 +100,7 @@ func TestPreparePromptDeduplicatesAndPrioritizesTheRequestThenNewestContext(t *t
 
 func TestPreparePromptWarnsAndPreservesTextWhenAnImageFails(t *testing.T) {
 	th, p := imageThread(t)
-	p.read = func(context.Context, Attachment) (protocol.ImageContent, error) {
+	p.read = func(context.Context, string, Attachment) (protocol.ImageContent, error) {
 		return protocol.ImageContent{}, errors.New("permission denied")
 	}
 	got, err := th.preparePrompt(context.Background(), Message{Text: "fix the failing test", Files: []Attachment{{ID: "F1", Name: "bug.png"}}}, observation{})
@@ -113,7 +126,7 @@ func TestPreparePromptEnforcesImageCountReadCountAndFrameBudget(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			th, p := imageThread(t)
-			p.read = func(context.Context, Attachment) (protocol.ImageContent, error) {
+			p.read = func(context.Context, string, Attachment) (protocol.ImageContent, error) {
 				if tc.fail {
 					return protocol.ImageContent{}, errors.New("unsupported")
 				}
@@ -171,6 +184,22 @@ func TestHandleMessageAcceptsImageOnlyRequestsAndStillEnforcesAccess(t *testing.
 				t.Fatal("an unauthorized upload started a turn or downloaded a file")
 			}
 		})
+	}
+}
+
+func TestImageOnlyRequestIsRejectedBeforeStartingATurnWhenSurfaceCannotReadImages(t *testing.T) {
+	th, p := imageThread(t)
+	p.canRead = func(string) bool { return false }
+	m := newTestMessage("unsupported-image-event", "")
+	m.Files = []Attachment{{ID: "F1"}}
+
+	th.b.HandleMessage(context.Background(), m)
+
+	if p.startedTurns() != 0 || len(p.readFiles) != 0 {
+		t.Fatalf("unsupported image started a turn or download: turns=%d reads=%v", p.startedTurns(), p.readFiles)
+	}
+	if len(p.notices) != 1 || !strings.Contains(p.notices[0].Text, "cannot read attachments") {
+		t.Fatalf("unsupported image notice = %+v", p.notices)
 	}
 }
 

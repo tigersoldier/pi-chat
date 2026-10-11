@@ -116,6 +116,18 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		return
 	}
 
+	// Reject image-only requests before creating or attaching a session when the
+	// routed surface cannot read images. Text requests can still proceed with a
+	// warning for any unreadable attachments.
+	if strings.TrimSpace(m.Text) == "" && len(m.Files) > 0 {
+		reader, ok := b.plat.(ImageReader)
+		if !ok || !reader.CanReadImage(m.Thread.Channel) {
+			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
+				Text: "This platform cannot read attachments — send the text instead."})
+			return
+		}
+	}
+
 	th, err := b.threadFor(m.Thread)
 	if err != nil {
 		// Without the stored state a prompt could create a second session for a
@@ -154,12 +166,6 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		// inside Slack.
 		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: mentionHelp})
 		return
-	case strings.TrimSpace(m.Text) == "":
-		if _, ok := b.plat.(ImageReader); !ok {
-			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
-				Text: "This platform cannot read attachments — send the text instead."})
-			return
-		}
 	}
 
 	// A mention whose whole text is a control command's name is a near miss:

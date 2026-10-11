@@ -234,10 +234,12 @@ and puts it in front of the request.
 - Preserve file identities and names on inbound messages and thread replies, including
   Slack's `file_share` subtype. Images in the trigger and in retained conversation lines
   travel as pi's native `images` prompt content, not private URLs the model cannot open.
-- The optional platform `ImageReader` resolves each file through `files.info` and downloads
-  `url_private_download` (or `url_private`) with the bot token. Only HTTPS Slack file hosts
-  are allowed, including redirects; pi-chat does not log or save tokens, private URLs or
-  image bytes. pi retains native image prompts in its session history as usual.
+- The optional platform `ImageReader` receives the thread's channel so a multiplexer can
+  route the read to its owning surface. The Slack app reader resolves each file through
+  `files.info` and downloads `url_private_download` (or `url_private`) with the bot token.
+  Only HTTPS Slack file hosts are allowed, including redirects; pi-chat does not log or save
+  tokens, private URLs or image bytes. pi retains native image prompts in its session history
+  as usual.
   The install needs `files:read`, already declared in both manifests.
 - Trigger images have priority, then the newest retained conversation images; deduplicate
   by file identity. Bound a turn to four images, 5 MiB per image and 10 MiB total before
