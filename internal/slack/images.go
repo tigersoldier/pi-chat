@@ -61,9 +61,12 @@ func fileURL(u *url.URL) bool {
 	return false
 }
 
+// CanReadImage reports that this Slack app surface can read files from its channels.
+func (p *Platform) CanReadImage(_ string) bool { return true }
+
 // ReadImage implements bot.ImageReader. Bytes live only long enough to become
 // native pi image content; nothing is written into a project or the state DB.
-func (p *Platform) ReadImage(ctx context.Context, file bot.Attachment) (protocol.ImageContent, error) {
+func (p *Platform) ReadImage(ctx context.Context, _ string, file bot.Attachment) (protocol.ImageContent, error) {
 	return p.api.ReadImage(ctx, file.ID)
 }
 

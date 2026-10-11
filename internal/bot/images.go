@@ -92,7 +92,7 @@ func (th *thread) preparePrompt(ctx context.Context, m Message, obs observation)
 			err = errors.New("this platform cannot read attachments")
 		} else {
 			readCtx, readCancel := context.WithTimeout(ctx, imageTimeout)
-			img, err = reader.ReadImage(readCtx, f.file)
+			img, err = reader.ReadImage(readCtx, m.Thread.Channel, f.file)
 			readCancel()
 		}
 		if err == nil && (img.Data == "" || img.Type != "image") {

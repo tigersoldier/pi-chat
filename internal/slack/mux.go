@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // MultiPlatform is the adapter half of the core/adapter split when more than one
@@ -92,13 +93,36 @@ func (m *MultiPlatform) OpenThread(ctx context.Context, channel, text string) (b
 	return thread, nil
 }
 
-// Optional capabilities below are claimed by the mux on behalf of the
-// surfaces, because the core asks the platform it holds and cannot ask per
-// thread (DESIGN.md §12). A surface that does not implement one means "nothing
-// to do here", not "failed": there is no conversation to read back on the
-// self-DM, no status indicator, and no agent surface for suggestions, and the
-// empty answer is exactly the behaviour the core gets from a platform that
-// never implemented the interface at all.
+// CanReadImage reports whether the surface for channel can read image attachments.
+func (m *MultiPlatform) CanReadImage(channel string) bool {
+	platform, err := m.forChannel(channel)
+	if err != nil {
+		return false
+	}
+	reader, ok := platform.(bot.ImageReader)
+	return ok && reader.CanReadImage(channel)
+}
+
+// ReadImage downloads an attachment through the surface that owns its channel.
+func (m *MultiPlatform) ReadImage(ctx context.Context, channel string, file bot.Attachment) (protocol.ImageContent, error) {
+	platform, err := m.forChannel(channel)
+	if err != nil {
+		return protocol.ImageContent{}, err
+	}
+	reader, ok := platform.(bot.ImageReader)
+	if !ok {
+		return protocol.ImageContent{}, fmt.Errorf("slack: surface for channel %s cannot read attachments", channel)
+	}
+	return reader.ReadImage(ctx, channel, file)
+}
+
+// Optional reporting and observation capabilities below are claimed by the mux
+// on behalf of the surfaces, because the core asks the platform it holds and
+// cannot ask per thread (DESIGN.md §12). A surface that does not implement one
+// means "nothing to do here", not "failed": there is no conversation to read
+// back on the self-DM, no status indicator, and no agent surface for suggestions.
+// The empty answer is what the core gets from a platform that never implemented
+// those interfaces at all.
 
 // Conversation reads a thread back through its surface. A surface that cannot
 // read threads back reports an empty conversation, which is what the core would
