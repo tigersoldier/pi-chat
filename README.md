@@ -4,26 +4,26 @@ Chat integrations for [pi-gateway](https://github.com/tigersoldier/pi-gateway):
 drive local [pi](https://pi.dev) coding-agent sessions from a chat platform.
 Slack is the first integration; Google Chat is a planned second one.
 
-`pi-chatd` runs on your machine and is fully outbound: one WebSocket to Slack
-(Socket Mode) and one loopback connection to `pi-gatewayd`. No listening socket,
-no tunnel, no public URL, no certificate. It does **not** own pi processes —
-`pi-gatewayd` does, and is a prerequisite.
+`pi-chatd` runs on your machine. Network traffic is outbound: Slack Socket Mode,
+the Slack Web API, and a loopback connection to `pi-gatewayd`. It does not own pi
+processes — `pi-gatewayd` does, and is a prerequisite. When the opt-in read-only
+chat tools are enabled, pi-chatd also opens a private Unix-domain socket for Pi
+extensions; it is owner-only and never exposed over TCP or a public endpoint.
 
 Architecture, the thread/session model, the access rules and the build phases:
 **[DESIGN.md](DESIGN.md).** Current position and milestones: **[PLAN.md](PLAN.md).**
 
 ## Status
 
-Design settled. M0 (the gateway seam), M1 (the Slack app, phase 0), M2 (repo prep), M3
-(the vertical slice), **M4 (the phase-1 MVP)** and **M4.6 (the agent surface) are done**:
-in Slack, a mention or a command starts a pi session in a thread, the answer streams back,
-and the thread's state survives a restart. Phase 1 has a user allowlist, durable thread
-state, project directories with the worktree convention, `/pi help|status|resume`,
-`@pi /<command>` pass-through, idle close and cold resume. Declared as Slack's agent
-messaging experience (the recommended manifest), the session also shows a real status
-while it works and a stop button that aborts the turn. Still to come (phase 2):
-`@pi /delete`, `/abort`, `/model`, interactive approvals, and the warm-session cap with
-eviction. Details: `PLAN.md`.
+M0 (the gateway seam), M1 (the Slack app, phase 0), M2 (repo prep), M3 (the vertical
+slice), **M4 (the phase-1 MVP)** and **M4.6 (the agent surface) are done**. In Slack, a
+mention or command starts a pi session in a thread, streams its answer back, and keeps
+thread state across restarts. Phase 1 includes an allowlist, durable thread state, project
+worktrees, `/pi help|status|resume`, pass-through commands, idle close and cold resume.
+The recommended agent manifest adds status and a stop button. Opt-in read-only chat-tools
+v1 is implemented in this worktree and unit-tested, but has not yet been verified against
+a live Slack workspace. Remaining phase-2 work includes `/abort`, `/model`, interactive
+approvals, and the warm-session cap with eviction. Details: `PLAN.md`.
 
 ## Surfaces
 
@@ -85,6 +85,16 @@ defaults: **[pi-chat.toml.example](pi-chat.toml.example)**. Check it with:
 make check          # loads, validates, prints a redacted summary
 ```
 
+### Read-only chat tools
+
+The `[chat_tools]` feature is off by default. When enabled, new sessions receive three
+read-only tools (`chat_read_thread`, `chat_read_message`, `chat_get_user`) through a
+versioned Pi extension and a private local broker. The gateway must advertise durable
+`spawn_config` support; Pi and pi-chatd must be able to access the same mode-0600 Unix
+socket. Existing/adopted sessions without an active binding remain usable without the
+tools. See [docs/chat-tools.md](docs/chat-tools.md) for scope, limits, session sharing,
+and failure behavior.
+
 ## Running it
 
 ```bash
@@ -104,14 +114,15 @@ Two trigger tokens, one vocabulary. Slack forbids developer slash commands
 inside message threads, which is why the two forms differ.
 
 > **What works today:** the mention forms and `/pi help`, `/pi status`, `/pi resume`,
-> `@pi /status`, and pass-through of pi's own commands. `/delete`, `/abort`, `/model` and
+> `@pi /status`, `@pi /resume` for restoring a session retired in that thread, and
+> pass-through of pi's own commands. `/delete`, `/abort`, `/model` and
 > `/stop` are part of the grammar but answer "not in this build yet" until phase 2 — they
 > are never forwarded to the agent as text.
 
 | Where | Form | Example |
 |---|---|---|
 | Channel or DM root | `/pi <command>` | `/pi status`, `/pi resume`, `/pi help` |
-| Channel or DM thread | `@pi /<command>` | `@pi /status`, `@pi /skill:grill-me` |
+| Channel or DM thread | `@pi /<command>` | `@pi /status`, `@pi /resume`, `@pi /skill:grill-me` |
 | Channel root or group DM root | `@pi <text>` | starts a thread and a session |
 | Channel or group DM thread | `@pi <text>` | continues that thread's session |
 | One-to-one DM root | plain text | starts a thread and a session |
@@ -139,8 +150,9 @@ are not supported yet. The bot needs the `files:read` scope (included in both ap
 manifests); reinstall the Slack app if your existing token does not have it.
 
 State lives in SQLite at `paths.db_path` (created on first run, inside a 0700 directory). It
-holds thread keys, session identities, cursors and handled event IDs — never
-transcripts, prompts, or answers.
+holds thread keys, session identities, cursors, handled event IDs and chat-tool binding
+metadata — never transcripts, prompts, app credentials, or answers. Pi's own session file
+may retain tool results under normal gateway retention and deletion behavior.
 
 ## Layout
 
@@ -149,7 +161,8 @@ cmd/pi-chatd/          the daemon: wiring, flags, logging, signals
 cmd/pi-chat-oauth/     the optional OAuth broker: one user token per person
 internal/config/       configuration file loading and validation
 internal/bot/          platform-independent core: threads, sessions, turns
-internal/slack/        Slack adapter: Socket Mode, Web API, rendering
+internal/slack/        Slack adapter: Socket Mode, Web API, rendering, read tools
+internal/chattools/    private Unix-socket broker and embedded Pi extension
 packaging/             systemd user unit
 slack/                 Slack app manifests — the app's configuration as code
 tools/gateway-probe/   nested module: pi-gateway seam smoke test

@@ -45,10 +45,11 @@ lives in the same daemon as the app.
 | **B. App only** | the defaults | mentions, DMs, slash commands, buttons, status, notifications ([walkthrough](slack-app-setup.md)) |
 | **C. Both** | defaults + `[slack.self_dm] enabled = true` | the app where you have it, the self-DM as a second way in; one daemon, one session table |
 
-Both surfaces share the store and the warm-session cap; the daemon routes by
-channel id, so the app's DM with you and your self-DM are different
-conversations with different sessions. This guide covers **A** first — the other
-shapes are one line apart (Step 5).
+Both surfaces share the store and the warm-session cap. Session identity is
+namespaced by surface, so even a D-channel visible to both does not share a Pi
+session. At startup pi-chat verifies that the configured D-channel is your own
+one-to-one self-DM; messages from any other participant are ignored. This guide
+covers **A** first — the other shapes are one line apart (Step 5).
 
 ---
 
@@ -255,7 +256,8 @@ In the self-DM, in this order:
    message at the top level would start a new one.
 4. **`/pi status`** — the session's state, and how close the warm cap is.
 5. Optional: **`/pi new`** retires the session and starts a fresh one;
-   **`/pi resume`** offers the sessions pi-chat can adopt as a numbered list.
+   inside that thread, **`@pi /resume`** restores one of its retired sessions. At a
+   conversation root, **`/pi resume`** offers outside sessions pi-chat can adopt.
 
 What you will *not* see: a notification, an unread badge, a spinner, or a button.
 That is the surface, not a fault.

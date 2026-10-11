@@ -21,7 +21,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tigersoldier/pi-gateway/gwclient"
+	"github.com/tigersoldier/pi-gateway/protocol"
+
 	"github.com/tigersoldier/pi-chat/internal/bot"
+	"github.com/tigersoldier/pi-chat/internal/chattools"
 	"github.com/tigersoldier/pi-chat/internal/config"
 	"github.com/tigersoldier/pi-chat/internal/slack"
 	"github.com/tigersoldier/pi-chat/internal/slack/selfdm"
@@ -75,15 +79,17 @@ type ingress struct {
 
 // surfaces is what starting the Slack surfaces produced.
 type surfaces struct {
-	mux    bot.Platform
-	app    *appSurface
-	selfdm *selfdm.Surface
+	mux                bot.Platform
+	app                *appSurface
+	selfdm             *selfdm.Surface
+	selfdmChatProvider *slack.ChatToolProvider
 }
 
 // appSurface is the installed-app integration: Socket Mode in, Web API out.
 type appSurface struct {
 	platform  bot.Platform
 	api       *slack.API
+	identity  slack.Identity
 	appToken  string
 	botUserID string
 }
@@ -118,13 +124,26 @@ func run(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	if cfg.ChatTools.Enabled {
+		broker, err := startChatTools(ctx, cfg, log, st, sl)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := broker.Close(closeCtx); err != nil {
+				log.Warn("cannot close chat-tools broker cleanly", "error", err)
+			}
+		}()
+	}
 
 	core := bot.New(cfg, log, sl.mux, st, version)
 	defer core.Close()
 
-	// Startup GC: a directory with no thread row is the remains of a crash or
-	// of an interrupted delete. Sessions the table still knows are kept, cold
-	// ones included, because /pi resume has to find them (DESIGN.md §9).
+	// Startup GC: the store and gateway catalog identify owned project
+	// directories. If the catalog is unavailable, the sweep fails safe and
+	// leaves every directory alone (DESIGN.md §9).
 	if removed, err := core.SweepWorkspaces(ctx); err != nil {
 		log.Warn("the workspace sweep reported problems", "error", err)
 	} else if len(removed) > 0 {
@@ -223,18 +242,27 @@ func startSurfaces(ctx context.Context, cfg *config.Config, log *slog.Logger, st
 
 	if cfg.Slack.SelfDM.Enabled {
 		sd, err := startSelfDMSurface(ctx, cfg, log, st)
+		var chatProvider *slack.ChatToolProvider
+		if err == nil {
+			err = checkSelfDMAdmission(cfg, sd)
+		}
+		if err == nil && cfg.ChatTools.Enabled {
+			chatProvider, err = sd.NewChatToolProvider(cfg.Slack.Access.AllowedChannels,
+				cfg.ChatTools.MaxMessages, cfg.ChatTools.MaxResultBytes)
+		}
 		if err != nil {
 			// A surface that is configured but cannot run is disabled when another
 			// surface can still serve, and fatal when it is all there is: a stale
-			// cookie must not take the app down or make systemd flap on restart, and
-			// three surfaces' worth of silence is not better than one.
-			return nil, disableOrFail(out.app != nil, log, err)
+			// cookie or wrong self-DM must not take the app down or make systemd
+			// flap on restart.
+			if fatalErr := disableOrFail(out.app != nil, log, err); fatalErr != nil {
+				return nil, fatalErr
+			}
+		} else {
+			out.selfdm = sd
+			out.selfdmChatProvider = chatProvider
+			routes[cfg.Slack.SelfDM.ChannelID] = sd.Platform()
 		}
-		if err := checkSelfDMAdmission(cfg, sd); err != nil {
-			return nil, disableOrFail(out.app != nil, log, err)
-		}
-		out.selfdm = sd
-		routes[cfg.Slack.SelfDM.ChannelID] = sd.Platform()
 	}
 
 	if out.app == nil && out.selfdm == nil {
@@ -250,6 +278,78 @@ func startSurfaces(ctx context.Context, cfg *config.Config, log *slog.Logger, st
 	}
 	out.mux = slack.NewMultiPlatform(log, def, routes)
 	return out, nil
+}
+
+// startChatTools installs the versioned extension and starts the private local
+// broker. Surface-specific providers retain their own authenticated API client.
+func startChatTools(ctx context.Context, cfg *config.Config, log *slog.Logger, st *store.Store, sl *surfaces) (*chattools.Broker, error) {
+	if err := requireGatewaySpawnConfig(ctx, cfg, log); err != nil {
+		return nil, err
+	}
+	if err := chattools.InstallExtension(cfg.ChatTools.ExtensionPath, cfg.ChatTools.SocketPath); err != nil {
+		return nil, err
+	}
+	providers := make(map[chattools.ProviderKey]chattools.Provider)
+	channels := cfg.Slack.Access.AllowedChannels
+	if sl.app != nil {
+		provider, err := slack.NewChatToolProvider(sl.app.api, bot.SurfaceApp, sl.app.identity.TeamID, sl.app.identity.URL,
+			channels, cfg.ChatTools.MaxMessages, cfg.ChatTools.MaxResultBytes)
+		if err != nil {
+			return nil, fmt.Errorf("chat-tools app provider: %w", err)
+		}
+		key := chattools.ProviderKey{Provider: "slack", Surface: bot.SurfaceApp, WorkspaceID: sl.app.identity.TeamID}
+		providers[key] = provider
+	}
+	if sl.selfdm != nil {
+		identity := sl.selfdm.Identity()
+		if sl.selfdmChatProvider == nil {
+			return nil, errors.New("chat-tools self-DM provider was not validated during surface startup")
+		}
+		key := chattools.ProviderKey{Provider: "slack", Surface: bot.SurfaceSelfDM, WorkspaceID: identity.TeamID}
+		providers[key] = sl.selfdmChatProvider
+	}
+	if len(providers) == 0 {
+		return nil, errors.New("chat tools require at least one authenticated Slack surface")
+	}
+	broker, err := chattools.Listen(chattools.BrokerConfig{
+		SocketPath:     cfg.ChatTools.SocketPath,
+		Timeout:        time.Duration(cfg.ChatTools.TimeoutSeconds) * time.Second,
+		MaxResultBytes: cfg.ChatTools.MaxResultBytes,
+		Store:          st,
+		Providers:      providers,
+		Logger:         log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Info("chat-tools broker is ready", "socket", cfg.ChatTools.SocketPath,
+		"extension", cfg.ChatTools.ExtensionPath, "max_messages", cfg.ChatTools.MaxMessages,
+		"max_result_bytes", cfg.ChatTools.MaxResultBytes, "timeout_seconds", cfg.ChatTools.TimeoutSeconds)
+	return broker, nil
+}
+
+func requireGatewaySpawnConfig(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+	client, err := gwclient.Dial(ctx, gwclient.Config{
+		StateDir:  cfg.Gateway.StateDir,
+		TokenFile: cfg.Gateway.AdminTokenFile,
+		Name:      "pi-chat chat-tools feature check",
+		Kind:      "pi-chat",
+	})
+	if err != nil {
+		return fmt.Errorf("chat tools require pi-gatewayd with durable spawn configuration: %w", err)
+	}
+	features := client.Features()
+	if err := client.Close(); err != nil {
+		log.Warn("cannot close the pi-gateway feature-check connection", "error", err)
+	}
+	if !hasSpawnConfigFeature(features) {
+		return errors.New("chat tools require pi-gatewayd to advertise the durable spawn_config feature")
+	}
+	return nil
+}
+
+func hasSpawnConfigFeature(features []string) bool {
+	return slices.Contains(features, protocol.FeatureSpawnConfig)
 }
 
 // startAppSurface checks the app's two tokens and builds its platform. A token
@@ -281,10 +381,11 @@ func startAppSurface(ctx context.Context, cfg *config.Config, log *slog.Logger) 
 		"bot_user", me.User,
 		"bot_user_id", me.UserID)
 
+	identity := slack.Identity{TeamID: me.TeamID, UserID: me.UserID, BotID: me.BotID, URL: me.URL}
 	return &appSurface{
-		platform: slack.NewPlatform(api, cfg,
-			slack.Identity{TeamID: me.TeamID, UserID: me.UserID, BotID: me.BotID}, log),
+		platform:  slack.NewPlatform(api, cfg, identity, log),
 		api:       api,
+		identity:  identity,
 		appToken:  appToken,
 		botUserID: me.UserID,
 	}, nil

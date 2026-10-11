@@ -19,28 +19,34 @@ import (
 
 // Defaults, also used as documentation by the example file.
 const (
-	DefaultGatewayStateDir   = "~/.config/pi-gateway"
-	DefaultAdminTokenFile    = "~/.config/pi-chat/gateway-admin.token"
-	DefaultThreadTokenFile   = "~/.config/pi-chat/gateway-thread.token"
-	DefaultSlackAppTokenFile = "~/.config/pi-chat/slack-app-token"
-	DefaultSlackBotTokenFile = "~/.config/pi-chat/slack-bot-token"
-	DefaultSelfDMXOXCFile    = "~/.config/pi-chat/slack-xoxc"
-	DefaultSelfDMXOXDFile    = "~/.config/pi-chat/slack-xoxd"
-	DefaultSelfDMXOXPFile    = "~/.config/pi-chat/slack-xoxp"
-	DefaultSelfDMPollPeriod  = "5s"
-	DefaultProjectsRoot      = "~/work"
-	DefaultReposRoot         = "~/code"
-	DefaultDBPath            = "~/.local/state/pi-chat/pi-chat.db"
-	DefaultMaxWarmSessions   = 8
-	DefaultIdleCloseMinutes  = 10
-	DefaultAdmissionSeconds  = 120
-	DefaultFlushMS           = 1000
+	DefaultGatewayStateDir    = "~/.config/pi-gateway"
+	DefaultAdminTokenFile     = "~/.config/pi-chat/gateway-admin.token"
+	DefaultThreadTokenFile    = "~/.config/pi-chat/gateway-thread.token"
+	DefaultSlackAppTokenFile  = "~/.config/pi-chat/slack-app-token"
+	DefaultSlackBotTokenFile  = "~/.config/pi-chat/slack-bot-token"
+	DefaultSelfDMXOXCFile     = "~/.config/pi-chat/slack-xoxc"
+	DefaultSelfDMXOXDFile     = "~/.config/pi-chat/slack-xoxd"
+	DefaultSelfDMXOXPFile     = "~/.config/pi-chat/slack-xoxp"
+	DefaultSelfDMPollPeriod   = "5s"
+	DefaultProjectsRoot       = "~/work"
+	DefaultReposRoot          = "~/code"
+	DefaultDBPath             = "~/.local/state/pi-chat/pi-chat.db"
+	DefaultMaxWarmSessions    = 8
+	DefaultIdleCloseMinutes   = 10
+	DefaultAdmissionSeconds   = 120
+	DefaultFlushMS            = 1000
+	DefaultChatToolsExtension = "~/.local/share/pi-chat/extensions/chat-tools.ts"
+	DefaultChatToolsSocket    = "~/.local/state/pi-chat/chat-tools.sock"
+	DefaultChatToolsTimeout   = 15
+	DefaultChatToolsMessages  = 50
+	DefaultChatToolsBytes     = 16 * 1024
 )
 
 // Config is the whole configuration file.
 type Config struct {
 	Slack       Slack       `toml:"slack"`
 	Gateway     Gateway     `toml:"gateway"`
+	ChatTools   ChatTools   `toml:"chat_tools"`
 	Paths       Paths       `toml:"paths"`
 	Concurrency Concurrency `toml:"concurrency"`
 	Render      Render      `toml:"render"`
@@ -153,6 +159,17 @@ type Gateway struct {
 	PiArgs          []string `toml:"pi_args"`
 }
 
+// ChatTools configures the opt-in read-only Slack tools available to sessions
+// created by pi-chat.
+type ChatTools struct {
+	Enabled        bool   `toml:"enabled"`
+	ExtensionPath  string `toml:"extension_path"`
+	SocketPath     string `toml:"socket_path"`
+	TimeoutSeconds int    `toml:"timeout_seconds"`
+	MaxMessages    int    `toml:"max_messages"`
+	MaxResultBytes int    `toml:"max_result_bytes"`
+}
+
 // Paths are the workspace convention (DESIGN.md §9).
 type Paths struct {
 	ProjectsRoot string `toml:"projects_root"`
@@ -236,6 +253,13 @@ func Defaults() *Config {
 			// PiArgs starts empty: --approve is added by the approvals policy in
 			// [behavior], so a default here would duplicate it (and hard-code a
 			// policy into a list meant for the user's own arguments).
+		},
+		ChatTools: ChatTools{
+			ExtensionPath:  DefaultChatToolsExtension,
+			SocketPath:     DefaultChatToolsSocket,
+			TimeoutSeconds: DefaultChatToolsTimeout,
+			MaxMessages:    DefaultChatToolsMessages,
+			MaxResultBytes: DefaultChatToolsBytes,
 		},
 		Paths: Paths{
 			ProjectsRoot: DefaultProjectsRoot,
@@ -342,6 +366,40 @@ func (c *Config) Validate() error {
 	require("gateway.state_dir", c.Gateway.StateDir)
 	require("gateway.admin_token_file", c.Gateway.AdminTokenFile)
 	require("gateway.thread_token_file", c.Gateway.ThreadTokenFile)
+	if c.ChatTools.Enabled {
+		require("chat_tools.extension_path", c.ChatTools.ExtensionPath)
+		require("chat_tools.socket_path", c.ChatTools.SocketPath)
+	}
+	if c.ChatTools.TimeoutSeconds < 1 || c.ChatTools.TimeoutSeconds > 60 {
+		errs = append(errs, fmt.Errorf("chat_tools.timeout_seconds must be between 1 and 60, got %d", c.ChatTools.TimeoutSeconds))
+	}
+	if c.ChatTools.MaxMessages < 1 || c.ChatTools.MaxMessages > DefaultChatToolsMessages {
+		errs = append(errs, fmt.Errorf("chat_tools.max_messages must be between 1 and %d, got %d", DefaultChatToolsMessages, c.ChatTools.MaxMessages))
+	}
+	if c.ChatTools.MaxResultBytes < 256 || c.ChatTools.MaxResultBytes > DefaultChatToolsBytes {
+		errs = append(errs, fmt.Errorf("chat_tools.max_result_bytes must be between 256 and %d, got %d", DefaultChatToolsBytes, c.ChatTools.MaxResultBytes))
+	}
+	if c.ChatTools.Enabled {
+		protectedPaths := []struct{ name, path string }{
+			{"config file", c.Path()},
+			{"chat_tools.socket_path", c.ChatTools.SocketPath},
+			{"gateway.state_dir", c.Gateway.StateDir},
+			{"gateway.admin_token_file", c.Gateway.AdminTokenFile},
+			{"gateway.thread_token_file", c.Gateway.ThreadTokenFile},
+			{"slack.app_token_file", c.Slack.AppTokenFile},
+			{"slack.bot_token_file", c.Slack.BotTokenFile},
+			{"slack.self_dm.xoxc_file", c.Slack.SelfDM.XOXCFile},
+			{"slack.self_dm.xoxd_file", c.Slack.SelfDM.XOXDFile},
+			{"slack.self_dm.xoxp_file", c.Slack.SelfDM.XOXPFile},
+			{"paths.db_path", c.Paths.DBPath},
+		}
+		for _, protected := range protectedPaths {
+			if c.ChatTools.ExtensionPath != "" && protected.path != "" &&
+				filepath.Clean(c.ChatTools.ExtensionPath) == filepath.Clean(protected.path) {
+				errs = append(errs, fmt.Errorf("chat_tools.extension_path must not alias %s", protected.name))
+			}
+		}
+	}
 	require("paths.projects_root", c.Paths.ProjectsRoot)
 	require("paths.repos_root", c.Paths.ReposRoot)
 	require("paths.db_path", c.Paths.DBPath)
@@ -355,6 +413,8 @@ func (c *Config) Validate() error {
 		{"gateway.state_dir", c.Gateway.StateDir},
 		{"gateway.admin_token_file", c.Gateway.AdminTokenFile},
 		{"gateway.thread_token_file", c.Gateway.ThreadTokenFile},
+		{"chat_tools.extension_path", c.ChatTools.ExtensionPath},
+		{"chat_tools.socket_path", c.ChatTools.SocketPath},
 		{"paths.projects_root", c.Paths.ProjectsRoot},
 		{"paths.repos_root", c.Paths.ReposRoot},
 		{"paths.db_path", c.Paths.DBPath},
@@ -411,6 +471,7 @@ func (c *Config) expandPaths() error {
 		&c.Slack.AppTokenFile, &c.Slack.BotTokenFile,
 		&c.Slack.SelfDM.XOXCFile, &c.Slack.SelfDM.XOXDFile, &c.Slack.SelfDM.XOXPFile,
 		&c.Gateway.StateDir, &c.Gateway.AdminTokenFile, &c.Gateway.ThreadTokenFile,
+		&c.ChatTools.ExtensionPath, &c.ChatTools.SocketPath,
 		&c.Paths.ProjectsRoot, &c.Paths.ReposRoot, &c.Paths.DBPath,
 	} {
 		*p = expand(*p, home)
@@ -500,6 +561,9 @@ func (c *Config) Summary() []string {
 		file("gateway admin token", c.Gateway.AdminTokenFile, ""),
 		file("gateway thread token", c.Gateway.ThreadTokenFile, ""),
 		fmt.Sprintf("gateway state dir: %s", c.Gateway.StateDir),
+		fmt.Sprintf("chat tools: %s (extension: %s, socket: %s, max %d messages / %d bytes / %ds)",
+			onOff(c.ChatTools.Enabled), c.ChatTools.ExtensionPath, c.ChatTools.SocketPath,
+			c.ChatTools.MaxMessages, c.ChatTools.MaxResultBytes, c.ChatTools.TimeoutSeconds),
 		fmt.Sprintf("allowed users: %s", joinOr(c.Slack.Access.AllowedUsers, "none — every request is denied")),
 		fmt.Sprintf("allowed channels: %s", joinOr(c.Slack.Access.AllowedChannels, "any channel the bot is in")),
 		fmt.Sprintf("projects root: %s", c.Paths.ProjectsRoot),

@@ -4,10 +4,10 @@ Reference file for resuming work after a context reset. Design and rationale liv
 [`DESIGN.md`](./DESIGN.md); this file is the operational plan, the environment facts, and
 the current position. **Update the status block and checkboxes as work lands.**
 
-Last updated: 2026-09-28 · repo `/home/pi/code/pi-gchat` (module
-`github.com/tigersoldier/pi-chat`) — M0–M4 done: the bot answers mentions and commands in
-Slack threads through `pi-gatewayd`, with durable thread state and provisioned
-workspaces.
+Last updated: 2026-10-11 · feature worktree `/home/pi/work/2026-10-11-create-a-clean-worktree-for-pi-chat`
+(branch `feat/chat-tools`; module `github.com/tigersoldier/pi-chat`). M0–M4.7 are
+implemented; this worktree adds opt-in read-only chat tools, with live Slack validation
+still pending.
 
 ---
 
@@ -21,16 +21,17 @@ workspaces.
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
 | M3 — phase-0 vertical slice | **Done and verified end-to-end** on 2026-09-27: a mention in a Slack thread streamed a real pi answer back into it (see M3 below) |
 | M4 — phase-1 MVP | **Done and verified live** on 2026-09-28: commands, allowlist refusals, SQLite thread state, provisioned project directories, cold/resume, startup GC (see M4 below) |
-| Code | `internal/config`, `internal/store` (SQLite), `internal/workspace` (provisioning + git cleanup), `internal/bot` (core), `internal/slack` (adapter), `cmd/pi-chatd`; five packages of tests |
-| `pi-chatd` | **Installed and running** as a systemd user unit (`packaging/pi-chatd.service`, `make install install-unit`), enabled at boot |
-| `pi-gatewayd` | **Installed and running** as a user unit; built from `~/code/pi-gateway` @ `119f0f2` (= tag `v0.1.2` content), self-reports `0.2.0` |
+| Chat tools v1 | **Implemented, Go/race-tested, and loaded by the installed Pi RPC runtime; live Slack validation pending.** Opt-in extension, private UDS broker, durable session bindings, bounded read-only Slack tools |
+| Code | `internal/config`, `internal/store` (SQLite), `internal/workspace` (provisioning + git cleanup), `internal/bot` (core), `internal/slack` (adapter), `internal/chattools` (broker/extension), `cmd/pi-chatd`; tests in each package |
+| `pi-chatd` | Existing systemd user service is recorded as enabled at boot; this feature worktree has not been installed or live-tested |
+| `pi-gatewayd` | Host service was last recorded at v0.1.3; this worktree now pins `v0.1.4-0.20261011164612-b545c9e1d3c7` (upstream `b545c9e`) for durable extension spawn configuration |
 | GitHub repo rename | **Not done** — browser action; local `origin` still says `pi-gchat`, which keeps working through GitHub's redirect |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: M4 is done and verified live. Next is M5 (phase 2): `/delete` with
-button confirmation and worktree cleanup, `/abort`, `/model`, interactive approvals
-(buttons + modal via `pending_ui`), and the warm-session cap with eviction and the bounded
-queue.**
+**Current position: M0–M4.7 are complete. This worktree implements opt-in, read-only
+chat-tools v1 (unit tests pass; live Slack and restart verification are still pending).
+Remaining phase-2 work is `/abort`, `/model`, interactive approvals, warm-session eviction
+and queueing; `/delete` is already implemented.**
 
 ---
 
@@ -360,8 +361,8 @@ for.
       retires the thread's session immediately — letting go of the connection, saving its
       cursor, clearing the row's session fields and watermark — while the session file,
       project directory and pi process stay, recorded in the new `retired` table so the
-      startup sweep keeps the directory and `/pi resume` can still adopt the session. A
-      thread's later sessions get a generation suffix (`…-2`), so a thread with more than
+      startup sweep keeps the directory and `@pi /resume` can restore it in the same thread.
+      A thread's later sessions get a generation suffix (`…-2`), so a thread with more than
       one session keeps an unambiguous catalog. Store schema 3, verified by migrating the
       live database 2 -> 3 with its rows intact. 14 new tests (8 core, 6 store) plus two
       rewritten for the new group-DM and plain-text rules.
@@ -530,6 +531,11 @@ once, not per turn.
 
 ### M5 — Phase 2
 
+- [x] Opt-in read-only chat-tools v1: embedded TypeScript extension, private bounded UDS
+      broker, exact session-path binding lookup, Slack thread/message/profile reads,
+      gateway `spawn_config` feature check, extension health verification, binding
+      revocation, and unit tests. Live Slack, gateway restart and cancellation-in-Pi
+      acceptance runs remain to be done in the deployment environment.
 - [x] `@pi /delete`: a button confirm (ephemeral, `Delete session` in danger red and
       `Cancel`), then the gateway's `DeleteSession` on a throwaway admin connection, then
       the worktree/branch cleanup, then the row marked `deleted` so its key stays reserved
@@ -578,12 +584,12 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 ## Environment facts
 
 | Thing | Value |
-|---|---|
-| Repo | `/home/pi/code/pi-gchat`, origin `git@github.com:tigersoldier/pi-gchat.git` |
-| Module | `pi-gchat` (to become `github.com/tigersoldier/pi-chat`), Go 1.26.4 |
+| --- | --- |
+| Repo | Feature worktree `/home/pi/work/2026-10-11-create-a-clean-worktree-for-pi-chat`, branch `feat/chat-tools`; upstream repo remains `pi-gchat` |
+| Module | `github.com/tigersoldier/pi-chat`, Go 1.26.4 |
 | Design | `DESIGN.md` (14 sections + decision log §15) |
 | `pi` binary | `~/.local/bin/pi` |
-| `pi-gatewayd` | installed at `~/.local/bin/pi-gatewayd`, **v0.1.3** (`a47e0ad`), protocol 1; rollback binary kept as `pi-gatewayd.v0.1.2.bak`. Clone `/home/pi/code/pi-gateway` |
+| `pi-gatewayd` | host service last recorded at v0.1.3; Go dependency in this worktree is `v0.1.4-0.20261011164612-b545c9e1d3c7` (`b545c9e`), protocol 1. The binary has not been installed/verified by this worktree |
 | Gateway state | `~/.config/pi-gateway` (port + tokens + `tokens.json`) |
 | Bot config | `~/.config/pi-chat/config.toml` (0600), state in `~/.local/state/pi-chat/` |
 | Scratch gwclient consumers | `/tmp/gwtest2` (earlier validation) |
@@ -642,19 +648,12 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 ## Next action
 
-1. **The rest of M4.7.** The upgrade, the observation and the instruction are built,
-   tested and deployed. What is left is the grammar half (`@pi /new`, plain text as
-   observation only, a top-level DM starting a new session, group DMs behaving like
-   channels) and `users:read` in both manifests — the reinstall is the one part that is
-   yours to do.
-2. **Open from the interview:** how a message arriving mid-turn is handled (the code takes
-   the next turn's transcript), and whether the first turn in a thread that already had
-   people talking should read that history (the code does, bounded — say so if you would
-   rather it did not).
-3. **Whenever you like:** rename the GitHub repo to `pi-chat`. The upstream rebind ask
-   (DESIGN §3) is unchanged, and the spawn-sidecar litter is filed as
-   [pi-gateway issue #1](https://github.com/tigersoldier/pi-gateway/issues/1).
-
-The gateway side is ready: `pi-gatewayd` is running, both tokens work, and the seam is
-proven by `tools/gateway-probe`. The repo side is ready: `make check` validates the live
-configuration, `make test` and `make vet` are clean.
+1. Local validation is complete: `go test ./...`, `go test -race ./...`, and `go vet ./...`
+   pass; the embedded TypeScript extension loads in the installed Pi RPC runtime.
+2. In the deployment environment, enable `[chat_tools]`, install/build the pinned
+   pi-gateway revision, and verify a new session exposes the tools before its first prompt.
+3. Exercise bounded Slack reads, missing scopes, cancellation, cold resume, daemon
+   restarts, retired-session resume, and deletion/revocation. Live acceptance remains
+   outstanding.
+4. Whenever you like, rename the GitHub repo to `pi-chat`; the upstream stop-rebind ask
+   is unchanged and the spawn-sidecar issue remains filed.

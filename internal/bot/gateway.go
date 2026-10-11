@@ -183,11 +183,18 @@ func (b *Bot) ownedSessions(ctx context.Context) (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	owned := make(map[string]bool, len(rows))
+	retired, err := b.store.RetiredSessions(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	owned := make(map[string]bool, len(rows)+len(retired))
 	for _, row := range rows {
 		if row.SessionPath != "" && row.State != store.StateDeleted {
 			owned[row.SessionPath] = true
 		}
+	}
+	for _, row := range retired {
+		owned[row.SessionPath] = true
 	}
 	return owned, nil
 }

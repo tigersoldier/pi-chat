@@ -115,6 +115,78 @@ func TestMigratesAVersionOneDatabase(t *testing.T) {
 // TestMigratesOnlyOnce checks that the second open of a migrated database is a
 // no-op: a migration that runs twice would fail on its own ALTER, which is how a
 // restart would break a working install.
+func TestFailedMigrationStepCanBeRetriedWithoutAPartialDDLChange(t *testing.T) {
+	ctx := context.Background()
+	path := writeV1Database(t)
+	legacy, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacy.ExecContext(ctx, `CREATE TABLE session_tool_bindings (session_path TEXT PRIMARY KEY)`); err != nil {
+		t.Fatalf("create a conflicting legacy table: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	if s, err := Open(ctx, path); err == nil {
+		_ = s.Close()
+		t.Fatal("Open succeeded despite the broken v5 index target")
+	}
+	check, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("reopen failed migration: %v", err)
+	}
+	var version int
+	if err := check.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read version after failure: %v", err)
+	}
+	if version != 4 {
+		t.Errorf("version after failed migration = %d, want 4", version)
+	}
+	columns, err := check.QueryContext(ctx, "PRAGMA table_info(threads)")
+	if err != nil {
+		t.Fatalf("read threads columns: %v", err)
+	}
+	hasSurface := false
+	for columns.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var defaultValue sql.NullString
+		if err := columns.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan threads column: %v", err)
+		}
+		hasSurface = hasSurface || name == "surface"
+	}
+	if err := columns.Err(); err != nil {
+		t.Fatalf("iterate threads columns: %v", err)
+	}
+	if err := columns.Close(); err != nil {
+		t.Fatalf("close columns: %v", err)
+	}
+	if hasSurface {
+		t.Error("failed v5 migration left the first ALTER TABLE behind")
+	}
+	if _, err := check.ExecContext(ctx, "DROP TABLE session_tool_bindings"); err != nil {
+		t.Fatalf("remove the conflicting table: %v", err)
+	}
+	if err := check.Close(); err != nil {
+		t.Fatalf("close retry connection: %v", err)
+	}
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("retry after correcting the conflict: %v", err)
+	}
+	defer s.Close()
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read retry version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Errorf("version after retry = %d, want %d", version, schemaVersion)
+	}
+}
+
 func TestMigratesOnlyOnce(t *testing.T) {
 	ctx := context.Background()
 	path := writeV1Database(t)

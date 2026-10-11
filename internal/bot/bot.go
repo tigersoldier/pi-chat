@@ -11,11 +11,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tigersoldier/pi-chat/internal/chattools"
 	"github.com/tigersoldier/pi-chat/internal/config"
 	"github.com/tigersoldier/pi-chat/internal/store"
 	"github.com/tigersoldier/pi-chat/internal/workspace"
@@ -201,6 +203,8 @@ func (b *Bot) HandleAction(ctx context.Context, a Action) {
 	switch a.ActionID {
 	case ActionResume:
 		go b.resumeSession(ctx, a)
+	case ActionResumeRetired:
+		go b.resumeRetiredSession(ctx, a)
 	case ActionStop:
 		b.stopTurn(ctx, a)
 	case ActionDelete:
@@ -499,6 +503,7 @@ func newRow(key string, t Thread) store.ThreadRow {
 		WorkspaceID: t.Workspace,
 		ChannelID:   t.Channel,
 		ThreadTS:    t.ThreadTS,
+		Surface:     t.SurfaceName(),
 		State:       store.StateCold,
 		CreatedAt:   now,
 		LastActive:  now,
@@ -672,15 +677,17 @@ func (b *Bot) refuse(ctx context.Context, userID, channel string, thread *Thread
 }
 
 // piArgs is the argument list a new session starts with: the user's own
-// gateway.pi_args, --approve when approvals are automatic, the project's
-// injected prompt, and the instruction that explains how a Slack thread reads
-// (DESIGN.md §4).
+// gateway.pi_args, --approve when approvals are automatic, the opt-in pi-chat
+// extension, the project's injected prompt, and the thread instruction.
 func (b *Bot) piArgs(project workspace.Project) []string {
 	args := slices.Clone(b.cfg.Gateway.PiArgs)
 	// The setting is what makes the policy explicit; pi_args stays the place
 	// for everything else, and a hand-written --approve is not duplicated.
 	if b.cfg.Behavior.Approvals == "auto" && !slices.Contains(args, "--approve") {
 		args = append(args, "--approve")
+	}
+	if b.cfg.ChatTools.Enabled {
+		args = chattools.AppendExtension(args, b.cfg.ChatTools.ExtensionPath)
 	}
 	args = append(args, b.work.PiArgs(project)...)
 	return appendSystemPrompt(args, instructionText)
@@ -720,7 +727,43 @@ func (b *Bot) SweepWorkspaces(ctx context.Context) ([]string, error) {
 	for _, dir := range retired {
 		keep[dir] = true
 	}
+	// The gateway can own a project directory even when a create reply was lost
+	// before pi-chat committed a session path. Never sweep a directory that any
+	// catalog session is still using; if the catalog is unavailable, skip GC.
+	sessions, err := b.gw.Sessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the gateway catalog before workspace sweep: %w", err)
+	}
+	root := filepath.Clean(b.cfg.Paths.ProjectsRoot)
+	for _, session := range sessions {
+		projectDir := b.projectForCwd(session.Cwd)
+		if projectDir == root && session.Cwd != "" {
+			return nil, nil // a process using the projects root may touch any project below it
+		}
+		if projectDir != "" {
+			keep[projectDir] = true
+		}
+	}
 	return b.work.Sweep(ctx, keep)
+}
+
+// projectForCwd returns the projects_root child containing a session cwd. A
+// worktree cwd is nested under its owning project, so keeping only the cwd
+// itself would still let startup GC remove the parent.
+func (b *Bot) projectForCwd(cwd string) string {
+	root := filepath.Clean(b.cfg.Paths.ProjectsRoot)
+	if root == "." || cwd == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(root, filepath.Clean(cwd))
+	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	if rel == "." {
+		return root
+	}
+	first := strings.Split(rel, string(filepath.Separator))[0]
+	return filepath.Join(root, first)
 }
 
 // noticeNewDMSession tells the user that this message starts a session of its

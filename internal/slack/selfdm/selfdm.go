@@ -140,10 +140,17 @@ func New(ctx context.Context, api *slack.API, st State, cfg Config, log *slog.Lo
 	if me.UserID == "" || me.TeamID == "" {
 		return nil, errors.New("self-DM: auth.test named no user or workspace")
 	}
+	conversation, err := api.ConversationInfo(ctx, cfg.Channel)
+	if err != nil {
+		return nil, fmt.Errorf("self-DM: verify the configured conversation: %w", err)
+	}
+	if conversation.ID != cfg.Channel || !conversation.IsIM || conversation.UserID != me.UserID {
+		return nil, errors.New("self-DM: the configured conversation must be the authenticated account's own direct message")
+	}
 
-	// One read of the conversation, for three things at once: that the token may
-	// read it, that the channel is the one configured, and where "now" is on a
-	// first run.
+	// One history read proves the token can read the verified conversation and
+	// supplies the position from which a first run starts without replaying old
+	// messages.
 	page, err := api.History(ctx, cfg.Channel, "", "", 1)
 	if err != nil {
 		return nil, fmt.Errorf("self-DM: cannot read channel %s: %w", cfg.Channel, err)
@@ -153,7 +160,7 @@ func New(ctx context.Context, api *slack.API, st State, cfg Config, log *slog.Lo
 		state: st,
 		log:   log,
 		cfg:   cfg,
-		id:    slack.Identity{TeamID: me.TeamID, UserID: me.UserID},
+		id:    slack.Identity{TeamID: me.TeamID, UserID: me.UserID, URL: me.URL},
 	}
 	if len(page.Messages) > 0 {
 		s.newest = page.Messages[0].TS
@@ -169,6 +176,12 @@ func (s *Surface) Platform() bot.Platform { return s.plat }
 // daemon checks it against the allowlist, because a self-DM whose owner is not
 // allowed would refuse every message.
 func (s *Surface) Identity() slack.Identity { return s.id }
+
+// NewChatToolProvider exposes this surface's own authenticated, bounded Slack
+// reader without exposing its token or API client to the daemon's core.
+func (s *Surface) NewChatToolProvider(allowedChannels []string, maxMessages, maxResultBytes int) (*slack.ChatToolProvider, error) {
+	return slack.NewChatToolProvider(s.api, bot.SurfaceSelfDM, s.id.TeamID, s.id.URL, allowedChannels, maxMessages, maxResultBytes)
+}
 
 // Run polls until the context ends, routing what it reads into the core.
 // Failures are retried with a growing wait and are not fatal to the process:
@@ -252,7 +265,7 @@ func (s *Surface) poll(ctx context.Context, cursor *string) error {
 func (s *Surface) fetch(ctx context.Context, cursor string) ([]slack.Message, error) {
 	var got []slack.Message
 	latest := ""
-	for page := 0; page < historyPagesPerPoll; page++ {
+	for range historyPagesPerPoll {
 		p, err := s.api.History(ctx, s.cfg.Channel, cursor, latest, 0)
 		if err != nil {
 			return nil, err

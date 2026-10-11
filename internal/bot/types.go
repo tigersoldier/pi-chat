@@ -13,25 +13,53 @@ import (
 // (DESIGN.md §12).
 const platformName = "slack"
 
+const (
+	SurfaceApp    = "app"
+	SurfaceSelfDM = "self_dm"
+)
+
 // Thread identifies one conversation. A session is always thread-scoped, so a
-// thread is also a session's identity (DESIGN.md §4, §7).
+// thread is also a session's identity (DESIGN.md §4, §7). Surface records which
+// installation and credential namespace owns its chat-tool binding and keeps
+// two adapters from sharing a key when both can address the same Slack DM.
 type Thread struct {
 	Workspace string // workspace (team) ID, e.g. T6K8Y3FRR
 	Channel   string // channel, private group, or DM ID
 	ThreadTS  string // timestamp of the thread's root message
+	Surface   string // app | self_dm; empty means the original app surface
+}
+
+// SurfaceName returns the explicit surface, preserving the original app
+// surface for old callers and persisted rows that omit it.
+func (t Thread) SurfaceName() string {
+	if t.Surface == "" {
+		return SurfaceApp
+	}
+	return t.Surface
 }
 
 // Key is the thread's stable identity, and the key pi-chat persists state
 // under.
 func (t Thread) Key() string {
-	return t.Workspace + ":" + t.Channel + ":" + t.ThreadTS
+	base := t.Workspace + ":" + t.Channel + ":" + t.ThreadTS
+	// App and channel keys keep their established format. A configured self-DM
+	// is a separate credential surface and may name the same D-channel as the
+	// app surface, so prefix only the newly introduced namespace.
+	if t.SurfaceName() == SurfaceSelfDM {
+		return SurfaceSelfDM + ":" + base
+	}
+	return base
 }
 
 // SessionName is the deterministic pi session name for the thread
 // (DESIGN.md §4): the same thread always maps to the same session, so a lost
 // database can be rebuilt by scanning the catalog.
 func (t Thread) SessionName() string {
-	return platformName + "-" + slugName(t.Workspace) + "-" + slugName(t.Channel) + "-" + slugName(t.ThreadTS)
+	prefix := platformName
+	if t.SurfaceName() == SurfaceSelfDM {
+		prefix += "-selfdm"
+	}
+	return prefix + "-" + slugName(t.Workspace) + "-" + slugName(t.Channel) + "-" + slugName(t.ThreadTS)
 }
 
 // slugName reduces a platform identifier to the alphabet session names are
@@ -292,6 +320,11 @@ type Button struct {
 
 // Platform is the adapter half of the core/adapter split: it turns core
 // intents into one chat platform's API calls (DESIGN.md §12).
+type SurfaceIdentifier interface {
+	// ChatSurface names the adapter surface used for new sessions and bindings.
+	ChatSurface() string
+}
+
 type Platform interface {
 	// StartTurn builds a renderer for a reply to m. It must not have a side
 	// effect on the platform: the core calls Start on the first turn.

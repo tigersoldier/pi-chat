@@ -59,6 +59,9 @@ func TestLoadAppliesDefaultsForMissingKeys(t *testing.T) {
 	if len(cfg.Slack.Access.AllowedUsers) != 1 {
 		t.Errorf("allowed_users = %v, want one entry", cfg.Slack.Access.AllowedUsers)
 	}
+	if cfg.ChatTools.Enabled || cfg.ChatTools.MaxMessages != DefaultChatToolsMessages || cfg.ChatTools.MaxResultBytes != DefaultChatToolsBytes {
+		t.Errorf("chat_tools defaults = %+v, want disabled with bounded defaults", cfg.ChatTools)
+	}
 	if cfg.Path() != path {
 		t.Errorf("Path() = %q, want %q", cfg.Path(), path)
 	}
@@ -97,6 +100,38 @@ func TestLoadOverridesDefaultsAndExpandsHome(t *testing.T) {
 	// Untouched keys keep their defaults, including the ones that carry "~".
 	if cfg.Gateway.AdminTokenFile == "" || strings.HasPrefix(cfg.Gateway.AdminTokenFile, "~") {
 		t.Errorf("admin_token_file = %q, want an expanded absolute path", cfg.Gateway.AdminTokenFile)
+	}
+}
+
+func TestChatToolsConfigIsExpandedAndBounded(t *testing.T) {
+	dir := home(t)
+	path := writeConfig(t, strings.Join([]string{
+		"[chat_tools]",
+		"enabled = true",
+		"extension_path = \"~/share/pi-chat/chat-tools.ts\"",
+		"socket_path = \"~/state/pi-chat/tools.sock\"",
+		"timeout_seconds = 20",
+		"max_messages = 12",
+		"max_result_bytes = 8192",
+		"",
+	}, "\n"))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ChatTools.Enabled || cfg.ChatTools.ExtensionPath != filepath.Join(dir, "share/pi-chat/chat-tools.ts") ||
+		cfg.ChatTools.SocketPath != filepath.Join(dir, "state/pi-chat/tools.sock") || cfg.ChatTools.TimeoutSeconds != 20 ||
+		cfg.ChatTools.MaxMessages != 12 || cfg.ChatTools.MaxResultBytes != 8192 {
+		t.Errorf("chat_tools = %+v", cfg.ChatTools)
+	}
+}
+
+func TestChatToolsExtensionCannotOverwriteSecretsOrState(t *testing.T) {
+	home(t)
+	path := writeConfig(t, "[chat_tools]\nenabled = true\nextension_path = \"~/.config/pi-chat/slack-bot-token\"\n")
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "slack.bot_token_file") {
+		t.Fatalf("Load() error = %v, want extension/token-path collision", err)
 	}
 }
 
@@ -144,6 +179,10 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"unknown log format", "[log]\nformat = \"yaml\"\n", "log.format"},
 		{"relative path", "[paths]\nrepos_root = \"code\"\n", "absolute"},
 		{"empty gateway dir", "[gateway]\nstate_dir = \"\"\n", "state_dir"},
+		{"relative chat tools socket", "[chat_tools]\nenabled = true\nsocket_path = \"run/tools.sock\"\n", "absolute"},
+		{"too many chat messages", "[chat_tools]\nmax_messages = 51\n", "max_messages"},
+		{"too large chat result", "[chat_tools]\nmax_result_bytes = 16385\n", "max_result_bytes"},
+		{"chat tools timeout too short", "[chat_tools]\ntimeout_seconds = 0\n", "timeout_seconds"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
