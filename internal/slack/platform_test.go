@@ -225,13 +225,46 @@ func TestCompleteRequestReactsToOriginalMessage(t *testing.T) {
 		t.Fatalf("CompleteRequest: %v", err)
 	}
 	calls := stub.recorded()
-	if len(calls) != 1 || calls[0].method != "reactions.add" {
-		t.Fatalf("calls = %+v, want one reactions.add", calls)
+	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[1].method != "reactions.add" {
+		t.Fatalf("calls = %+v, want reactions.remove eyes followed by reactions.add checkmark", calls)
 	}
-	params := calls[0].params
-	if params["channel"] != message.Thread.Channel || params["timestamp"] != message.TS || params["name"] != "white_check_mark" {
-		t.Errorf("reactions.add params = %+v, want channel=%q timestamp=%q name=white_check_mark",
-			params, message.Thread.Channel, message.TS)
+	for i, want := range []string{"eyes", "white_check_mark"} {
+		params := calls[i].params
+		if params["channel"] != message.Thread.Channel || params["timestamp"] != message.TS || params["name"] != want {
+			t.Errorf("%s params = %+v, want channel=%q timestamp=%q name=%q",
+				calls[i].method, params, message.Thread.Channel, message.TS, want)
+		}
+	}
+}
+
+func TestCompleteRequestAddsCheckWhenEyesAreAlreadyAbsent(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"reactions.remove": "no_reaction"}}
+	platform := newTestPlatform(t, stub, "patch")
+	message := testMessage()
+	message.TS = "1700000000.000200"
+
+	if err := platform.CompleteRequest(context.Background(), message); err != nil {
+		t.Fatalf("CompleteRequest without an eyes reaction: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[1].method != "reactions.add" || calls[1].params["name"] != "white_check_mark" {
+		t.Fatalf("calls = %+v, want missing eyes tolerated before adding checkmark", calls)
+	}
+}
+
+func TestCompleteRequestDoesNotAddCheckWhenEyesCannotBeRemoved(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"reactions.remove": "missing_scope"}}
+	platform := newTestPlatform(t, stub, "patch")
+	message := testMessage()
+	message.TS = "1700000000.000200"
+
+	err := platform.CompleteRequest(context.Background(), message)
+	if !IsCode(err, "missing_scope") {
+		t.Fatalf("CompleteRequest error = %v, want missing_scope", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "reactions.remove" {
+		t.Fatalf("calls = %+v, want no checkmark unless eyes were removed", calls)
 	}
 }
 

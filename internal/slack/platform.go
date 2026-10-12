@@ -183,8 +183,11 @@ func (p *Platform) AcknowledgeRequest(ctx context.Context, m bot.Message, allowe
 	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, reaction)
 }
 
-// CompleteRequest marks the original message after its turn succeeds.
+// CompleteRequest replaces the in-progress eyes reaction with a check mark.
 func (p *Platform) CompleteRequest(ctx context.Context, m bot.Message) error {
+	if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, "eyes"); err != nil && !IsCode(err, "no_reaction") {
+		return fmt.Errorf("remove the in-progress reaction: %w", err)
+	}
 	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, "white_check_mark")
 }
 

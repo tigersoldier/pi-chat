@@ -56,7 +56,7 @@ oauth_config:
       - users:read          # names beside a message, not just the ID
       - assistant:write     # agent app support; legacy methods
       - files:read          # download images from agent requests and threads
-      - reactions:write     # 👀 on accepted requests; ✅ on success; 🤷 when denied
+      - reactions:write     # 👀 on accepted requests; replace with ✅ on success; 🤷 when denied
     # Only for the team self-DM mode, where a person's own token drives their
     # own "Notes to self" (docs/slack-user-token-setup.md). Not requested by the
     # app's install link, so a normal install does not ask anyone for these.
