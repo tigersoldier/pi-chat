@@ -338,11 +338,17 @@ bounded — see the observation section above).
   turns; what they carry forward is the sequence number the next save records.
 - **The cursor is saved on settle and on the sweep**, so a restart or an idle close
   resumes at the tail rather than replaying from the head.
-- **A process starts with no warm threads.** No thread is warm in a fresh process —
-  warm means a bound connection, and a new process holds none — so startup clears the
-  marker. Without it, a crash would leave rows claiming to be warm, and both `/pi status`
-  and the warm-session cap read that marker. The sweep also repairs the same lie for a
-  thread whose connection died while the process kept running.
+- **A process starts with no warm threads.** Warm means a bound connection, and a new
+  process holds none, so startup clears the old markers. A clean shutdown refreshes each
+  warm session's leaf, persists a unique notice marker, then sends a notice: an idle
+  session gets a prompt; a running session gets a non-preempting follow-up. The gateway
+  keeps the session alive after pi-chat exits. On startup, pi-chat finds that notice in
+  the entry stream and posts only its assistant reply, before any later user turn, back
+  into the same Slack thread. Successfully posted checkpoints are marked before cleanup
+  so a cleanup failure does not repost. Sessions still running are retried during
+  maintenance; checkpoints expire after seven days. A crash may leave a warm marker but
+  cannot send a shutdown notice. The sweep also repairs a warm marker for a thread whose
+  connection died while the process kept running.
 - **Deleted:** the session file is gone; the thread row is marked `deleted` and keeps
   the key reserved so the next message starts fresh.
 

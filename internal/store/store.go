@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 6
+const schemaVersion = 8
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS retired (
 );
 
 CREATE INDEX IF NOT EXISTS retired_thread ON retired(thread_key);
+
+-- Sessions pi-chat notified during a clean shutdown, pending a response check.
+CREATE TABLE IF NOT EXISTS shutdown_pending (
+    thread_key       TEXT PRIMARY KEY,
+    session_path     TEXT NOT NULL,
+    leaf_id          TEXT NOT NULL DEFAULT '',
+    notice_id        TEXT NOT NULL DEFAULT '',
+    notice_entry_id  TEXT NOT NULL DEFAULT '',
+    posted           INTEGER NOT NULL DEFAULT 0 CHECK (posted IN (0, 1)),
+    created_at       INTEGER NOT NULL
+);
 
 -- A surface's own bookkeeping, for an adapter that has no threads to hang it on
 -- (see surface.go). Not chat-shaped, on purpose: it holds a cursor and a list of
@@ -201,6 +212,19 @@ var migrations = []struct {
 		`ALTER TABLE retired ADD COLUMN observed_ts TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE retired ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE retired ADD COLUMN leaf_id TEXT NOT NULL DEFAULT ''`,
+	}},
+	{to: 7, stmt: []string{
+		`CREATE TABLE IF NOT EXISTS shutdown_pending (
+            thread_key   TEXT PRIMARY KEY,
+            session_path TEXT NOT NULL,
+            leaf_id      TEXT NOT NULL DEFAULT '',
+            created_at   INTEGER NOT NULL
+        )`,
+	}},
+	{to: 8, stmt: []string{
+		`ALTER TABLE shutdown_pending ADD COLUMN notice_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE shutdown_pending ADD COLUMN notice_entry_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE shutdown_pending ADD COLUMN posted INTEGER NOT NULL DEFAULT 0 CHECK (posted IN (0, 1))`,
 	}},
 }
 
@@ -336,6 +360,8 @@ var versionStatements = map[int]string{
 	4: "PRAGMA user_version = 4",
 	5: "PRAGMA user_version = 5",
 	6: "PRAGMA user_version = 6",
+	7: "PRAGMA user_version = 7",
+	8: "PRAGMA user_version = 8",
 }
 
 // recordVersion stamps the schema version on the same executor as the schema
