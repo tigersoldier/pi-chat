@@ -2,11 +2,14 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tigersoldier/pi-gateway/gwclient"
 
 	"github.com/tigersoldier/pi-chat/internal/config"
 	"github.com/tigersoldier/pi-chat/internal/store"
@@ -22,6 +25,43 @@ func TestThreadIdentity(t *testing.T) {
 	// session instead of creating a second one.
 	if got, want := thread.SessionName(), "slack-t6k8y3frr-c0123abc-1721609600-123456"; got != want {
 		t.Fatalf("SessionName() = %q, want %q", got, want)
+	}
+	selfDM := thread
+	selfDM.Surface = SurfaceSelfDM
+	if selfDM.Key() == thread.Key() || selfDM.SessionName() == thread.SessionName() || selfDM.SurfaceName() != SurfaceSelfDM {
+		t.Fatalf("the app and self-DM identities collide: app=%+v self-DM=%+v", thread, selfDM)
+	}
+	if got, want := selfDM.Key(), "self_dm:"+thread.Key(); got != want {
+		t.Errorf("self-DM Key() = %q, want %q", got, want)
+	}
+	if !strings.HasPrefix(selfDM.SessionName(), "slack-selfdm-") {
+		t.Errorf("self-DM session name = %q, want a separate namespace", selfDM.SessionName())
+	}
+}
+
+func TestThreadForKeepsCredentialSurfacesSeparate(t *testing.T) {
+	b, _, st := newTestBot(t)
+	app := Thread{Workspace: "T1", Channel: "D1", ThreadTS: "1700000000.000100"}
+	selfDM := app
+	selfDM.Surface = SurfaceSelfDM
+	appThread, err := b.threadFor(app)
+	if err != nil {
+		t.Fatalf("app threadFor: %v", err)
+	}
+	selfDMThread, err := b.threadFor(selfDM)
+	if err != nil {
+		t.Fatalf("self-DM threadFor: %v", err)
+	}
+	if appThread.key == selfDMThread.key {
+		t.Fatal("app and self-DM surfaces registered one thread agent")
+	}
+	appThread.update(func(row *store.ThreadRow) { row.SessionPath = "/sessions/app.jsonl" })
+	selfDMThread.update(func(row *store.ThreadRow) { row.SessionPath = "/sessions/selfdm.jsonl" })
+	for key, want := range map[string]string{app.Key(): "/sessions/app.jsonl", selfDM.Key(): "/sessions/selfdm.jsonl"} {
+		row, found, err := st.Thread(context.Background(), key)
+		if err != nil || !found || row.SessionPath != want {
+			t.Errorf("thread %q = path %q found=%v err=%v, want %q", key, row.SessionPath, found, err, want)
+		}
 	}
 }
 
@@ -234,7 +274,7 @@ func TestHandleMessageGuardsNearMisses(t *testing.T) {
 }
 
 func TestHandleMessageDoesNotGuardRealPrompts(t *testing.T) {
-	// "delete the old branch" is a prompt, not a mis-typed `/delete`. The guard
+	// "delete the old branch" is a prompt, not a mistyped `/delete`. The guard
 	// only covers a message that is exactly a command name.
 	b, platform, _ := newTestBot(t)
 
@@ -339,6 +379,43 @@ func TestSweepWorkspacesKeepsWhatThreadsOwn(t *testing.T) {
 	}
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Errorf("the orphan survived: %v", err)
+	}
+}
+
+func TestSweepWorkspacesKeepsAnUntrackedGatewaySessionDirectory(t *testing.T) {
+	b, _, _ := newTestBot(t)
+	project := filepath.Join(b.cfg.Paths.ProjectsRoot, "2026-01-04-live-session")
+	cwd := filepath.Join(project, "repos", "checkout")
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatalf("make the session directory: %v", err)
+	}
+	b.gw = &fakeGateway{rows: []gwclient.SessionRow{{Path: "/sessions/orphan.jsonl", Cwd: cwd}}}
+
+	removed, err := b.SweepWorkspaces(context.Background())
+	if err != nil {
+		t.Fatalf("SweepWorkspaces: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("swept a gateway-owned directory: %v", removed)
+	}
+	if _, err := os.Stat(project); err != nil {
+		t.Errorf("the active session's project directory was removed: %v", err)
+	}
+}
+
+func TestSweepWorkspacesSkipsDeletionWhenGatewayCatalogIsUnavailable(t *testing.T) {
+	b, _, _ := newTestBot(t)
+	project := filepath.Join(b.cfg.Paths.ProjectsRoot, "2026-01-04-catalog-down")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatalf("make the project directory: %v", err)
+	}
+	b.gw = &fakeGateway{err: errors.New("gateway unavailable")}
+
+	if _, err := b.SweepWorkspaces(context.Background()); err == nil {
+		t.Fatal("SweepWorkspaces succeeded without checking the gateway catalog")
+	}
+	if _, err := os.Stat(project); err != nil {
+		t.Errorf("catalog failure did not fail safe: %v", err)
 	}
 }
 

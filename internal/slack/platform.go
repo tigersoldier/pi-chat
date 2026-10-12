@@ -32,6 +32,7 @@ type Identity struct {
 	TeamID string
 	UserID string
 	BotID  string
+	URL    string // workspace URL returned by auth.test
 }
 
 // Platform renders turns and posts notices with Slack's Web API.
@@ -64,6 +65,9 @@ type Platform struct {
 func NewPlatform(api *API, cfg *config.Config, id Identity, log *slog.Logger) *Platform {
 	return &Platform{api: api, cfg: cfg, log: log, id: id, labels: newLabeler(api, log)}
 }
+
+// ChatSurface identifies the installed-app credential surface.
+func (p *Platform) ChatSurface() string { return bot.SurfaceApp }
 
 // Conversation reads a thread back: what was said in it, in order, so the core
 // can put the conversation in front of the next prompt (DESIGN.md §4).

@@ -59,6 +59,8 @@ type choice struct {
 	at        time.Time
 }
 
+func (p *Platform) ChatSurface() string { return bot.SurfaceSelfDM }
+
 func newPlatform(api *slack.API, st State, id slack.Identity, cfg Config, log *slog.Logger) *Platform {
 	return &Platform{
 		api:     api,

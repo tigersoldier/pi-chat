@@ -69,6 +69,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if err != nil {
 		return err
 	}
+	sessionPath := th.snapshot().SessionPath
 	if err := r.Start(ctx); err != nil {
 		return fmt.Errorf("start the reply: %w", err)
 	}
@@ -150,6 +151,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		prompt = instruction + "\n\n" + prompt
 	}
 	if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
+		if st.sessionDeleted() {
+			th.forgetSessionForPath(ctx, sessionPath)
+			return fmt.Errorf("%w: it was deleted outside pi-chat", errSessionGone)
+		}
 		return fmt.Errorf("prompt: %w", err)
 	}
 	// The prompt is where those messages went, so this is the first moment the
@@ -163,6 +168,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		return err
 	}
 	if err := client.AwaitSettled(ctx); err != nil {
+		if st.sessionDeleted() {
+			th.forgetSessionForPath(ctx, sessionPath)
+			return fmt.Errorf("%w: it was deleted outside pi-chat", errSessionGone)
+		}
 		return fmt.Errorf("wait for the turn: %w", err)
 	}
 
@@ -170,7 +179,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// got, so reopening the thread resumes here instead of replaying it. A
 	// deleted session has nothing left to resume, so it is handled first.
 	if st.sessionDeleted() {
-		th.forgetSession()
+		th.forgetSessionForPath(ctx, sessionPath)
 		return fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
 	}
 	th.saveCursorAfterActivity(ctx, client)
@@ -205,9 +214,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	th.turnMu.Lock()
 	defer th.finishTurn(st)
+	sessionPath := th.snapshot().SessionPath
 	defer func() {
 		if st.sessionDeleted() {
-			th.forgetSession()
+			th.forgetSessionForPath(context.Background(), sessionPath)
 		}
 	}()
 
@@ -713,6 +723,30 @@ func (th *thread) onEvent(ev gwclient.Event) {
 // onEventWithClient also hands the connection to an observed-turn renderer so
 // it can stop waiting if the gateway connection dies.
 func (th *thread) onEventWithClient(ev gwclient.Event, client *gwclient.Client, epoch uint64) {
+	th.onSessionEventWithClient("", ev, client, epoch)
+}
+
+// onSessionEvent ignores frames from a connection whose session identity is no
+// longer the thread's. A late deletion revokes only the old path's binding; it
+// must not complete a turn or clear the successor's row.
+func (th *thread) onSessionEvent(sessionPath string, ev gwclient.Event) {
+	th.onSessionEventWithClient(sessionPath, ev, nil, th.sessionEpoch.Load())
+}
+
+// onSessionEventWithClient keeps both the session identity and connection
+// generation attached to each callback, while passing the client to any
+// observed-turn renderer started from that callback.
+func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event, client *gwclient.Client, epoch uint64) {
+	if sessionPath != "" && th.snapshot().SessionPath != sessionPath {
+		if ev.Type == "gw_session_state" {
+			if state, err := ev.SessionState(); err == nil && state.State == protocol.SessionStateDeleted {
+				go th.revokeDeletedSessionBinding(context.Background(), sessionPath)
+			}
+		}
+		th.log.Debug("ignoring an event from a session this thread no longer owns",
+			"type", ev.Type, "session", sessionPath)
+		return
+	}
 	if epoch != th.sessionEpoch.Load() || th.sessionChanging.Load() {
 		return
 	}
@@ -760,6 +794,23 @@ func (th *thread) onEventWithClient(ev gwclient.Event, client *gwclient.Client, 
 	}
 	if epoch != th.sessionEpoch.Load() || th.sessionChanging.Load() {
 		return
+	}
+	cur = th.cur.Load()
+	if ev.Type == "gw_session_state" {
+		if state, err := ev.SessionState(); err == nil && state.State == protocol.SessionStateDeleted {
+			if cur != nil {
+				// Deletion belongs to the thread even before its next prompt. Keep
+				// it on the turn for the turn path to persist after the read loop
+				// has returned; the gateway callback must not write the store.
+				cur.deleted.Store(true)
+				cur.markDone()
+				return
+			}
+			// An idle connection still owns a durable binding. Revoke it away
+			// from the gateway read goroutine, which must never block on I/O.
+			go th.forgetSessionForPath(context.Background(), sessionPath)
+			return
+		}
 	}
 	if cur == nil {
 		// Text and lifecycle events alone do not establish an unsolicited

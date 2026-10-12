@@ -48,29 +48,42 @@ Non-goals are listed in §14.
                                                                └──────────────────────────┘
 ```
 
-Everything is **outbound**: one WSS to Slack (Socket Mode), loopback TCP to the
-gateway, plus the Slack Web API. No listening socket, no tunnel, no public URL, no
-certificate. `pi-gatewayd` is a prerequisite, not a component of this repository.
+When read-only chat tools are enabled, a Pi extension sends HTTP over the private UDS
+to `internal/chattools`; the broker selects the Slack provider from the session's durable
+binding. This path carries neither Slack credentials nor platform-selected arguments.
 
-### Two planes
+All **network** traffic is outbound: Slack Socket Mode, the Slack Web API, and
+loopback TCP to the gateway. There is no network listener, tunnel, public URL or
+certificate. When the opt-in read-only chat tools are enabled, pi-chatd also opens a
+private Unix-domain socket used only by Pi extensions; it is local IPC, not a network
+endpoint. `pi-gatewayd` is a prerequisite, not a component of this repository.
+
+### Planes
 
 | Plane | Transport | Purpose |
 |---|---|---|
 | **Chat plane** | Slack Socket Mode + Web API | events in, messages out |
 | **Session plane** | `gwclient` over loopback TCP | sessions, prompts, events |
+| **Tool plane** | private Unix-domain socket (opt-in) | Pi extension → bound platform provider |
 
 The core is platform-independent; the Slack adapter owns everything that knows
 Slack's shapes (§12).
 
 ---
 
-## 3. Upstream contract (pi-gateway v0.1.2)
+## 3. Upstream contract (pi-gateway v0.1.4+)
 
-Dependency: `github.com/tigersoldier/pi-gateway` at **v0.1.2+**, importing the exported
-`gwclient`, `protocol` and `config` packages. Single local deployment; single
-`pi-gatewayd`.
+Dependency: `github.com/tigersoldier/pi-gateway` at the current worktree's
+`v0.1.4-0.20261011164612-b545c9e1d3c7`, importing the exported `gwclient`, `protocol`
+and `config` packages. Single local deployment; single `pi-gatewayd`.
 
-What this design relies on, all verified present in v0.1.2:
+The chat-tools path relies on `gw_welcome.features` advertising durable
+`spawn_config`; pi-chat checks it before starting the broker. The gateway accepts
+`--extension` in session spawn args and persists it through hibernation/restart. Before a
+new session's first prompt, pi-chat checks the catalog's recorded `spawn.extension` path
+and the live extension health marker. No gateway-specific tool RPC was added.
+
+What the core relies on, verified in the gateway contract:
 
 | Need | API |
 |---|---|
@@ -234,10 +247,12 @@ and puts it in front of the request.
 - Preserve file identities and names on inbound messages and thread replies, including
   Slack's `file_share` subtype. Images in the trigger and in retained conversation lines
   travel as pi's native `images` prompt content, not private URLs the model cannot open.
-- The optional platform `ImageReader` resolves each file through `files.info` and downloads
-  `url_private_download` (or `url_private`) with the bot token. Only HTTPS Slack file hosts
-  are allowed, including redirects; pi-chat does not log or save tokens, private URLs or
-  image bytes. pi retains native image prompts in its session history as usual.
+- The optional platform `ImageReader` receives the thread's channel so a multiplexer can
+  route the read to its owning surface. The Slack app reader resolves each file through
+  `files.info` and downloads `url_private_download` (or `url_private`) with the bot token.
+  Only HTTPS Slack file hosts are allowed, including redirects; pi-chat does not log or save
+  tokens, private URLs or image bytes. pi retains native image prompts in its session history
+  as usual.
   The install needs `files:read`, already declared in both manifests.
 - Trigger images have priority, then the newest retained conversation images; deduplicate
   by file identity. Bound a turn to four images, 5 MiB per image and 10 MiB total before
@@ -299,12 +314,12 @@ rather than once per turn.
   while the session file, its working directory and its pi process are left alone, because
   "new session" means a clean slate rather than "throw my work away" (that is `/delete`,
   with its confirmation button). The retired session is recorded (see `retired` in §7) so
-  the startup sweep keeps its directory, and it stays adoptable through `/pi resume`. A
-  following `<text>` becomes the new session's first prompt; without one, the next message
-  here is. A turn already running in the thread is refused rather than waited for.
+  the startup sweep keeps its directory, and it stays resumable in the same thread through
+  `@pi /resume`. A following `<text>` becomes the new session's first prompt; without one,
+  the next message here is. A turn already running in the thread is refused rather than waited for.
 - **A thread's later sessions get a generation suffix** (`slack-<ws>-<ch>-<ts>-2`): one
   thread can now have more than one session, and two of them under one name would leave the
-  catalog ambiguous — for `/pi resume`, and for anyone reading it. The suffix is the number
+  catalog ambiguous — for `@pi /resume`, and for anyone reading it. The suffix is the number
   of retired sessions, so a rebuilt database lands on the same names.
 
 **Still open from the same interview:** how a message that arrives *while* a turn is
@@ -372,7 +387,7 @@ commands inside message threads** and its slash-command payload carries no `thre
 | Context | Form | Examples |
 |---|---|---|
 | Channel root, DM root | `/pi <command>` | `/pi status`, `/pi resume`, `/pi help` |
-| Channel thread, DM thread | `@pi /<command>` | `@pi /status`, `@pi /skill:grill-me`, `@pi /compact` |
+| Channel thread, DM thread | `@pi /<command>` | `@pi /status`, `@pi /resume`, `@pi /skill:grill-me` |
 | Channel root | `@pi <text>` | `@pi fix the failing test` (starts a thread + session) |
 | Channel thread | `@pi <text>`, or plain text in a thread the bot is already in | continue the session |
 | DM thread | plain `<text>` | no mention needed |
@@ -381,9 +396,9 @@ commands inside message threads** and its slash-command payload carries no `thre
 
 1. **Root commands are session-less only.** Legal: `/pi help`, `/pi status` (bot status:
    gateway reachable, warm sessions, cap, this channel's threads), `/pi resume` (list
-   resumable sessions; picking one opens a thread and binds it). Anything else answers
-   with an ephemeral hint pointing at the thread form. A root invocation never creates
-   or touches a session as a side effect.
+   outside sessions; picking one opens a thread and binds it). In a thread, `@pi /resume`
+   lists sessions retired from that thread and restores one there. A root invocation never
+   creates or touches a session as a side effect.
 2. **Resolution order:** bot control command → agent command → prompt. Agent commands
    are the ones pi reports through `GetCommands()` (extensions, prompt templates,
    skills); they are **not** validated against that list before being forwarded, so
@@ -432,8 +447,9 @@ What reaches a session, and what does not:
 | `/pi help`, `@pi /help` | root / thread | usage + current thread state |
 | `/pi status` | root | bot status |
 | `@pi /status` | thread | session id, cwd, model, warm/cold, queue, last activity |
-| `/pi resume` | root | list adoptable sessions; pick with buttons |
-| `@pi /new [<text>]` | thread | retire this thread's session and start a fresh one; `<text>`, when given, is its first prompt. The old session stays in `/pi resume` |
+| `/pi resume` | root | list outside sessions to adopt; pick with buttons |
+| `@pi /resume` | thread | list this thread's retired sessions and restore one here |
+| `@pi /new [<text>]` | thread | retire this thread's session and start a fresh one; `<text>`, when given, is its first prompt. The old session stays resumable with `@pi /resume` |
 | `@pi /abort` | thread | `Abort`; queued prompts survive by design |
 | `@pi /delete` | thread | confirm → `DeleteSession` → worktree/branch cleanup → row deleted |
 | `@pi /model` | thread | `SetModel` / `GetAvailableModels` |
@@ -596,8 +612,8 @@ processes and the catalog; **this database owns everything chat-side** — upstr
 `createdBy`/tags are in-memory and vanish on a daemon restart.
 
 ```sql
-threads(thread_key PK,            -- workspace:channel:thread_ts
-        workspace_id, channel_id, thread_ts,
+threads(thread_key PK,            -- app: workspace:channel:thread_ts; self_dm: namespaced
+        workspace_id, channel_id, thread_ts, surface,
         session_name, session_path, session_id, cwd, project_dir,
         state,                    -- warm | cold | deleted
         last_seq, leaf_id,        -- replay cursor (persist on settle and periodically)
@@ -609,14 +625,18 @@ seen(event_id PK, received_at)    -- inbound dedupe (TTL sweep); see the rule be
 pending_ui(dialog_id PK, thread_key, message_ts, created_at)
 admissions(id PK, thread_key, text, event_id, queued_at)
 retired(session_path PK,          -- a session /new replaced, kept resumable
-        thread_key, session_name, project_dir, retired_at)
+        thread_key, session_name, project_dir, observed_ts, last_seq, leaf_id, retired_at)
+session_tool_bindings(session_path PK, -- separate read-tool authority
+        provider, surface, workspace_id, channel_id, thread_ts,
+        capabilities, extension_version, state, created_at)
 ```
 
 Rules:
 
-- **No conversation content is stored** — no transcripts, no assistant text, no tool
-  output. `admissions` holds text only until dispatch. (This is what the privacy note
-  will claim, and it must stay true.)
+- **No conversation content is stored in SQLite** — no transcripts, assistant text or
+  tool output. `admissions` holds text only until dispatch. Chat-tool bindings store only
+  session/origin identity, capabilities and extension version. Pi's normal session file
+  remains the record of tool results.
 - **The one exception is deliberate and bounded**: when a prompt had to drop or shorten
   part of a conversation, the whole of it is written to
   `<state dir>/threads/<session name>/observed-<ts>.md` and the prompt names the file.
@@ -641,10 +661,11 @@ Rules:
   writes a new message. The column is there so the recovery path is a change of
   policy rather than a migration.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
-- **Phase 1 writes `threads` and `seen`.** `pending_ui` and `admissions` are created with
-  the rest of the schema — one artifact, one migration — and are written from phase 2,
-  when there are dialogs and a queue to put in them. The database carries a schema
-  version and refuses to open one written by a newer pi-chat.
+- **The current schema writes `threads`, `seen`, and optional session-tool bindings.** A
+  new tool-enabled session commits its thread row and binding in one transaction before
+  the first prompt. `pending_ui` and `admissions` are created with the rest of the schema
+  and are written when dialogs and queueing are enabled. The database carries a schema
+  version (currently 6) and refuses to open one written by a newer pi-chat.
 - **Schema changes are migrations**, not a new schema: `init` migrates a database whose
   `user_version` is behind, stamping each step's version only after its statements
   succeed, so a failure is retried on the next start rather than half-applied. A fresh
@@ -657,7 +678,12 @@ Rules:
   turn cannot make the bot read the same messages twice.
 - **`retired` is what `/new` keeps alive** (§4): a session it replaced still exists, so its
   working directory is somebody's work rather than litter, and the sweep has to be able to
-  tell the two apart. It is also where the next session's generation number comes from.
+  tell the two apart. Its observation and replay cursors let the same thread restore the
+  session without losing where it left off; it is also where the next session's generation
+  number comes from.
+- **Tool bindings outlive retirement and daemon restarts** so the originating thread can
+  resume them. Delete or definitive gateway deletion revokes the binding; reusing a live
+  session from a different origin requires explicit confirmation.
 
 ---
 
@@ -727,12 +753,12 @@ Cleanup:
   the agent made, a worktree on somebody else's branch, or a file the agent wrote outside
   `repos/` is reported as left behind, and a directory that is not empty is never
   removed. Deleting the wrong repository is worse than a directory outliving its session.
-- **Startup GC:** for each directory under `projects_root` with **no** `threads` row and
-  no `retired` record: remove its worktrees, prune its branch, delete the directory.
-  Orphans only — a cold thread with a live row is never touched, and neither is the
-  directory of a session `/new` replaced, because `/pi resume` (and the work in its
-  worktree) must still be there. Only names that look like pi-chat's own
-  (`<YYYY-MM-DD>-<slug>`) are considered at all.
+- **Startup GC:** for each directory under `projects_root` with **no** `threads` row,
+  `retired` record or gateway session cwd: remove its worktrees, prune its branch, delete
+  the directory. Orphans only — a cold thread with a live row is never touched, and neither
+  is the directory of a session `/new` replaced, because `@pi /resume` (and the work in its
+  worktree) must still be there. If the gateway catalog is unavailable, GC does nothing.
+  Only names that look like pi-chat's own (`<YYYY-MM-DD>-<slug>`) are considered at all.
 - Sessions adopted from outside the bot have no project dir, live outside `projects_root`,
   and are therefore structurally out of the GC's reach — as well as out of `/delete`'s.
 
@@ -746,7 +772,9 @@ on the machine and, through the admin token, destroy sessions.
 - `slack.access.allowed_users` (Slack member IDs) is required and enforced **before any
   side effect** — no dial, no project dir, no session. The check uses the *event's* user,
   so edits and bot-authored messages cannot slip through.
-- `slack.access.allowed_channels` is optional; empty means any channel the bot is in.
+- `slack.access.allowed_channels` is optional; for the app surface, empty means any
+  channel the bot is in. Chat-tool reads also rely on the bound credential's actual API
+  scopes and membership; when configured, this channel allowlist restricts both surfaces.
 - **The allowlist lives under the platform's own section**, because the identity models
   differ: Slack has member and channel IDs, Google Chat would have email addresses and
   space names. Each adapter owns its access rules; the core enforces “default deny” and
@@ -770,6 +798,13 @@ The admin connection must be **short-lived, and never reused for creation**:
 so a pooled creator connection would remain an attached client of every session it
 ever created — pinning them warm and making them unevictable (§8). Dial, create,
 close; the loopback dial costs nothing.
+
+Opt-in read-only chat tools keep Slack credentials and API calls inside pi-chat. The Pi
+extension has only a private owner-only Unix socket; every call resolves the exact
+canonical session path to an active durable binding, which selects the provider, surface,
+workspace and capabilities. `allowed_channels` is enforced again for reads. No model
+argument can select credentials or broaden scope, and the broker exposes no search or
+write operation.
 
 Mint with `pi-gatewayd --provision-token`; rotate via `tokens.json` + SIGHUP.
 
@@ -853,7 +888,12 @@ terminal).
 **Slack adapter:** Socket Mode envelopes + ack, `event_id` dedupe, thread key and sender
 extraction, allowlist input, mention stripping, rendering and chunking, streaming vs
 fallback, interactive components and modals, file download → `protocol.ImageContent`,
-slash-command registration.
+slash-command registration, and strict read-only Slack tool calls.
+
+**Tool broker (`internal/chattools`):** local UDS, canonical session-path lookup,
+capability/version checks, rate and size limits, cancellation, and sanitized errors. It
+never receives credentials from the extension and dispatches only to the provider chosen
+by the durable store binding.
 
 **One message, one delivery.** Slack reports a mention twice — as `app_mention` and as
 the `message` event for the same `ts` — so which delivery answers is decided by where the
@@ -1023,8 +1063,8 @@ drive the adapter without a workspace.
 
 | # | Decision | Why |
 |---|---|---|
-| 1 | Built on `pi-gateway` as a `gwclient` consumer (v0.1.2+) | The daemon owns sessions, queue, replay, hibernation; reimplementing that was the old design's largest cost. Upstream explicitly scopes the Slack bot to a separate repo. |
-| 2 | Slack ingress: Socket Mode, wired directly (no transport interface) | Keeps the service fully outbound — no endpoint, tunnel or cert; slash commands and interactivity work. The platform seam below it is where reuse actually matters. |
+| 1 | Built on `pi-gateway` as a `gwclient` consumer (current pin: v0.1.4 pseudo-version) | The daemon owns sessions, queue, replay, hibernation and durable spawn configuration; reimplementing that was the old design's largest cost. Upstream explicitly scopes the Slack bot to a separate repo. |
+| 2 | Slack ingress: Socket Mode, wired directly (no transport interface) | Keeps the network surface outbound-only — no network endpoint, tunnel or cert; the opt-in private Unix socket is separate local tool IPC. Slash commands and interactivity still work. The platform seam below it is where reuse actually matters. |
 | 3 | Keep the worktree-per-session convention; `/delete` cleans up; startup GC sweeps orphans only | Worktrees are what allow concurrent threads per repo without touching the user's checkout; GC covers crashes, and cold-but-known threads stay resumable. |
 | 4 | Request the upstream stop-rebind fix; keep attach-before-prompt as an invariant | The defect silently forks a second session after a stop; the invariant is defence in depth either way. |
 | 5 | Rename to `pi-chat`, Google Chat named as a deferred adapter, gchat spike code deleted | The name is the scope statement; the module path has no external importers, so the rename is free. The gchat transport code does not survive the gateway rewrite. |

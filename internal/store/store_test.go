@@ -27,6 +27,7 @@ func sampleThread() ThreadRow {
 		WorkspaceID: "T1",
 		ChannelID:   "C1",
 		ThreadTS:    "1700000000.000100",
+		Surface:     "app",
 		SessionName: "slack-t1-c1-1700000000-000100",
 		SessionPath: "/sessions/a.jsonl",
 		SessionID:   "abc",

@@ -37,6 +37,11 @@ func (r *Router) Handle(ctx context.Context, m slack.Message) {
 	if m.User == "" {
 		return
 	}
+	if m.User != r.id.UserID {
+		r.log.Warn("ignoring a message in the configured self-DM that was not authored by its owner",
+			"channel", r.channel, "user", m.User)
+		return
+	}
 	posted, err := r.state.SurfacePosted(ctx, SurfaceName, m.TS)
 	if err != nil {
 		r.log.Warn("cannot read the self-DM posted ledger; treating the message as input",
@@ -72,7 +77,7 @@ func (r *Router) Handle(ctx context.Context, m slack.Message) {
 		return
 	}
 
-	thread := &bot.Thread{Workspace: r.id.TeamID, Channel: r.channel, ThreadTS: threadTS}
+	thread := &bot.Thread{Workspace: r.id.TeamID, Channel: r.channel, ThreadTS: threadTS, Surface: bot.SurfaceSelfDM}
 	files := make([]bot.Attachment, 0, len(m.Files))
 	for _, file := range m.Files {
 		name := file.Name

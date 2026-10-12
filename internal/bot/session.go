@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/tigersoldier/pi-gateway/gwclient"
 	"github.com/tigersoldier/pi-gateway/protocol"
 
+	"github.com/tigersoldier/pi-chat/internal/chattools"
 	"github.com/tigersoldier/pi-chat/internal/store"
 	"github.com/tigersoldier/pi-chat/internal/workspace"
 )
@@ -28,6 +30,7 @@ const (
 	sessionCreateTimeout = 30 * time.Second
 	cursorTimeout        = 5 * time.Second
 	storeTimeout         = 5 * time.Second
+	createAttemptTag     = "pi-chat-create-attempt"
 )
 
 // thread is one chat thread's agent: a connection bound to the session that
@@ -210,15 +213,24 @@ func isGone(err error) bool {
 
 // forgetSession records that the thread's session is gone and releases the
 // connection that was bound to it.
-func (th *thread) forgetSession() {
+func (th *thread) forgetSession(ctx context.Context) {
+	th.forgetSessionForPath(ctx, "")
+}
+
+func (th *thread) forgetSessionForPath(ctx context.Context, expectedPath string) {
 	th.connMu.Lock()
+	if expectedPath != "" && th.snapshot().SessionPath != expectedPath {
+		th.connMu.Unlock()
+		th.revokeDeletedSessionBinding(ctx, expectedPath)
+		return // an idle deletion callback arrived after this thread moved on
+	}
 	client := th.client
 	th.client = nil
 	th.connMu.Unlock()
 	if client != nil {
 		_ = client.Close()
 	}
-	th.forgetSessionLocked()
+	th.forgetSessionLocked(ctx, expectedPath)
 }
 
 // forgetSessionLocked records that the session is gone. The caller holds connMu
@@ -228,15 +240,38 @@ func (th *thread) forgetSession() {
 // file is what was deleted, and anything the agent wrote is still on disk — but
 // the thread stops owning a session, so the next message starts a fresh one
 // deliberately instead of re-attaching a tombstone.
-func (th *thread) forgetSessionLocked() {
-	th.sessionEpoch.Add(1)
+func (th *thread) forgetSessionLocked(ctx context.Context, expectedPath string) {
+	path := th.snapshot().SessionPath
+	if expectedPath != "" && path != expectedPath {
+		th.revokeDeletedSessionBinding(ctx, expectedPath)
+		return
+	}
+	if path != "" {
+		th.revokeDeletedSessionBinding(ctx, path)
+	}
+	changed := false
 	th.update(func(row *store.ThreadRow) {
+		if expectedPath != "" && row.SessionPath != expectedPath {
+			return
+		}
+		changed = true
 		row.State = store.StateDeleted
 		row.SessionName, row.SessionPath, row.SessionID = "", "", ""
 		row.LastSeq, row.LeafID, row.ProgressTS = 0, "", ""
 	})
-	th.forgetAssistant()
-	th.log.Warn("the session was deleted outside pi-chat", "thread", th.key)
+	if changed {
+		th.sessionEpoch.Add(1)
+		th.forgetAssistant()
+		th.log.Warn("the session was deleted outside pi-chat", "thread", th.key)
+	}
+}
+
+func (th *thread) revokeDeletedSessionBinding(ctx context.Context, path string) {
+	storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
+	defer cancel()
+	if err := th.b.store.RevokeSessionToolBinding(storeCtx, path); err != nil {
+		th.log.Error("cannot revoke the deleted session's chat-tools binding", "path", path, "error", err)
+	}
 }
 
 // ensure returns a connection bound to the thread's session, creating the
@@ -281,10 +316,20 @@ func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, 
 	if _, err := client.SwitchSession(ctx, path); err != nil {
 		_ = client.Close()
 		if isGone(err) {
-			th.forgetSessionLocked()
+			th.forgetSessionLocked(ctx, path)
 			return nil, fmt.Errorf("%w: %s", errSessionGone, path)
 		}
 		return nil, fmt.Errorf("bind session %s: %w", path, err)
+	}
+	if th.b.cfg.ChatTools.Enabled {
+		if err := th.verifyActiveChatTools(ctx, client, path); err != nil {
+			_ = client.Close()
+			if isGone(err) {
+				th.forgetSessionLocked(ctx, path)
+				return nil, fmt.Errorf("%w: %s", errSessionGone, path)
+			}
+			return nil, err
+		}
 	}
 	th.client = client
 	th.update(func(row *store.ThreadRow) { row.State = store.StateWarm })
@@ -302,6 +347,14 @@ func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, 
 // that silently never evicts (DESIGN.md §8, §10). Dial, create, close.
 func (th *thread) create(ctx context.Context, prompt string) error {
 	th.forgetAssistant()
+	if row := th.snapshot(); row.State == store.StateCold && row.SessionPath == "" && row.ProjectDir != "" {
+		if err := th.reconcilePendingCreate(ctx, row.ProjectDir); err != nil {
+			return err
+		}
+		if th.snapshot().SessionPath != "" {
+			return nil // a prior ambiguous create reached the gateway after its reply was lost
+		}
+	}
 	project, err := th.b.work.Provision(prompt)
 	if err != nil {
 		return err
@@ -336,28 +389,283 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 		return fmt.Errorf("open the admin connection: %w", err)
 	}
 	defer admin.Close()
+	gatewaySessionCreated := false
+	defer func() {
+		if !gatewaySessionCreated || created {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCreateTimeout)
+		defer cleanupCancel()
+		if _, err := admin.DeleteSession(cleanupCtx, "", false); err != nil && !isGone(err) {
+			created = true
+			// Leave a pending owner rather than granting tools based only on a
+			// live health marker. The next attempt re-reads the tagged catalog row,
+			// verifies its durable spawn record and extension, then commits it.
+			th.keepPendingProject(project.Dir)
+			th.log.Warn("cannot remove a session whose creation did not complete; preserving its project directory", "error", err)
+		}
+	}()
 
 	ref, err := admin.NewSession(ctx, gwclient.NewSessionRequest{
 		Name:   th.sessionName(ctx),
 		Cwd:    project.Dir,
 		PiArgs: piArgs,
-		Tags:   map[string]string{"platform": platformName, "thread": th.key},
+		Tags:   map[string]string{"platform": platformName, "thread": th.key, createAttemptTag: project.Dir},
 	})
 	if err != nil {
+		// A connection can learn that it was rebound before a transport error
+		// makes the command result ambiguous. If so, the deferred cleanup still
+		// deletes that bound session. Otherwise use the creation tag to reconcile
+		// the catalog; never remove a directory a possibly-live pi may still use.
+		gatewaySessionCreated = admin.Session() != nil
+		if !gatewaySessionCreated {
+			var response *gwclient.ResponseError
+			if !errors.As(err, &response) {
+				created = true // a timed-out request may still be using this directory
+				th.reconcileAmbiguousCreate(ctx, project.Dir)
+			}
+		}
 		return fmt.Errorf("create the session: %w", err)
 	}
+	gatewaySessionCreated = true
 	if ref == nil || ref.Path == "" {
 		return errors.New("the daemon created a session without a path")
 	}
-	th.update(func(row *store.ThreadRow) {
-		row.SessionName, row.SessionPath, row.SessionID = ref.Name, ref.Path, ref.ID
-		row.Cwd, row.ProjectDir = project.Dir, project.Dir
-	})
+	if th.b.cfg.ChatTools.Enabled {
+		if err := th.verifyRecordedChatToolsSpawn(ctx, ref.Path); err != nil {
+			return err
+		}
+		if err := verifyChatToolsExtension(ctx, admin, chattools.ExtensionVersion); err != nil {
+			return err
+		}
+	}
+	if err := th.recordCreatedSession(ctx, ref.Name, ref.Path, ref.ID, project.Dir, project.Dir); err != nil {
+		return fmt.Errorf("record new session and chat-tools binding: %w", err)
+	}
 	th.log.Info("created session",
 		"session", ref.Name, "path", ref.Path,
 		"cwd", project.Dir, "project", project.Name(), "pi_args", piArgs)
 	created = true
 	return nil
+}
+
+// reconcilePendingCreate checks a project directory preserved after an
+// ambiguous new-session response. The gateway's creation tag identifies the
+// session while the daemon is running; exact name and cwd also recover it after
+// a gateway restart drops in-memory creator tags.
+func (th *thread) reconcilePendingCreate(ctx context.Context, attemptDir string) error {
+	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+	defer cancel()
+	rows, err := th.b.gw.Sessions(ctx)
+	if err != nil {
+		return fmt.Errorf("reconcile the previous session creation: %w", err)
+	}
+	expectedName := th.sessionName(ctx)
+	var found *gwclient.SessionRow
+	for i := range rows {
+		if !isCreateAttemptSession(rows[i], attemptDir, expectedName) {
+			continue
+		}
+		if rows[i].Path == "" {
+			return errors.New("the gateway catalog found an incomplete session from the previous create attempt")
+		}
+		if found != nil && found.Path != rows[i].Path {
+			return errors.New("the gateway catalog found multiple sessions from the previous create attempt")
+		}
+		found = &rows[i]
+	}
+	if found != nil {
+		if th.b.cfg.ChatTools.Enabled {
+			if err := verifyChatToolsSpawnRecord(rows, found.Path, th.b.cfg.ChatTools.ExtensionPath); err != nil {
+				return fmt.Errorf("verify the previous session's durable chat-tools configuration: %w", err)
+			}
+			if err := th.verifyRecoveredChatTools(ctx, found.Path); err != nil {
+				return fmt.Errorf("verify the previous session's chat-tools extension: %w", err)
+			}
+		}
+		if err := th.recordCreatedSession(ctx, found.Name, found.Path, found.ID, found.Cwd, attemptDir); err != nil {
+			return fmt.Errorf("record the session from the previous create attempt: %w", err)
+		}
+		return nil
+	}
+	th.update(func(row *store.ThreadRow) {
+		row.Cwd, row.ProjectDir = "", ""
+	})
+	return nil
+}
+
+// reconcileAmbiguousCreate records a matching gateway session as this thread's
+// current session. If the catalog cannot prove the outcome, it stores the
+// directory on the thread row so startup GC cannot delete a path a late Pi may
+// still be using; the next create retries the catalog reconciliation first.
+func (th *thread) reconcileAmbiguousCreate(ctx context.Context, attemptDir string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCreateTimeout)
+	defer cancel()
+	if err := th.reconcilePendingCreate(cleanupCtx, attemptDir); err != nil {
+		th.keepPendingProject(attemptDir)
+		th.log.Warn("cannot reconcile an ambiguous session creation; preserving its project directory", "error", err)
+		return
+	}
+	if th.snapshot().SessionPath == "" {
+		th.keepPendingProject(attemptDir)
+		th.log.Warn("the catalog cannot yet prove whether an ambiguous session creation succeeded; preserving its project directory",
+			"attempt", attemptDir)
+	}
+}
+
+// keepPendingProject leaves a durable owner for a directory until the gateway
+// catalog can resolve an ambiguous create attempt.
+func (th *thread) keepPendingProject(projectDir string) {
+	th.update(func(row *store.ThreadRow) {
+		if row.SessionPath == "" {
+			row.Cwd, row.ProjectDir = projectDir, projectDir
+		}
+	})
+}
+
+func isCreateAttemptSession(row gwclient.SessionRow, attemptDir, expectedName string) bool {
+	if row.CreatedBy != nil {
+		if row.CreatedBy.Kind != kind {
+			return false
+		}
+		if tag := row.CreatedBy.Tags[createAttemptTag]; tag != "" {
+			return tag == attemptDir
+		}
+	}
+	return row.Name == expectedName && row.Cwd == attemptDir
+}
+
+func (th *thread) verifyRecordedChatToolsSpawn(ctx context.Context, sessionPath string) error {
+	rows, err := th.b.gw.Sessions(ctx)
+	if err != nil {
+		return fmt.Errorf("read the gateway catalog: %w", err)
+	}
+	return verifyChatToolsSpawnRecord(rows, sessionPath, th.b.cfg.ChatTools.ExtensionPath)
+}
+
+func verifyChatToolsSpawnRecord(rows []gwclient.SessionRow, sessionPath, extensionPath string) error {
+	if sessionPath == "" || extensionPath == "" {
+		return errors.New("the session path and extension path must be set")
+	}
+	for _, row := range rows {
+		if row.Path != sessionPath {
+			continue
+		}
+		for _, path := range row.Spawn["extension"] {
+			if filepath.Clean(path) == filepath.Clean(extensionPath) {
+				return nil
+			}
+		}
+		return errors.New("the gateway catalog does not record the pi-chat extension for this session")
+	}
+	return errors.New("the gateway catalog does not contain the new session")
+}
+
+// verifyRecoveredChatTools checks both halves of a pending create before it is
+// made durable as an active thread binding. SwitchSession applies the gateway's
+// recorded spawn configuration if the Pi process had to restart.
+func (th *thread) verifyRecoveredChatTools(ctx context.Context, sessionPath string) error {
+	client, err := gwclient.Dial(ctx, gwclient.Config{
+		StateDir:  th.b.cfg.Gateway.StateDir,
+		TokenFile: th.b.cfg.Gateway.ThreadTokenFile,
+		Name:      "pi-chat verify chat-tools",
+		Kind:      kind,
+	})
+	if err != nil {
+		return fmt.Errorf("open a verification connection: %w", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			th.log.Warn("cannot close chat-tools verification connection", "error", err)
+		}
+	}()
+	if _, err := client.SwitchSession(ctx, sessionPath); err != nil {
+		return fmt.Errorf("attach to the recovered session: %w", err)
+	}
+	return verifyChatToolsExtension(ctx, client, chattools.ExtensionVersion)
+}
+
+// recordCreatedSession commits a new or reconciled session and its optional
+// tool binding as one durable owner record.
+func (th *thread) recordCreatedSession(ctx context.Context, name, path, id, cwd, projectDir string) error {
+	if path == "" {
+		return errors.New("cannot record a session without a gateway path")
+	}
+	if name == "" {
+		name = th.sessionName(ctx)
+	}
+	if cwd == "" {
+		cwd = projectDir
+	}
+	row := th.snapshot()
+	row.SessionName, row.SessionPath, row.SessionID = name, path, id
+	row.Cwd, row.ProjectDir = cwd, projectDir
+	row.State = store.StateCold
+	row.Surface = th.t.SurfaceName()
+	if th.b.cfg.ChatTools.Enabled {
+		binding := store.SessionToolBinding{
+			SessionPath:      path,
+			Provider:         "slack",
+			Surface:          th.t.SurfaceName(),
+			WorkspaceID:      th.t.Workspace,
+			ChannelID:        th.t.Channel,
+			ThreadTS:         th.t.ThreadTS,
+			Capabilities:     []string{"read_thread", "read_message", "read_user"},
+			ExtensionVersion: chattools.ExtensionVersion,
+			State:            store.ToolBindingActive,
+			CreatedAt:        time.Now(),
+		}
+		storeCtx, storeCancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
+		defer storeCancel()
+		if err := th.b.store.PutThreadWithToolBinding(storeCtx, row, binding, false); err != nil {
+			return err
+		}
+		th.rowMu.Lock()
+		th.row = row
+		th.rowMu.Unlock()
+		return nil
+	}
+	th.update(func(current *store.ThreadRow) { *current = row })
+	return nil
+}
+
+func (th *thread) verifyActiveChatTools(ctx context.Context, client *gwclient.Client, sessionPath string) error {
+	binding, found, err := th.b.store.SessionToolBinding(ctx, sessionPath)
+	if err != nil {
+		return fmt.Errorf("verify the session's chat-tools binding: %w", err)
+	}
+	if !found || binding.State != store.ToolBindingActive {
+		return nil // adopted or revoked sessions remain usable without chat tools
+	}
+	if binding.Provider != "slack" || binding.Surface != th.t.SurfaceName() ||
+		binding.WorkspaceID != th.t.Workspace || binding.ChannelID != th.t.Channel || binding.ThreadTS != th.t.ThreadTS {
+		return errors.New("the session's chat-tools binding belongs to a different Slack thread or surface")
+	}
+	return verifyChatToolsExtension(ctx, client, binding.ExtensionVersion)
+}
+
+func verifyChatToolsExtension(ctx context.Context, client *gwclient.Client, version string) error {
+	commands, err := client.GetCommands(ctx)
+	if err != nil {
+		return fmt.Errorf("verify the chat-tools extension in the session: %w", err)
+	}
+	if !chatToolsExtensionLoaded(commands, version) {
+		return errors.New("the pi-chat chat-tools extension is not loaded in the session; refusing to send a prompt")
+	}
+	return nil
+}
+
+func chatToolsExtensionLoaded(commands []gwclient.Command, version string) bool {
+	if version != chattools.ExtensionVersion {
+		return false
+	}
+	for _, command := range commands {
+		if command.Name == chattools.HealthCommand && command.Source == "extension" &&
+			command.Description == "pi-chat-tools:"+version {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionName is the name a new session gets: the thread's deterministic name,
@@ -398,17 +706,6 @@ func (th *thread) retire(ctx context.Context) (bool, error) {
 	if row.SessionPath == "" {
 		return false, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
-	defer cancel()
-	if err := th.b.store.RetireSession(ctx, store.RetiredSession{
-		SessionPath: row.SessionPath,
-		ThreadKey:   th.key,
-		SessionName: row.SessionName,
-		ProjectDir:  row.ProjectDir,
-		RetiredAt:   time.Now(),
-	}); err != nil {
-		return false, err
-	}
 
 	// Let go of the connection: the thread must not stay attached to a session it
 	// no longer owns, and closing saves the cursor, so resuming the old session
@@ -421,6 +718,22 @@ func (th *thread) retire(ctx context.Context) (bool, error) {
 	if client != nil {
 		th.saveCursor(ctx, client)
 		_ = client.Close()
+	}
+	row = th.snapshot() // saveCursor may have advanced the replay cursor
+
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
+	defer cancel()
+	if err := th.b.store.RetireSession(ctx, store.RetiredSession{
+		SessionPath: row.SessionPath,
+		ThreadKey:   th.key,
+		SessionName: row.SessionName,
+		ProjectDir:  row.ProjectDir,
+		ObservedTS:  row.ObservedTS,
+		LastSeq:     row.LastSeq,
+		LeafID:      row.LeafID,
+		RetiredAt:   time.Now(),
+	}); err != nil {
+		return false, err
 	}
 
 	th.forgetAssistant()
@@ -490,6 +803,13 @@ func (th *thread) destroy(ctx context.Context) (deleteReport, error) {
 		default:
 			return report, fmt.Errorf("delete the session: %w", err)
 		}
+		// Revoke only after the gateway confirms the session is gone. A refused
+		// delete leaves the live session and its binding usable. If persistence
+		// fails after deletion, still clear the row: the session cannot issue
+		// tools any more, and a repeated delete can retry the revocation.
+		if err := th.b.store.RevokeSessionToolBinding(ctx, row.SessionPath); err != nil {
+			th.log.Error("cannot revoke the deleted session's chat-tools binding", "path", row.SessionPath, "error", err)
+		}
 	}
 
 	if row.ProjectDir != "" {
@@ -519,6 +839,8 @@ func (th *thread) destroy(ctx context.Context) (deleteReport, error) {
 //
 // The caller holds connMu.
 func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
+	row := th.snapshot()
+	sessionPath := row.SessionPath
 	var eventClient atomic.Pointer[gwclient.Client]
 	epoch := th.sessionEpoch.Load()
 	cfg := gwclient.Config{
@@ -528,14 +850,12 @@ func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
 		Kind:      kind,
 		Tags:      map[string]string{"platform": platformName, "thread": th.key},
 		OnEvent: func(ev gwclient.Event) {
-			th.onEventWithClient(ev, eventClient.Load(), epoch)
+			th.onSessionEventWithClient(sessionPath, ev, eventClient.Load(), epoch)
 		},
 	}
-	// The hello is unbound; ensure attaches the session with SwitchSession
-	// afterward. That switch starts a live stream, so no historical replay is
-	// delivered to this callback. Keep the cursor for gwclient's live sequence
-	// tracking, but render only turns observed after the bind.
-	row := th.snapshot()
+	// A previously driven thread resumes from its cursor for live sequence
+	// tracking. Frames outside an observed turn are discarded, and SwitchSession
+	// starts a live stream without promising replay of the cold interval.
 	if row.LastSeq > 0 || row.LeafID != "" {
 		cfg.Resume = &protocol.Resume{SinceSeq: row.LastSeq, LeafEntryID: row.LeafID}
 	} else {

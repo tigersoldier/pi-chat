@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tigersoldier/pi-gateway/protocol"
+
 	"github.com/tigersoldier/pi-chat/internal/config"
 )
 
@@ -25,6 +27,15 @@ func TestDisableOrFail(t *testing.T) {
 	}
 	if err := disableOrFail(true, log, stale); err != nil {
 		t.Errorf("with another surface up, disableOrFail = %v, want nil (the daemon keeps serving)", err)
+	}
+}
+
+func TestHasSpawnConfigFeature(t *testing.T) {
+	if hasSpawnConfigFeature([]string{"session_replay", "spawn_config_additive"}) {
+		t.Fatal("additive reload support was confused with durable spawn configuration")
+	}
+	if !hasSpawnConfigFeature([]string{protocol.FeatureSpawnConfig}) {
+		t.Fatal("durable spawn_config was not recognized")
 	}
 }
 

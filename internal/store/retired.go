@@ -21,6 +21,9 @@ type RetiredSession struct {
 	ThreadKey   string
 	SessionName string
 	ProjectDir  string // the directory pi-chat owns, "" when there is none
+	ObservedTS  string // the thread's observation watermark for this session
+	LastSeq     uint64 // gateway event cursor for this session
+	LeafID      string
 	RetiredAt   time.Time
 }
 
@@ -36,17 +39,111 @@ func (s *Store) RetireSession(ctx context.Context, r RetiredSession) error {
 		r.RetiredAt = time.Now()
 	}
 	_, err := s.db.ExecContext(ctx, `
-        INSERT INTO retired (session_path, thread_key, session_name, project_dir, retired_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO retired (session_path, thread_key, session_name, project_dir,
+                             observed_ts, last_seq, leaf_id, retired_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_path) DO UPDATE SET
             thread_key   = excluded.thread_key,
             session_name = excluded.session_name,
-            project_dir  = excluded.project_dir`,
-		r.SessionPath, r.ThreadKey, r.SessionName, r.ProjectDir, r.RetiredAt.Unix())
+            project_dir  = excluded.project_dir,
+            observed_ts  = excluded.observed_ts,
+            last_seq     = excluded.last_seq,
+            leaf_id      = excluded.leaf_id`,
+		r.SessionPath, r.ThreadKey, r.SessionName, r.ProjectDir, r.ObservedTS, r.LastSeq, r.LeafID, r.RetiredAt.Unix())
 	if err != nil {
 		return fmt.Errorf("store: retire session %s: %w", r.SessionPath, err)
 	}
 	return nil
+}
+
+// RetiredSessions lists resumable sessions. An empty threadKey lists every
+// retired session; root-level adoption uses that to keep them out of other
+// threads' pickers.
+func (s *Store) RetiredSessions(ctx context.Context, threadKey string) ([]RetiredSession, error) {
+	query := `SELECT session_path, thread_key, session_name, project_dir,
+                     observed_ts, last_seq, leaf_id, retired_at FROM retired`
+	var args []any
+	if threadKey != "" {
+		query += ` WHERE thread_key = ?`
+		args = append(args, threadKey)
+	}
+	query += ` ORDER BY retired_at DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list retired sessions: %w", err)
+	}
+	defer rows.Close()
+	var out []RetiredSession
+	for rows.Next() {
+		var retired RetiredSession
+		var retiredAt int64
+		if err := rows.Scan(&retired.SessionPath, &retired.ThreadKey, &retired.SessionName,
+			&retired.ProjectDir, &retired.ObservedTS, &retired.LastSeq, &retired.LeafID, &retiredAt); err != nil {
+			return nil, fmt.Errorf("store: read a retired session: %w", err)
+		}
+		retired.RetiredAt = time.Unix(retiredAt, 0)
+		out = append(out, retired)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list retired sessions: %w", err)
+	}
+	return out, nil
+}
+
+// RestoreRetiredSession atomically moves one session from the retired set back
+// onto its original thread. It refuses to overwrite a newer session or to move
+// a path to a different thread.
+func (s *Store) RestoreRetiredSession(ctx context.Context, threadKey, sessionPath, sessionID, cwd string) (ThreadRow, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ThreadRow{}, false, fmt.Errorf("store: begin restoring a retired session: %w", err)
+	}
+	defer tx.Rollback()
+
+	var retired RetiredSession
+	err = tx.QueryRowContext(ctx, `SELECT thread_key, session_name, project_dir, observed_ts,
+                                         last_seq, leaf_id FROM retired WHERE session_path = ?`,
+		sessionPath).Scan(&retired.ThreadKey, &retired.SessionName, &retired.ProjectDir,
+		&retired.ObservedTS, &retired.LastSeq, &retired.LeafID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && retired.ThreadKey != threadKey) {
+		return ThreadRow{}, false, nil
+	}
+	if err != nil {
+		return ThreadRow{}, false, fmt.Errorf("store: read retired session %s: %w", sessionPath, err)
+	}
+	row, err := scanThread(tx.QueryRowContext(ctx, selectThread+` WHERE thread_key = ?`, threadKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ThreadRow{}, false, nil
+	}
+	if err != nil {
+		return ThreadRow{}, false, fmt.Errorf("store: read thread %s to restore session: %w", threadKey, err)
+	}
+	if row.SessionPath != "" {
+		return ThreadRow{}, false, nil
+	}
+	row.SessionName, row.SessionPath, row.SessionID = retired.SessionName, sessionPath, sessionID
+	row.Cwd, row.ProjectDir = cwd, retired.ProjectDir
+	row.State = StateCold
+	row.LastSeq, row.LeafID = retired.LastSeq, retired.LeafID
+	row.ProgressTS = ""
+	row.ObservedTS = retired.ObservedTS
+	if err := putThread(ctx, tx, row); err != nil {
+		return ThreadRow{}, false, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM retired WHERE session_path = ? AND thread_key = ?`, sessionPath, threadKey)
+	if err != nil {
+		return ThreadRow{}, false, fmt.Errorf("store: remove restored session from retired list: %w", err)
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		if err != nil {
+			return ThreadRow{}, false, fmt.Errorf("store: confirm restored session removal: %w", err)
+		}
+		return ThreadRow{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return ThreadRow{}, false, fmt.Errorf("store: commit restored session: %w", err)
+	}
+	return row, true, nil
 }
 
 // RetiredCount reports how many sessions this thread has retired, which is what

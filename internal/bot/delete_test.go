@@ -12,6 +12,7 @@ import (
 	"github.com/tigersoldier/pi-gateway/gwclient"
 	"github.com/tigersoldier/pi-gateway/protocol"
 
+	"github.com/tigersoldier/pi-chat/internal/chattools"
 	"github.com/tigersoldier/pi-chat/internal/store"
 )
 
@@ -28,6 +29,17 @@ func lifecycleFor(t *testing.T, b *Bot) *fakeLifecycle {
 
 // deletePress is the Delete button's payload, as the adapter delivers it: the
 // thread the message was in, and the session path the confirmation named.
+func seedToolBinding(t *testing.T, st *store.Store, row store.ThreadRow) {
+	t.Helper()
+	if err := st.BindSessionToolBinding(context.Background(), store.SessionToolBinding{
+		SessionPath: row.SessionPath, Provider: "slack", Surface: row.Surface,
+		WorkspaceID: row.WorkspaceID, ChannelID: row.ChannelID, ThreadTS: row.ThreadTS,
+		Capabilities: []string{"read_thread"}, ExtensionVersion: chattools.ExtensionVersion,
+	}, false); err != nil {
+		t.Fatalf("BindSessionToolBinding: %v", err)
+	}
+}
+
 func deletePress(value string) Action {
 	return Action{
 		EventID:   "Ev-delete-" + value,
@@ -88,6 +100,7 @@ func TestDeleteDeletesTheSessionAndItsWorktree(t *testing.T) {
 	life := lifecycleFor(t, b)
 	th := threadWithSession(t, b, st, "C1", "1700000000.000100")
 	row := th.snapshot()
+	seedToolBinding(t, st, row)
 	if row.ObservedTS == "" {
 		t.Fatal("the seeded thread has no watermark to test the clearing of")
 	}
@@ -117,6 +130,10 @@ func TestDeleteDeletesTheSessionAndItsWorktree(t *testing.T) {
 	}
 	if got.ObservedTS != "" {
 		t.Errorf("the row kept the deleted session's watermark: %q", got.ObservedTS)
+	}
+	binding, found, err := st.SessionToolBinding(context.Background(), row.SessionPath)
+	if err != nil || !found || binding.State != store.ToolBindingRevoked {
+		t.Errorf("successful delete binding = %+v, found=%v err=%v; want revoked", binding, found, err)
 	}
 
 	waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) >= 2 })
@@ -244,6 +261,7 @@ func TestDeleteReportsAFailureWithoutLosingTheSession(t *testing.T) {
 	life := lifecycleFor(t, b)
 	th := threadWithSession(t, b, st, "C1", "1700000000.000100")
 	row := th.snapshot()
+	seedToolBinding(t, st, row)
 	life.failDelete(errors.New("the daemon is not answering"))
 
 	b.HandleAction(context.Background(), deletePress(row.SessionPath))
@@ -258,6 +276,10 @@ func TestDeleteReportsAFailureWithoutLosingTheSession(t *testing.T) {
 	}
 	if got.State != store.StateCold || got.SessionPath != row.SessionPath {
 		t.Errorf("a failed delete changed the row: %#v", got)
+	}
+	binding, found, err := st.SessionToolBinding(context.Background(), row.SessionPath)
+	if err != nil || !found || binding.State != store.ToolBindingActive {
+		t.Errorf("failed delete binding = %+v, found=%v err=%v; want active", binding, found, err)
 	}
 	notices := platform.postedNotices()
 	if text := notices[len(notices)-1].Text; !strings.Contains(text, "Nothing was deleted") {

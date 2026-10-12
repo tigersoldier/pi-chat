@@ -121,6 +121,7 @@ func parseMessage(env Envelope, botUserID string) (bot.Message, bool) {
 			Workspace: callback.TeamID,
 			Channel:   event.Channel,
 			ThreadTS:  threadTS,
+			Surface:   bot.SurfaceApp,
 		},
 		UserID:    event.User,
 		Workspace: callback.TeamID,
@@ -231,6 +232,7 @@ func parseAction(env Envelope) (bot.Action, bool) {
 			Workspace: payload.Team.ID,
 			Channel:   payload.Channel.ID,
 			ThreadTS:  payload.Message.ThreadTS,
+			Surface:   bot.SurfaceApp,
 		}
 	}
 	return bot.Action{
@@ -328,6 +330,7 @@ func parseStopped(env Envelope) (bot.Action, bool) {
 		Workspace: callback.TeamID,
 		Channel:   callback.Event.Channel,
 		ThreadTS:  callback.Event.ThreadTS,
+		Surface:   bot.SurfaceApp,
 	}
 	return bot.Action{
 		EventID:   env.EnvelopeID,

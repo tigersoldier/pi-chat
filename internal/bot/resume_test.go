@@ -1,11 +1,15 @@
 package bot
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
+
+	"github.com/tigersoldier/pi-chat/internal/config"
+	"github.com/tigersoldier/pi-chat/internal/store"
 )
 
 func TestSessionLabelLeadsWithWhatTheSessionIsAbout(t *testing.T) {
@@ -107,6 +111,31 @@ func TestFirstSentenceSkipsTheWrapperASkillArrivesIn(t *testing.T) {
 		if got := firstSentence(tc.in); got != tc.want {
 			t.Errorf("firstSentence(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestResumeNoticeExplainsWhenChatToolsAreUnavailable(t *testing.T) {
+	b, _, st := newTestBotWith(t, func(cfg *config.Config) { cfg.ChatTools.Enabled = true })
+	defer st.Close()
+	ctx := context.Background()
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	row := gwclient.SessionRow{Name: "external-session", Path: "/sessions/external.jsonl", Cwd: "/home/pi/code/thing"}
+
+	notice := b.resumeNoticeForSession(ctx, thread, row, false)
+	if !strings.Contains(notice.Text, "Chat tools are not available") || !strings.Contains(notice.Text, "@pi /new") {
+		t.Fatalf("an adopted session without a binding was not explained: %q", notice.Text)
+	}
+
+	if err := st.BindSessionToolBinding(ctx, store.SessionToolBinding{
+		SessionPath: row.Path, Provider: "slack", Surface: SurfaceApp,
+		WorkspaceID: thread.Workspace, ChannelID: thread.Channel, ThreadTS: thread.ThreadTS,
+		Capabilities: []string{"read_thread"}, ExtensionVersion: "v1", State: store.ToolBindingActive,
+	}, false); err != nil {
+		t.Fatalf("bind the session for the active-binding case: %v", err)
+	}
+	active := b.resumeNoticeForSession(ctx, thread, row, false)
+	if strings.Contains(active.Text, "Chat tools are not available") {
+		t.Fatalf("an active session binding was reported unavailable: %q", active.Text)
 	}
 }
 

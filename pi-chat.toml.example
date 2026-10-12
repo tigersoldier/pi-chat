@@ -53,6 +53,18 @@ thread_token_file = "~/.config/pi-chat/gateway-thread.token" # operator + contro
 # you want a new pi process to start with belongs here.
 pi_args = []
 
+[chat_tools]
+# Opt-in read-only tools for the agent. pi-chat installs a versioned TypeScript
+# extension and serves it over a private Unix socket; Pi, pi-chatd and pi-gatewayd
+# must run on this host as the same OS user. Enabling this requires a gateway that
+# advertises durable spawn_config support.
+enabled          = false
+extension_path   = "~/.local/share/pi-chat/extensions/chat-tools.ts"
+socket_path      = "~/.local/state/pi-chat/chat-tools.sock"
+timeout_seconds  = 15
+max_messages     = 50
+max_result_bytes = 16384
+
 [paths]
 projects_root = "~/work"                                    # new sessions get a project dir
 repos_root    = "~/code"                                    # your git repositories
@@ -60,7 +72,7 @@ db_path       = "~/.local/state/pi-chat/pi-chat.db"
 
 [concurrency]
 max_warm_sessions         = 8     # bound connections, i.e. warm pi processes
-thread_idle_close_minutes = 10    # close a thread's connection after this long idle
+thread_idle_close_minutes = 60    # close a thread's connection after this long idle
 admission_wait_seconds    = 120   # how long a message may wait for a free slot
 eviction                  = "evict-then-queue"  # evict idle LRU → queue → refuse
 
