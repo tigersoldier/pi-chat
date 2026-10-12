@@ -315,14 +315,20 @@ bounded — see the observation section above).
 
 - **Warm:** the thread has a bound connection; the daemon holds a pi process.
 - **Cold:** the connection is closed after `thread_idle_close_minutes` of inactivity
-  (only when the turn is idle). The daemon hibernates the process later; the file
-  remains.
-- **Re-dial:** on the next message, dial with `Resume{Cursor}` — replay, or a snapshot
-  whose content is discarded (we render live turns, not history) while its watermark is
-  adopted. The replayed frames are dropped because nothing is being rendered between
-  turns; what they carry forward is the sequence number the next save records.
-- **The cursor is saved on settle and on the sweep**, so a restart or an idle close
-  resumes at the tail rather than replaying from the head.
+  (60 minutes by default, only when the turn is idle). The daemon hibernates the process
+  later; the file remains.
+- **Cold polling:** for up to one hour after the idle-close window, the bot checks up
+  to eight cold threads per maintenance sweep. It targets one-minute checks for the
+  first ten minutes, then five-minute checks for the remaining time. Each check
+  reattaches, reads entries after the saved leaf, and closes again if no new assistant
+  answer or running turn is found. A running or newly answered session stays warm and is
+  handled by the ordinary observed-turn renderer. This is generic to any session turn.
+- **Re-dial:** a user message dials unbound with `Resume{Cursor}`, then attaches with
+  `SwitchSession`. That switch starts a live stream; it does not replay the time the
+  thread was cold. Cold polling reads the durable session entries separately; the cursor
+  still tracks live event sequencing.
+- **The cursor is saved on settle, on the sweep, and after an empty cold poll.** While a
+  thread is cold, polling is the bounded fallback for turns that finish between attaches.
 - **A process starts with no warm threads.** No thread is warm in a fresh process —
   warm means a bound connection, and a new process holds none — so startup clears the
   marker. Without it, a crash would leave rows claiming to be warm, and both `/pi status`
@@ -815,7 +821,7 @@ db_path       = "~/.local/state/pi-chat/pi-chat.db"
 
 [concurrency]
 max_warm_sessions         = 8
-thread_idle_close_minutes = 10
+thread_idle_close_minutes = 60
 admission_wait_seconds    = 120
 eviction                  = "evict-then-queue"
 

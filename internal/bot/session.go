@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,11 +49,23 @@ type thread struct {
 	connMu sync.Mutex
 	client *gwclient.Client
 
+	// sessionEpoch invalidates callbacks from a connection after the thread
+	// retires or deletes the session it was attached to. sessionChanging gates
+	// new observed-turn reservations during those operations.
+	sessionEpoch    atomic.Uint64
+	sessionChanging atomic.Bool
+
 	// rowMu guards the durable row. It is a second, narrower lock than connMu
 	// on purpose: the row is written from the turn path, the idle sweep and
 	// the cursor saver, and those must not queue behind a dial.
 	rowMu sync.Mutex
 	row   store.ThreadRow
+
+	// assistantMu guards the last known assistant answer. An observed turn uses
+	// it as a baseline if idle-close drops the connection before it can query.
+	assistantMu    sync.Mutex
+	assistantHash  [32]byte
+	assistantKnown bool
 
 	// cur is the turn the connection's events belong to, if any. It is
 	// atomically swapped because the gateway's read goroutine reads it while
@@ -122,6 +135,40 @@ func (th *thread) live() *gwclient.Client {
 // status command reads before touching the client: see statusThread.
 func (th *thread) busy() bool { return th.cur.Load() != nil }
 
+// assistantBaseline returns a fixed-size fingerprint instead of retaining a
+// potentially large answer for every tracked thread.
+func (th *thread) assistantBaseline() ([32]byte, bool) {
+	th.assistantMu.Lock()
+	defer th.assistantMu.Unlock()
+	return th.assistantHash, th.assistantKnown
+}
+
+// rememberAssistant keeps only the fingerprint needed to distinguish a new
+// answer from the last one after reconnect.
+func (th *thread) rememberAssistant(text string) {
+	th.assistantMu.Lock()
+	th.assistantHash = sha256.Sum256([]byte(text))
+	th.assistantKnown = true
+	th.assistantMu.Unlock()
+}
+
+func (th *thread) forgetAssistant() {
+	th.assistantMu.Lock()
+	th.assistantHash = [32]byte{}
+	th.assistantKnown = false
+	th.assistantMu.Unlock()
+}
+
+// finishTurn releases a reservation after the renderer lifecycle has ended.
+// The caller holds turnMu.
+func (th *thread) finishTurn(st *turnState) {
+	if !th.cur.CompareAndSwap(st, nil) {
+		th.log.Debug("a following turn reserved the thread before this renderer finished")
+	}
+	st.finish()
+	th.turnMu.Unlock()
+}
+
 // abort stops the turn running in this thread, reporting whether there was one
 // to stop. The platform's stop control is also how a stale loading indicator
 // gets cleared, and the caller has to tell those two cases apart.
@@ -182,11 +229,13 @@ func (th *thread) forgetSession() {
 // the thread stops owning a session, so the next message starts a fresh one
 // deliberately instead of re-attaching a tombstone.
 func (th *thread) forgetSessionLocked() {
+	th.sessionEpoch.Add(1)
 	th.update(func(row *store.ThreadRow) {
 		row.State = store.StateDeleted
 		row.SessionName, row.SessionPath, row.SessionID = "", "", ""
 		row.LastSeq, row.LeafID, row.ProgressTS = 0, "", ""
 	})
+	th.forgetAssistant()
 	th.log.Warn("the session was deleted outside pi-chat", "thread", th.key)
 }
 
@@ -252,6 +301,7 @@ func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, 
 // attached to every session it ever created and make them unevictable — a cap
 // that silently never evicts (DESIGN.md §8, §10). Dial, create, close.
 func (th *thread) create(ctx context.Context, prompt string) error {
+	th.forgetAssistant()
 	project, err := th.b.work.Provision(prompt)
 	if err != nil {
 		return err
@@ -363,6 +413,7 @@ func (th *thread) retire(ctx context.Context) (bool, error) {
 	// Let go of the connection: the thread must not stay attached to a session it
 	// no longer owns, and closing saves the cursor, so resuming the old session
 	// later continues where this thread stopped rather than replaying it.
+	th.sessionEpoch.Add(1)
 	th.connMu.Lock()
 	client := th.client
 	th.client = nil
@@ -372,6 +423,7 @@ func (th *thread) retire(ctx context.Context) (bool, error) {
 		_ = client.Close()
 	}
 
+	th.forgetAssistant()
 	th.update(func(r *store.ThreadRow) {
 		r.SessionName, r.SessionPath, r.SessionID = "", "", ""
 		r.Cwd, r.ProjectDir = "", ""
@@ -417,6 +469,7 @@ func (th *thread) destroy(ctx context.Context) (deleteReport, error) {
 	// disconnecting them, so leaving this one open would keep a client of a
 	// session that is going away, receiving the events of a session this thread no
 	// longer owns.
+	th.sessionEpoch.Add(1)
 	th.connMu.Lock()
 	client := th.client
 	th.client = nil
@@ -466,21 +519,24 @@ func (th *thread) destroy(ctx context.Context) (deleteReport, error) {
 //
 // The caller holds connMu.
 func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
+	var eventClient atomic.Pointer[gwclient.Client]
+	epoch := th.sessionEpoch.Load()
 	cfg := gwclient.Config{
 		StateDir:  th.b.cfg.Gateway.StateDir,
 		TokenFile: th.b.cfg.Gateway.ThreadTokenFile,
 		Name:      "pi-chat " + th.t.SessionName(),
 		Kind:      kind,
 		Tags:      map[string]string{"platform": platformName, "thread": th.key},
-		OnEvent:   th.onEvent,
+		OnEvent: func(ev gwclient.Event) {
+			th.onEventWithClient(ev, eventClient.Load(), epoch)
+		},
 	}
-	// A thread that has been driven before resumes from its cursor, so the
-	// events of an idle window (or of a restart) are not replayed into a
-	// thread that already saw them. The replayed frames are discarded by
-	// onEvent, which only renders inside a turn, and the watermark they carry
-	// is what the next save records. A first attach has nothing to resume, so
-	// it starts at the head (DESIGN.md §4).
-	if row := th.snapshot(); row.LastSeq > 0 || row.LeafID != "" {
+	// The hello is unbound; ensure attaches the session with SwitchSession
+	// afterward. That switch starts a live stream, so no historical replay is
+	// delivered to this callback. Keep the cursor for gwclient's live sequence
+	// tracking, but render only turns observed after the bind.
+	row := th.snapshot()
+	if row.LastSeq > 0 || row.LeafID != "" {
 		cfg.Resume = &protocol.Resume{SinceSeq: row.LastSeq, LeafEntryID: row.LeafID}
 	} else {
 		cfg.LiveOnly = true
@@ -489,13 +545,37 @@ func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open the thread connection: %w", err)
 	}
+	eventClient.Store(client)
 	return client, nil
+}
+
+// saveCursorAfterActivity records both the live event sequence and the durable
+// session leaf after a turn, so a later cold poll starts after already handled
+// assistant output. Live event frames advance sequence numbers but do not carry
+// a durable leaf, so GetEntries refreshes that boundary first.
+func (th *thread) saveCursorAfterActivity(ctx context.Context, client *gwclient.Client) {
+	if client == nil {
+		return
+	}
+	row := th.snapshot()
+	queryCtx, queryCancel := context.WithTimeout(ctx, gatewayTimeout)
+	page, err := client.GetEntries(queryCtx, row.LeafID)
+	queryCancel()
+	if err != nil {
+		th.log.Debug("cannot refresh the session entry cursor", "error", err)
+		th.saveCursor(ctx, client)
+		return
+	}
+	th.saveCursorAt(ctx, client.LastSeq(), page.LeafID)
 }
 
 // saveCursor records how much of the session's event stream the connection has
 // consumed, so the next attach resumes from there.
 func (th *thread) saveCursor(ctx context.Context, client *gwclient.Client) {
-	seq, leaf := client.LastSeq(), client.LeafID()
+	th.saveCursorAt(ctx, client.LastSeq(), client.LeafID())
+}
+
+func (th *thread) saveCursorAt(ctx context.Context, seq uint64, leaf string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorTimeout)
 	defer cancel()
 	if err := th.b.store.SetThreadCursor(ctx, th.key, seq, leaf); err != nil {

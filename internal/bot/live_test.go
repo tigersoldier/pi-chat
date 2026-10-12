@@ -136,6 +136,46 @@ func TestLiveTurnThroughGateway(t *testing.T) {
 	if after.State != store.StateWarm {
 		t.Errorf("state after the resumed turn = %q, want %q", after.State, store.StateWarm)
 	}
+	if after.LeafID == "" {
+		t.Fatal("the settled turn did not persist a session-entry leaf for cold polling")
+	}
+
+	// A generic assistant turn can finish while pi-chat is cold. Polling the
+	// durable entries after the saved leaf should render it without another
+	// Slack prompt or any knowledge of which client started the turn.
+	th.turnMu.Lock()
+	th.close(ctx)
+	th.turnMu.Unlock()
+	external, err := gwclient.Dial(ctx, gwclient.Config{
+		StateDir:  cfg.Gateway.StateDir,
+		TokenFile: cfg.Gateway.ThreadTokenFile,
+		Name:      "pi-chat live external turn",
+		Kind:      kind,
+		Session:   row.SessionPath,
+	})
+	if err != nil {
+		t.Fatalf("attach an external session client: %v", err)
+	}
+	defer external.Close()
+	if _, err := external.Prompt(ctx, "Reply with exactly the single word PONG3 and nothing else."); err != nil {
+		t.Fatalf("start an external session turn: %v", err)
+	}
+	if err := external.AwaitSettled(ctx); err != nil {
+		t.Fatalf("wait for the external turn: %v", err)
+	}
+	_ = external.Close()
+
+	polled := &recordingRenderer{signal: make(chan struct{}, 16)}
+	platform.mu.Lock()
+	platform.renderer = polled
+	platform.mu.Unlock()
+	if !th.pollColdSession(ctx) {
+		t.Fatal("cold polling did not retain the connection for the recovered answer")
+	}
+	waitFor(t, "the polled assistant answer", func() bool { return len(polled.finalAnswers()) == 1 })
+	if got := polled.finalAnswers()[0]; !strings.Contains(got, "PONG3") {
+		t.Fatalf("polled answer = %q, want PONG3", got)
+	}
 }
 
 // liveMessage is one prompt in the live thread.

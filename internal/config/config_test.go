@@ -49,6 +49,9 @@ func TestLoadAppliesDefaultsForMissingKeys(t *testing.T) {
 		t.Errorf("max_warm_sessions = %d, want the default %d",
 			cfg.Concurrency.MaxWarmSessions, DefaultMaxWarmSessions)
 	}
+	if cfg.Concurrency.ThreadIdleCloseMinutes != 60 {
+		t.Errorf("thread_idle_close_minutes = %d, want 60", cfg.Concurrency.ThreadIdleCloseMinutes)
+	}
 	if cfg.Render.Mode != "stream" {
 		t.Errorf("render.mode = %q, want \"stream\"", cfg.Render.Mode)
 	}
@@ -197,6 +200,10 @@ func TestSummaryNeverPrintsTokenContents(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(cfg.Summary(), "\n")
+	if !strings.Contains(joined, "cold poll "+ColdPollFastInterval.String()+" for first "+ColdPollFastWindow.String()+
+		", then "+ColdPollSlowInterval.String()+" until "+ColdPollWindow.String()) {
+		t.Errorf("the summary should report cold-session polling, got:\n%s", joined)
+	}
 	if strings.Contains(joined, "supersecret") {
 		t.Fatalf("the summary leaked a token value:\n%s", joined)
 	}

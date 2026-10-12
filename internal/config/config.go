@@ -32,9 +32,14 @@ const (
 	DefaultReposRoot         = "~/code"
 	DefaultDBPath            = "~/.local/state/pi-chat/pi-chat.db"
 	DefaultMaxWarmSessions   = 8
-	DefaultIdleCloseMinutes  = 10
+	DefaultIdleCloseMinutes  = 60
 	DefaultAdmissionSeconds  = 120
 	DefaultFlushMS           = 1000
+	ColdPollFastInterval     = time.Minute
+	ColdPollFastWindow       = 10 * time.Minute
+	ColdPollSlowInterval     = 5 * time.Minute
+	ColdPollWindow           = time.Hour
+	ColdPollBatchSize        = 8
 )
 
 // Config is the whole configuration file.
@@ -505,9 +510,10 @@ func (c *Config) Summary() []string {
 		fmt.Sprintf("projects root: %s", c.Paths.ProjectsRoot),
 		fmt.Sprintf("repos root: %s", c.Paths.ReposRoot),
 		fmt.Sprintf("database: %s", c.Paths.DBPath),
-		fmt.Sprintf("warm session cap: %d (%s), idle close %dm, admission wait %ds",
+		fmt.Sprintf("warm session cap: %d (%s), idle close %dm, cold poll %s for first %s, then %s until %s, admission wait %ds",
 			c.Concurrency.MaxWarmSessions, c.Concurrency.Eviction,
-			c.Concurrency.ThreadIdleCloseMinutes, c.Concurrency.AdmissionWaitSeconds),
+			c.Concurrency.ThreadIdleCloseMinutes, ColdPollFastInterval, ColdPollFastWindow,
+			ColdPollSlowInterval, ColdPollWindow, c.Concurrency.AdmissionWaitSeconds),
 		fmt.Sprintf("render: %s (flush %dms)", c.Render.Mode, c.Render.FlushMS),
 		fmt.Sprintf("approvals: %s, pi args: %v", c.Behavior.Approvals, c.Gateway.PiArgs),
 		fmt.Sprintf("injected prompt: %s", yesNo(c.Behavior.InjectedPrompt != "")),

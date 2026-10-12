@@ -11,6 +11,7 @@ import (
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
 
+	"github.com/tigersoldier/pi-chat/internal/config"
 	"github.com/tigersoldier/pi-chat/internal/store"
 )
 
@@ -194,7 +195,15 @@ func (b *Bot) cmdNew(ctx context.Context, r request, arg string) error {
 		b.answer(ctx, r, "A turn is running here. Stop it, or wait for it to finish, and try again.")
 		return nil
 	}
+	th.sessionChanging.Store(true)
+	if th.busy() {
+		th.sessionChanging.Store(false)
+		th.turnMu.Unlock()
+		b.answer(ctx, r, "A turn is running here. Stop it, or wait for it to finish, and try again.")
+		return nil
+	}
 	retired, err := th.retire(ctx)
+	th.sessionChanging.Store(false)
 	th.turnMu.Unlock()
 	if err != nil {
 		return err
@@ -332,7 +341,17 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 		b.answer(ctx, r, "A turn is running here. Stop it, or wait for it to finish, then ask again.")
 		return
 	}
-	defer th.turnMu.Unlock()
+	th.sessionChanging.Store(true)
+	if th.busy() {
+		th.sessionChanging.Store(false)
+		th.turnMu.Unlock()
+		b.answer(ctx, r, "A turn is running here. Stop it, or wait for it to finish, then ask again.")
+		return
+	}
+	defer func() {
+		th.sessionChanging.Store(false)
+		th.turnMu.Unlock()
+	}()
 
 	// Say what is happening before doing it: the answer is a message the user is
 	// already looking at, and the work below is slower than that.
@@ -651,8 +670,10 @@ func (b *Bot) statusRoot(ctx context.Context, r request) error {
 	lines := []string{
 		fmt.Sprintf("*pi-chat %s*", b.version),
 		b.gw.Status(ctx),
-		fmt.Sprintf("warm sessions: %d of %d allowed (idle close after %dm); %s",
+		fmt.Sprintf("warm sessions: %d of %d allowed (idle close after %dm; cold poll %s for first %s, then %s until %s); %s",
 			warm, b.cfg.Concurrency.MaxWarmSessions, b.cfg.Concurrency.ThreadIdleCloseMinutes,
+			config.ColdPollFastInterval, config.ColdPollFastWindow,
+			config.ColdPollSlowInterval, config.ColdPollWindow,
 			threadStates(warm, cold, deleted)),
 		fmt.Sprintf("threads in this channel: %d (%s)", here, threadStates(hereWarm, hereCold, hereDeleted)),
 		fmt.Sprintf("render: %s, approvals: %s", b.cfg.Render.Mode, b.cfg.Behavior.Approvals),
@@ -726,6 +747,7 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		b.answer(ctx, r, "I found that session but cannot record it: "+err.Error())
 		return
 	}
+	th.forgetAssistant()
 	th.update(func(row *store.ThreadRow) {
 		row.SessionName, row.SessionPath, row.SessionID = chosen.Name, chosen.Path, chosen.ID
 		row.Cwd = chosen.Cwd
@@ -733,10 +755,12 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		// and the startup sweep leave ProjectDir empty alone (DESIGN.md §9).
 		row.ProjectDir = ""
 	})
-	if _, err := th.ensure(ctx, ""); err != nil {
+	client, err := th.ensure(ctx, "")
+	if err != nil {
 		b.reply(ctx, Notice{Thread: &thread, Text: "I found that session but could not attach to it: " + err.Error()})
 		return
 	}
+	th.saveCursorAfterActivity(ctx, client)
 	b.reply(ctx, resumeNotice(thread, *chosen, a.Direct))
 	// The picker is replaced rather than left behind, so the same session
 	// cannot be adopted twice by an old button.
