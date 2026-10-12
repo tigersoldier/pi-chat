@@ -68,9 +68,8 @@ Killed it; no other instances remain.
 
 Full walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**. The app is
 configured by pasting **[slack/manifest.yaml](slack/manifest.yaml)** into Slack's app
-manifest editor, so scopes, events, Socket Mode, Interactivity, the Messages Tab and the
-`/pi` command are applied in one step. `slack/manifest-agent.yaml` is the variant that
-declares the app as a Slack agent (see [slack/README.md](slack/README.md)).
+manifest editor, so scopes, events, Socket Mode, Interactivity, the Messages Tab, `/pi`, and
+the Agent Sessions experience are applied in one step (see [slack/README.md](slack/README.md)).
 
 - [x] M1.1 App created from scratch; **Socket Mode enabled**; app-level token with
       `connections:write` → `~/.config/pi-chat/slack-app-token`
@@ -82,13 +81,12 @@ declares the app as a Slack agent (see [slack/README.md](slack/README.md)).
       a channel with `/invite @pi` if that has not happened yet
 - [ ] M1.5 Apply the remaining scopes, events and settings in one paste: app →
       **Settings → App Manifest** → replace with `slack/manifest.yaml` → Save → reinstall.
-      Slack shows a diff first. This covers `channels:history`, `groups:history`,
-      `im:history`, `mpim:history`, `files:read`, `reactions:write`, the four
-      `message.*` events, the Messages Tab, Interactivity and the `/pi` command
-- [ ] M1.6 Optional, after M1.5: decide on the agent variant. It adds
-      `assistant:write` and the agent events for a DM timeline, real agent status
-      (`agents.sessions.setStatus`) and a stop button, at the cost of requiring the
-      workspace's agent feature (`feature_disabled` elsewhere) and an irreversible switch
+      Slack shows a diff first. This covers the history/file/reaction scopes, message and
+      agent events, the Messages Tab, Interactivity, `/pi`, and Agent Sessions.
+- [ ] M1.6 If Slack does not show Agent Sessions after M1.5, ask a workspace/org admin to
+      enable **AI agent experience** for the installed app. The manifest already declares
+      the agent surface; without workspace support, `agents.sessions.setStatus` returns
+      `feature_disabled`. Switching from the legacy assistant view is irreversible.
 
 **Verified on 2026-09-26** with read-only API calls (`auth.test`,
 `apps.connections.open`); tokens were passed via a stdin curl config so they never
@@ -244,7 +242,7 @@ worth fixing before M5 builds `/delete` on top of this base.
 | A failed session creation left its **project directory** behind | Only the next startup sweep would have found it |
 | `update` flushed outside its lock | Two writes could land out of order, leaving the database with an older snapshot than memory |
 | Dead code, two loaders for one row, `TeamID` vs `Workspace`, a hardcoded platform name, duplicated rune trimming | Structure findings; all removed or unified |
-| Docs claiming unbuilt features (`files:read`, `reactions:write`, the agent events, `setStatus`/`rename`/`Abort`) | Now marked phase 3 in both manifests, the tutorial and DESIGN |
+| Docs claiming unbuilt features (`files:read`, `reactions:write`, the agent events, `setStatus`/`rename`/`Abort`) | Now marked phase 3 in the Slack manifest, tutorial and DESIGN |
 
 **Accepted, not fixed (with the reason):**
 
@@ -267,8 +265,8 @@ worth fixing before M5 builds `/delete` on top of this base.
 
 ### M4.6 — the agent surface
 
-- [x] `slack/manifest-agent.yaml` is the recommended app: Slack's agent messaging
-      experience, with the plain manifest kept for workspaces that cannot have it
+- [x] `slack/manifest.yaml` is the single maintained app manifest and declares Slack's
+      agent messaging experience; the bot continues without the agent UI where unavailable
 - [x] Status follows the turn: `agents.sessions.setStatus` on `busy` → `idle`, mapped from
       a platform-neutral vocabulary, best-effort, and asked once when the install cannot
       show one (`feature_disabled`, `missing_scope`)
@@ -343,11 +341,10 @@ for.
 - [x] `users:read`-driven labels in the transcript, with the ID-only fallback when the
       scope is missing (the adapter latches after the first refusal, so a plain-bot install
       pays for one failed call, not one per message)
-- [x] `users:read` in both manifests, so labels carry names — added to
-      `slack/manifest.yaml` and `slack/manifest-agent.yaml`, and to the scope table in
-      `docs/slack-app-setup.md`. **The app still has to be reinstalled for it to take
-      effect**: until then a transcript reads `[U123]`, with one warning in the journal
-      and no further attempts (`users:read` is a *new* scope, so Slack disables the
+- [x] `users:read` in the Slack manifest and the scope table in
+      `docs/slack-app-setup.md`, so labels carry names. **The app still has to be reinstalled
+      for it to take effect**: until then a transcript reads `[U123]`, with one warning in
+      the journal and no further attempts (`users:read` is a *new* scope, so Slack disables the
       install until it is granted)
 - [x] Grammar: DM messages turn, channel-thread plain text is observed only, mentions
       register a thread without provisioning, a top-level DM message starts a new session
@@ -453,7 +450,7 @@ use found, all of them in paths the stubs could not see:
       `agents.sessions.setStatus`: whatever it is installed as now, it is not an agent
       app, so the suggested prompts (M4.6) and the session indicator are dormant. Nothing
       to code — turns, commands and `/pi status` do not need either — but installing from
-      `slack/manifest-agent.yaml` (and any Slack-side agent feature that has to be
+      `slack/manifest.yaml` (and any Slack-side agent feature that has to be
       switched on first) is what makes them live. Found by the new live test, which is why
       that test skips on a capability answer rather than failing.
 

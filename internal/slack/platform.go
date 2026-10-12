@@ -53,9 +53,9 @@ type Platform struct {
 	// without an indicator instead of asking again on every one.
 	statusRefused atomic.Bool
 
-	// promptsRefused is the same latch for suggestions: a plain-bot install has
-	// no agent surface to show them on, and the method needs a scope the default
-	// manifest deliberately does not request.
+	// promptsRefused is the same latch for suggestions: an older or custom app
+	// that is not declared as an agent may have no surface to show them on, or
+	// may not have granted the method's assistant:write scope.
 	promptsRefused atomic.Bool
 }
 
