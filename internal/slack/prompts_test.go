@@ -48,8 +48,8 @@ func TestSetSuggestedPromptsOmitsThreadTS(t *testing.T) {
 	}
 }
 
-// TestSetSuggestedPromptsLatchesOnMissingScope: the default manifest does not
-// request assistant:write, so a plain-bot install answers missing_scope forever.
+// TestSetSuggestedPromptsLatchesOnMissingScope: older or custom app installs may
+// not have assistant:write, so Slack answers missing_scope for each attempt.
 func TestSetSuggestedPromptsLatchesOnMissingScope(t *testing.T) {
 	stub := &stubSlack{failed: map[string]string{"assistant.threads.setSuggestedPrompts": "missing_scope"}}
 	platform := newTestPlatform(t, stub, "stream")

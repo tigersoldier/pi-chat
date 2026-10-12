@@ -253,7 +253,7 @@ and puts it in front of the request.
   Only HTTPS Slack file hosts are allowed, including redirects; pi-chat does not log or save
   tokens, private URLs or image bytes. pi retains native image prompts in its session history
   as usual.
-  The install needs `files:read`, already declared in both manifests.
+  The install needs `files:read`, already declared in the Slack manifest.
 - Trigger images have priority, then the newest retained conversation images; deduplicate
   by file identity. Bound a turn to four images, 5 MiB per image and 10 MiB total before
   base64 encoding, safely below the gateway's 16 MiB frame cap. Accept PNG, JPEG, GIF and
@@ -514,7 +514,7 @@ Constraints and behaviours:
   A turn that produced several messages therefore ends showing the final answer, not a
   concatenation of intermediates.
 - **Status and title, two tiers:**
-  - *Declared as an agent* (`slack/manifest-agent.yaml`, Slack's agent messaging
+  - *Declared as an agent* (`slack/manifest.yaml`, Slack's agent messaging
     experience): `agents.sessions.setStatus` takes real lifecycle values that map onto
     our states exactly — `processing` while a turn runs (Slack shows a loading UX), `suspended` while we wait for an approval, `active` when idle, `closed` on delete.
     Titles use `agents.sessions.rename`. Subscribing to `agent_session_stopped` (scope
@@ -562,18 +562,17 @@ Constraints and behaviours:
 
     The scopes, precisely: `agents.sessions.setStatus` and `agents.sessions.rename` need
     **`chat:write` alone** — the agent surface is not what buys `assistant:write`.
-    `assistant:write` is the required scope of `app_context_changed` and of the legacy
-    `assistant.threads.*` methods, and pi-chat uses neither, so in the agent manifest it
-    is declared only because Slack's agent feature asks for it and a scope change forces
-    a reinstall. Caveats: the workspace must have the agent feature enabled
+    `assistant:write` is required by `app_context_changed` and legacy `assistant.threads.*`
+    methods; pi-chat uses `assistant.threads.setSuggestedPrompts` for dynamic prompts, and
+    Slack also requires the scope for agent apps. Caveats: the workspace must have the agent
+    feature enabled
     (`feature_disabled` otherwise), and switching an app from the legacy assistant view
     to the agent view cannot be reversed.
-  - *Plain bot* (the default `slack/manifest.yaml`): the only status primitives are
-    `assistant.threads.setStatus` (a free-form string with a two-minute timeout) and
-    `assistant.threads.setTitle`, both of which need `assistant:write` — a scope the
-    default manifest deliberately does **not** request, so today this tier shows no
-    status at all and *cannot*: adding it means adding the scope and reinstalling. Slack
-    is migrating these methods to the `agents.sessions.*` names above, so treat both
+  - *Legacy/custom plain bot* (an app not declared as an agent): the older status
+    primitives are `assistant.threads.setStatus` (a free-form string with a two-minute
+    timeout) and `assistant.threads.setTitle`, both of which need `assistant:write`. The
+    maintained `slack/manifest.yaml` declares the agent experience and uses the newer
+    `agents.sessions.*` methods above; Slack is migrating the older methods, so treat both
     spellings as current, not settled.
 - **`extension_ui_request` is two things on one frame type, and the adapter must split
   them by `method`:**
@@ -955,12 +954,11 @@ the reply path is never the only path: a `response_url` that refuses a notice, o
 the *replacement* of one (the outcome of a confirmed delete), falls back to posting, so a
 button always answers somewhere.
 
-The Slack app itself is configuration as code: `slack/manifest.yaml` (standard bot) and
-`slack/manifest-agent.yaml` (agent messaging experience) are the two supported app
-shapes, applied by pasting one into the app's manifest editor;
-`docs/slack-app-setup.md` is the walkthrough. Keeping them in the repository means a
-scope or event is added once, reviewed as a diff in Slack, and never drifts from the
-adapter's expectations.
+The Slack app itself is configuration as code: `slack/manifest.yaml` is the single
+maintained app manifest, applied by pasting it into the app's manifest editor;
+`docs/slack-app-setup.md` is the walkthrough. Keeping it in the repository means a scope or
+event is added once, reviewed as a diff in Slack, and never drifts from the adapter's
+expectations.
 
 **The seam, as implemented** (`internal/bot/types.go`):
 

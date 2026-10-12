@@ -1,43 +1,12 @@
-# pi-chat — Slack app manifest (standard bot)
+# pi-chat — Slack app manifest
 #
-# Paste this into Slack to create the app with every scope, event and setting
-# pi-chat needs, instead of clicking through half a dozen settings pages.
-#
-# Create a new app:   https://api.slack.com/apps → Create New App → From an app
-#                     manifest
-# Update an existing app: your app → Settings → App Manifest → paste → Save
-#
-# Editing an existing app shows a diff and then asks you to reinstall, which is
-# the point: a manifest change is reviewed before it takes effect.
+# This manifest declares Slack's agent messaging experience: DMs get a timeline,
+# lifecycle status, and a stop button while a turn runs. The workspace must allow
+# the experience; without it, pi-chat still works but Slack shows no agent status.
+# Switching an existing app from the legacy assistant view to the agent view
+# cannot be reversed. See docs/slack-app-setup.md before applying it.
 #
 # Docs: docs/slack-app-setup.md
-#
-# --- What to customize -------------------------------------------------------
-#
-#   display_information.name        the app name, which is also the mention
-#                                   handle people type (@pi). 35 characters max.
-#   display_information.description one line shown in the app directory
-#   features.bot_user.display_name  the @handle shown on messages
-#   features.slash_commands[].command, .description, .usage_hint
-#                                   renaming the command is fine — pi-chat uses
-#                                   whatever command name Slack delivers
-#
-# --- What NOT to change ------------------------------------------------------
-#
-#   oauth_config.scopes.bot     the whole point of this file
-#   settings.event_subscriptions.bot_events
-#   settings.socket_mode_enabled
-#   features.app_home           direct messages depend on it
-#
-# oauth_config.scopes.user is only for the optional team mode where each person
-# gets their own token for their own self-DM (docs/slack-user-token-setup.md).
-# Those scopes are requested by the broker's own install link, never by the
-# app's install, so the app's consent screen does not mention them — but adding
-# them here is a manifest change and Slack will ask for a reinstall.
-#
-# Tokens are not part of a manifest and cannot be: after saving this, generate
-# an app-level token (Basic Information → App-Level Tokens → connections:write)
-# and install the app to get the bot token. See docs/slack-app-setup.md.
 
 _metadata:
   major_version: 2
@@ -46,17 +15,28 @@ _metadata:
 display_information:
   name: pi
   description: Drive local pi coding-agent sessions from Slack
-  # background_color: "#1d1d1d"  # optional; once set it can only be changed,
-  #                            # not removed
 
 features:
+  # Declaring the app as an agent is what enables the agent experience. New apps
+  # can only use agent_view; the older assistant_view is deprecated. The
+  # assistant:write scope below is not what makes this work; see its comment.
+  agent_view:
+    # 300 characters max
+    agent_description: Run local pi coding-agent sessions from Slack.
+    # No suggested_prompts here on purpose. A hard-coded list cannot name
+    # anything about the machine the bot runs on, so pi-chat sets them at
+    # runtime instead: opening the conversation offers work in the
+    # repositories that are actually under paths.repos_root
+    # (assistant.threads.setSuggestedPrompts, which needs assistant:write
+    # below and, in an agent app, must NOT carry thread_ts — Slack documents
+    # that including it makes the call fail silently).
   bot_user:
     display_name: pi
     always_online: false
   app_home:
     home_tab_enabled: false
-    messages_tab_enabled: true          # give the bot a Messages tab
-    messages_tab_read_only_enabled: false  # …that users can actually type into
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   slash_commands:
     - command: /pi
       description: pi-chat control commands, usable in a channel or DM root
@@ -66,15 +46,16 @@ features:
 oauth_config:
   scopes:
     bot:
-      - app_mentions:read   # receive @pi mentions
-      - chat:write          # post, update and stream messages
+      - app_mentions:read
+      - chat:write
       - commands            # the /pi slash command
       - channels:history    # plain text in public threads
       - groups:history      # plain text in private channels
       - im:history          # direct messages
       - mpim:history        # group direct messages
       - users:read          # names beside a message, not just the ID
-      - files:read          # download images from requests and thread context
+      - assistant:write     # agent app support; legacy methods
+      - files:read          # download images from agent requests and threads
       - reactions:write     # 👀 on accepted requests; ✅ on success; 🤷 when denied
     # Only for the team self-DM mode, where a person's own token drives their
     # own "Notes to self" (docs/slack-user-token-setup.md). Not requested by the
@@ -94,9 +75,15 @@ settings:
       - message.groups
       - message.im
       - message.mpim
+      - app_home_opened      # a DM open; no scope required
+      # agent_session_stopped is handled: it is what makes Slack's loading
+      # indicator interactive, and pressing it aborts the turn.
+      - agent_session_stopped  # the user pressed stop while we were working
+      # Declared but unused, kept so that adding them needs no reinstall:
+      - app_context_changed  # what the user is viewing; unused
+      - agent_session_title_changed  # renamed by the user; unused
   interactivity:
-    is_enabled: true        # approval buttons and modals; no request URL
-                            # under Socket Mode
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

@@ -20,7 +20,8 @@ slice), **M4 (the phase-1 MVP)** and **M4.6 (the agent surface) are done**. In S
 mention or command starts a pi session in a thread, streams its answer back, and keeps
 thread state across restarts. Phase 1 includes an allowlist, durable thread state, project
 worktrees, `/pi help|status|resume`, pass-through commands, idle close and cold resume.
-The recommended agent manifest adds status and a stop button. Opt-in read-only chat-tools
+The Slack app manifest enables Agent Sessions, including status and a stop button when the
+workspace allows the agent experience. Opt-in read-only chat-tools
 v1 is implemented in this worktree and unit-tested, but has not yet been verified against
 a live Slack workspace. Remaining phase-2 work includes `/abort`, `/model`, interactive
 approvals, and the warm-session cap with eviction. Details: `PLAN.md`.
@@ -32,7 +33,7 @@ and they share one core, one store and one session pool:
 
 | Surface | Needs | Gives | Off when |
 |---|---|---|---|
-| **App** (default) | an installed app: `xapp-…` and `xoxb-…` | mentions, DMs, slash commands, buttons, status, notifications | `slack.enabled = false`, or either token file missing |
+| **App** (default) | an installed app: `xapp-…` and `xoxb-…` | mentions, DMs, slash commands, buttons, notifications; agent status and stop button when enabled for the workspace | `slack.enabled = false`, or either token file missing |
 | **Self-DM** (opt-in) | either your own `xoxc-…` token and `d` cookie, or a per-person `xoxp-…` token minted by the app | a private control channel in "Notes to self" | `slack.self_dm.enabled` is false (the default) |
 
 The mux routes a call by channel id, so the app's DM with you and your own
@@ -70,8 +71,10 @@ conversation.
    operations use the admin token, and the long-lived per-thread connections
    cannot destroy sessions.
 
-3. **A Slack app** — created from **[slack/manifest.yaml](slack/manifest.yaml)**;
-   walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**. The app is
+3. **A Slack app** — created from **[slack/manifest.yaml](slack/manifest.yaml)**,
+   which declares Slack's agent experience and status/stop button. If the workspace
+   disables the agent experience, the bot still works without those indicators. Walkthrough:
+   **[docs/slack-app-setup.md](docs/slack-app-setup.md)**. The app is
    optional: with no app tokens, the daemon runs the self-DM surface alone
    (**[docs/slack-self-dm-setup.md](docs/slack-self-dm-setup.md)**) — and with
    neither, it refuses to start and says so.
