@@ -390,6 +390,23 @@ func TestFlushRendersPendingText(t *testing.T) {
 	stop()
 }
 
+func TestStartTurnFailureMarksOriginalRequestFailed(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	message := newTestMessage("failed-turn", "hello")
+
+	b.startTurn(ctx, th, message)
+	waitFor(t, "failed request reaction", func() bool { return len(platform.failedRequests()) == 1 })
+	if got := platform.failedRequests()[0].TS; got != message.TS {
+		t.Errorf("failed request timestamp = %q, want %q", got, message.TS)
+	}
+	if got := len(platform.completedRequests()); got != 0 {
+		t.Errorf("completed %d requests after the turn failed", got)
+	}
+}
+
 func TestRunTurnSetupFailureDoesNotCompleteRequest(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := testThread(t, b, st)

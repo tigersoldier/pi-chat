@@ -268,6 +268,22 @@ func TestCompleteRequestDoesNotAddCheckWhenEyesCannotBeRemoved(t *testing.T) {
 	}
 }
 
+func TestFailRequestReplacesEyesWithWarning(t *testing.T) {
+	stub := &stubSlack{}
+	platform := newTestPlatform(t, stub, "patch")
+	message := testMessage()
+	message.TS = "1700000000.000200"
+
+	if err := platform.FailRequest(context.Background(), message); err != nil {
+		t.Fatalf("FailRequest: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[0].params["name"] != "eyes" ||
+		calls[1].method != "reactions.add" || calls[1].params["name"] != "warning" {
+		t.Fatalf("calls = %+v, want remove eyes before adding warning", calls)
+	}
+}
+
 func TestFinishWithoutStartPostsTheReadyAnswer(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")

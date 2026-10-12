@@ -269,6 +269,12 @@ type RequestCompleter interface {
 	CompleteRequest(ctx context.Context, m Message) error
 }
 
+// RequestFailureReporter marks an addressed message after its turn fails.
+// It is optional because some surfaces cannot react to the original message.
+type RequestFailureReporter interface {
+	FailRequest(ctx context.Context, m Message) error
+}
+
 // Suggestion is one prompt a platform offers before the user types: a title for
 // the choice, and the message choosing it sends.
 type Suggestion struct {

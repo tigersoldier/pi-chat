@@ -36,6 +36,7 @@ type fakePlatform struct {
 	notices   []Notice
 	acks      []requestAck
 	completed []Message
+	failed    []Message
 	opened    []string // the text of each thread the core asked for
 	thread    Thread   // what OpenThread returns; zero means a stand-in
 	renderer  *recordingRenderer
@@ -97,6 +98,13 @@ func (p *fakePlatform) CompleteRequest(_ context.Context, m Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.completed = append(p.completed, m)
+	return nil
+}
+
+func (p *fakePlatform) FailRequest(_ context.Context, m Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failed = append(p.failed, m)
 	return nil
 }
 
@@ -181,6 +189,12 @@ func (p *fakePlatform) completedRequests() []Message {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]Message(nil), p.completed...)
+}
+
+func (p *fakePlatform) failedRequests() []Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Message(nil), p.failed...)
 }
 
 // openedThreads returns the texts of the threads the core asked to open.

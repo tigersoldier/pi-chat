@@ -424,8 +424,9 @@ commands inside message threads** and its slash-command payload carries no `thre
    reply about somebody's allowlist. Their *mention*, or their DM, is a request, and a
    refusal is the answer to it.
 8. **An addressed request is acknowledged before work or refusal.** The app surface
-   reacts `:eyes:` to an allowed mention or one-to-one DM; a successful turn replaces
-   it with `:white_check_mark:`. An unallowed request gets `:shrug:` and a private refusal.
+   reacts `:eyes:` to an allowed mention or one-to-one DM; success replaces it with
+   `:white_check_mark:`, failure with `:warning:`. An unallowed request gets `:shrug:`
+   and a private refusal.
 
 What reaches a session, and what does not:
 
