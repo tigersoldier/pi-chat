@@ -98,10 +98,9 @@ type appSurface struct {
 func run(cfg *config.Config) error {
 	log := newLogger(cfg.Log)
 
-	// A signal cancels this context, which ends every ingress loop and releases
-	// every gateway connection. Turns that are still running are abandoned:
-	// the session stays alive in pi-gatewayd, and its answer is in pi's
-	// session file.
+	// A signal cancels this context and ends the ingress loops. The core queues
+	// a non-preempting notice on each warm session before releasing its gateway
+	// connections; pi-gatewayd keeps those sessions alive.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -140,6 +139,9 @@ func run(cfg *config.Config) error {
 
 	core := bot.New(cfg, log, sl.mux, st, version)
 	defer core.Close()
+	checkCtx, cancelCheck := context.WithTimeout(ctx, 5*time.Second)
+	core.CheckShutdownResponses(checkCtx)
+	cancelCheck()
 
 	// Startup GC: the store and gateway catalog identify owned project
 	// directories. If the catalog is unavailable, the sweep fails safe and

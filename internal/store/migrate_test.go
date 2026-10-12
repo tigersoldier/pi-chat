@@ -65,8 +65,8 @@ func writeV1Database(t *testing.T) string {
 }
 
 // TestMigratesAVersionOneDatabase is the migration path's whole job: a database
-// written by the previous build opens, keeps its rows, and gains the column the
-// new one reads.
+// written by an older build opens, keeps its rows, and gains the schema current
+// code reads and writes.
 func TestMigratesAVersionOneDatabase(t *testing.T) {
 	ctx := context.Background()
 	path := writeV1Database(t)
@@ -83,6 +83,15 @@ func TestMigratesAVersionOneDatabase(t *testing.T) {
 	}
 	if version != schemaVersion {
 		t.Errorf("version after the migration = %d, want %d", version, schemaVersion)
+	}
+	checkpoint := ShutdownCheckpoint{
+		ThreadKey: "T1:C1:1.1", SessionPath: "/s/a.jsonl", LeafID: "leaf-1", NoticeID: "notice-1",
+	}
+	if err := s.PutShutdownCheckpoint(ctx, checkpoint); err != nil {
+		t.Fatalf("PutShutdownCheckpoint on the migrated database: %v", err)
+	}
+	if rows, err := s.ShutdownCheckpoints(ctx); err != nil || len(rows) != 1 || rows[0].LeafID != checkpoint.LeafID || rows[0].NoticeID != checkpoint.NoticeID {
+		t.Errorf("shutdown checkpoints on the migrated database = %+v, err=%v", rows, err)
 	}
 
 	row, found, err := s.Thread(ctx, "T1:C1:1.1")

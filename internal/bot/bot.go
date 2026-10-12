@@ -289,7 +289,9 @@ func (b *Bot) suggestions() []Suggestion {
 }
 
 // Run performs the periodic maintenance the daemon needs, until ctx ends:
-// closing connections that have gone idle and pruning the dedupe table.
+// checking responses left by shutdown, closing idle connections and pruning
+// the dedupe table. On cancellation it gives warm sessions a shutdown notice
+// before releasing their gateway connections.
 //
 // It blocks, and it is the caller's to run beside the socket, rather than a
 // goroutine started at construction: a service that spawns work in a
@@ -303,9 +305,13 @@ func (b *Bot) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownNotifyTimeout)
+			b.notifySessionsOfShutdown(shutdownCtx)
+			cancel()
 			b.Close()
 			return ctx.Err()
 		case <-sweep.C:
+			b.CheckShutdownResponses(ctx)
 			b.closeIdle(ctx)
 		case <-prune.C:
 			b.pruneEvents(ctx)
@@ -363,6 +369,12 @@ func (b *Bot) closeIdle(ctx context.Context) {
 			continue
 		}
 		client := th.live()
+		// A gateway turn can outlive this process's turn goroutine (including a
+		// shutdown follow-up), so do not close its connection while it runs.
+		if client != nil && client.TurnRunning() {
+			th.turnMu.Unlock()
+			continue
+		}
 		if client != nil {
 			if now.Sub(row.LastActive) >= window {
 				th.close(ctx)
