@@ -206,14 +206,18 @@ type Observer interface {
 // goroutine, but its methods may be called from different ones over a turn's
 // life, so implementations must be safe for that.
 type Renderer interface {
-	// Start creates the reply: a streaming message, or a placeholder to patch.
+	// Start attempts to create the reply: a streaming message, or a placeholder
+	// to patch. The core calls it on the first visible text, not when the turn
+	// begins; it may continue rendering if this best-effort attempt fails.
 	Start(ctx context.Context) error
-	// Delta appends text pi has produced since the last call, in order.
+	// Delta appends visible text in order. It may be called without a successful
+	// Start so the renderer can retain partial text for Finish or Fail.
 	Delta(ctx context.Context, text string) error
 	// Finish presents the authoritative final answer, which supersedes
-	// whatever was streamed.
+	// whatever was streamed. It may be called without a successful Start, if
+	// the agent only provided final text or creating the reply failed.
 	Finish(ctx context.Context, final string) error
-	// Fail presents a failure in place of an answer.
+	// Fail presents a failure in place of an answer, including before Start.
 	Fail(ctx context.Context, cause error) error
 }
 
@@ -257,6 +261,12 @@ type StatusReporter interface {
 // work or refuses it. Platforms choose how to present the acknowledgement.
 type RequestAcknowledger interface {
 	AcknowledgeRequest(ctx context.Context, m Message, allowed bool) error
+}
+
+// RequestCompleter marks an addressed message after its turn succeeds. It is
+// optional because some surfaces cannot react to the original message.
+type RequestCompleter interface {
+	CompleteRequest(ctx context.Context, m Message) error
 }
 
 // Suggestion is one prompt a platform offers before the user types: a title for
@@ -330,7 +340,9 @@ type SurfaceIdentifier interface {
 
 type Platform interface {
 	// StartTurn builds a renderer for a reply to m. It must not have a side
-	// effect on the platform: the core calls Start on the first turn.
+	// effect on the platform: the core calls Renderer.Start after visible text
+	// arrives; if Start fails, it may still call Delta to retain partial text,
+	// then Finish or Fail.
 	StartTurn(ctx context.Context, m Message) (Renderer, error)
 	// Post posts a notice.
 	Post(ctx context.Context, n Notice) error

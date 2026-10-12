@@ -134,10 +134,11 @@ and `@pi /help` print the current list.
 In a **one-to-one DM**, plain text starts a session at the root and continues it in a
 thread — no mention needed. In a **channel or group DM**, only a message that mentions pi
 starts work; other replies are silently ignored as requests and read as context the next
-time pi is addressed. Mentions get an `eyes` reaction when access is allowed; requests
-outside the access policy get a `shrug` reaction and a private refusal. Plain text at
-channel or group DM roots is ignored, which keeps busy rooms from turning every later
-message into a prompt.
+time pi is addressed. On the app surface, accepted mentions and one-to-one DM requests
+get an `eyes` reaction; successful turns add a `white_check_mark`, while requests outside
+the access policy get a `shrug` reaction and a private refusal. Plain text at channel or
+group DM roots is ignored, which keeps busy rooms from turning every later message into a
+prompt.
 
 ### Images
 

@@ -215,6 +215,50 @@ func TestAcknowledgeRequestReactsToOriginalMessage(t *testing.T) {
 	}
 }
 
+func TestCompleteRequestReactsToOriginalMessage(t *testing.T) {
+	stub := &stubSlack{}
+	platform := newTestPlatform(t, stub, "patch")
+	message := testMessage()
+	message.TS = "1700000000.000200"
+
+	if err := platform.CompleteRequest(context.Background(), message); err != nil {
+		t.Fatalf("CompleteRequest: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "reactions.add" {
+		t.Fatalf("calls = %+v, want one reactions.add", calls)
+	}
+	params := calls[0].params
+	if params["channel"] != message.Thread.Channel || params["timestamp"] != message.TS || params["name"] != "white_check_mark" {
+		t.Errorf("reactions.add params = %+v, want channel=%q timestamp=%q name=white_check_mark",
+			params, message.Thread.Channel, message.TS)
+	}
+}
+
+func TestFinishWithoutStartPostsTheReadyAnswer(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	answer := "The answer is ready."
+
+	if err := r.Finish(context.Background(), answer); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
+		t.Fatalf("calls = %+v, want one post only after final text is ready", calls)
+	}
+	params := calls[0].params
+	if params["channel"] != r.channel || params["thread_ts"] != r.threadTS || params["text"] != answer {
+		t.Errorf("posted answer params = %+v, want channel=%q thread_ts=%q text=%q",
+			params, r.channel, r.threadTS, answer)
+	}
+	for _, call := range calls {
+		if call.method == "chat.startStream" || call.method == "chat.update" {
+			t.Errorf("final-only answer unexpectedly started or patched an empty reply: calls=%+v", calls)
+		}
+	}
+}
+
 func newTestRenderer(t *testing.T, stub *stubSlack, mode string) *renderer {
 	t.Helper()
 	return testRenderer(t, newTestPlatform(t, stub, mode))
@@ -487,6 +531,31 @@ func TestFailBeforeStartPostsFailureInThread(t *testing.T) {
 	}
 	if got := calls[0].params["text"]; got != ":warning: pi-chat: "+cause {
 		t.Errorf("failure text = %v, want the full cause", got)
+	}
+}
+
+func TestFailPreservesTextWhenNoReplyWasStarted(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+	if err := r.Delta(ctx, "partial answer"); err != nil {
+		t.Fatalf("Delta before Start: %v", err)
+	}
+	if calls := stub.recorded(); len(calls) != 0 {
+		t.Fatalf("buffering text without a reply made API calls: %+v", calls)
+	}
+	cause := errors.New("Slack was unavailable when the reply started")
+
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
+		t.Fatalf("calls = %+v, want a failure message posted after buffering", calls)
+	}
+	text := calls[0].params["text"].(string)
+	if !strings.Contains(text, "partial answer") || !strings.Contains(text, cause.Error()) {
+		t.Errorf("failure text = %q, want partial answer and cause", text)
 	}
 }
 

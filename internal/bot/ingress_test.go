@@ -142,25 +142,31 @@ func TestOnlyAddressedMessagesAreClaimed(t *testing.T) {
 	}
 }
 
-func TestTaggedMessageIsAcknowledgedBeforeAuthorizationOutcome(t *testing.T) {
+func TestAddressedMessageIsAcknowledgedBeforeAuthorizationOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		userID  string
+		direct  bool
 		allowed bool
 	}{
-		{name: "allowlisted", userID: "U1", allowed: true},
-		{name: "not allowlisted", userID: "U2"},
+		{name: "allowlisted mention", userID: "U1", allowed: true},
+		{name: "not allowlisted mention", userID: "U2"},
+		{name: "allowlisted DM", userID: "U1", direct: true, allowed: true},
+		{name: "not allowlisted DM", userID: "U2", direct: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b, platform, _ := newTestBot(t)
 			message := newTestMessage("Ev1", "please help")
 			message.UserID, message.TS = tc.userID, "1700000000.000200"
+			if tc.direct {
+				message.Mentioned, message.Direct = false, true
+			}
 
 			b.HandleMessage(context.Background(), message)
 
 			acks := platform.acknowledgedRequests()
 			if len(acks) != 1 || acks[0].allowed != tc.allowed || acks[0].message.TS != message.TS {
-				t.Fatalf("acknowledgements = %+v, want one for the tagged message with allowed=%v", acks, tc.allowed)
+				t.Fatalf("acknowledgements = %+v, want one for the addressed message with allowed=%v", acks, tc.allowed)
 			}
 			if tc.allowed {
 				waitFor(t, "the turn", func() bool { return platform.startedTurns() == 1 })

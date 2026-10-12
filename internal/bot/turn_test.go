@@ -251,14 +251,22 @@ func TestStripANSI(t *testing.T) {
 
 // recordingRenderer records what a turn renders.
 type recordingRenderer struct {
-	mu      sync.Mutex
-	deltas  []string
-	finals  []string
-	failure string
-	signal  chan struct{} // if set, receives a value on every Delta
+	mu       sync.Mutex
+	starts   int
+	startErr error
+	deltas   []string
+	finals   []string
+	failure  string
+	signal   chan struct{} // if set, receives a value on every Delta
 }
 
-func (r *recordingRenderer) Start(context.Context) error { return nil }
+func (r *recordingRenderer) Start(context.Context) error {
+	r.mu.Lock()
+	r.starts++
+	err := r.startErr
+	r.mu.Unlock()
+	return err
+}
 
 func (r *recordingRenderer) Delta(_ context.Context, text string) error {
 	r.mu.Lock()
@@ -289,6 +297,71 @@ func (r *recordingRenderer) rendered() string {
 	return strings.Join(r.deltas, "")
 }
 
+func (r *recordingRenderer) startCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.starts
+}
+
+func TestFlushRetainsTextWhenReplyStartFails(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Render.FlushMS = 60000
+	b := &Bot{cfg: cfg, log: discardLogger()}
+	th := &thread{key: "test", b: b, log: b.log}
+	r := &recordingRenderer{startErr: errors.New("Slack unavailable")}
+	st := newTurnState()
+
+	stop := th.flush(context.Background(), st, r)
+	st.feed(textDelta(t, "partial answer"), discardLogger())
+	stop()
+
+	if got := r.rendered(); got != "partial answer" {
+		t.Fatalf("buffered text = %q, want partial answer available to Fail", got)
+	}
+}
+
+func TestFlushThinkingOnlyDoesNotStartReply(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Render.FlushMS = 60000
+	b := &Bot{cfg: cfg, log: discardLogger()}
+	th := &thread{key: "test", b: b, log: b.log}
+	r := &recordingRenderer{}
+	st := newTurnState()
+
+	stop := th.flush(context.Background(), st, r)
+	st.feed(gwclient.Event{
+		Type: "message_update",
+		Raw:  []byte(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"private reasoning"}}`),
+	}, discardLogger())
+	stop()
+
+	if got := r.startCount(); got != 0 {
+		t.Fatalf("Start called %d times while only thinking was emitted", got)
+	}
+}
+
+func TestFlushStartsImmediatelyOnFirstText(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Render.FlushMS = 60000
+	b := &Bot{cfg: cfg, log: discardLogger()}
+	th := &thread{key: "test", b: b, log: b.log}
+	r := &recordingRenderer{signal: make(chan struct{}, 8)}
+	st := newTurnState()
+
+	stop := th.flush(context.Background(), st, r)
+	st.feed(textDelta(t, "visible answer"), discardLogger())
+	defer stop()
+
+	select {
+	case <-r.signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first text was not rendered immediately; got %q", r.rendered())
+	}
+	if got := r.startCount(); got != 1 {
+		t.Fatalf("Start called %d times for the first text chunk, want 1", got)
+	}
+}
+
 func TestFlushRendersPendingText(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Render.FlushMS = 5
@@ -315,6 +388,25 @@ func TestFlushRendersPendingText(t *testing.T) {
 	// Stopping twice must be safe: a turn stops the flusher before it finishes
 	// and again on the way out.
 	stop()
+}
+
+func TestRunTurnSetupFailureDoesNotCompleteRequest(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &recordingRenderer{}
+
+	err := th.runTurn(ctx, newTestMessage("setup-failure", "hello"), r)
+	if err == nil {
+		t.Fatal("runTurn with a canceled context unexpectedly succeeded")
+	}
+	if got := len(platform.completedRequests()); got != 0 {
+		t.Errorf("completed %d requests after setup failed before any output", got)
+	}
+	if got := r.startCount(); got != 0 {
+		t.Errorf("Start called %d times despite failure before output", got)
+	}
 }
 
 func TestFlushRendersBeforeExiting(t *testing.T) {

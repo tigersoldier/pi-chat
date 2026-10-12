@@ -110,7 +110,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	}
 
 	allowed := b.allowed(m.UserID, m.Thread.Channel)
-	if m.Mentioned {
+	if m.Mentioned || m.Direct {
 		b.acknowledgeRequest(ctx, m, allowed)
 	}
 	if !allowed {
@@ -639,8 +639,8 @@ func (b *Bot) stopTurn(ctx context.Context, a Action) {
 	b.setStatus(ctx, th, StatusIdle)
 }
 
-// acknowledgeRequest asks the platform to acknowledge a tagged request. The
-// reaction is a receipt, not part of authorization or turn execution, so a
+// acknowledgeRequest asks the platform to acknowledge an addressed request.
+// The reaction is a receipt, not part of authorization or turn execution, so a
 // platform failure is logged and never blocks either.
 func (b *Bot) acknowledgeRequest(ctx context.Context, m Message, allowed bool) {
 	reporter, ok := b.plat.(RequestAcknowledger)
@@ -649,6 +649,18 @@ func (b *Bot) acknowledgeRequest(ctx context.Context, m Message, allowed bool) {
 	}
 	if err := reporter.AcknowledgeRequest(ctx, m, allowed); err != nil {
 		b.log.Warn("cannot acknowledge the request", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
+	}
+}
+
+// completeRequest marks a successfully completed prompt on its original
+// message. It is best-effort like the acknowledgement sent when work starts.
+func (b *Bot) completeRequest(ctx context.Context, m Message) {
+	reporter, ok := b.plat.(RequestCompleter)
+	if !ok {
+		return
+	}
+	if err := reporter.CompleteRequest(ctx, m); err != nil {
+		b.log.Warn("cannot mark the request complete", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
 	}
 }
 
