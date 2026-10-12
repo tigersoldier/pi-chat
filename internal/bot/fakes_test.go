@@ -31,14 +31,15 @@ type requestAck struct {
 
 // fakePlatform records what the core asks a platform to do.
 type fakePlatform struct {
-	mu       sync.Mutex
-	turns    []Message
-	notices  []Notice
-	acks     []requestAck
-	opened   []string // the text of each thread the core asked for
-	thread   Thread   // what OpenThread returns; zero means a stand-in
-	renderer *recordingRenderer
-	statuses []Status // lifecycle states, in the order the core asked for them
+	mu        sync.Mutex
+	turns     []Message
+	notices   []Notice
+	acks      []requestAck
+	completed []Message
+	opened    []string // the text of each thread the core asked for
+	thread    Thread   // what OpenThread returns; zero means a stand-in
+	renderer  *recordingRenderer
+	statuses  []Status // lifecycle states, in the order the core asked for them
 
 	prompts        []Suggestion
 	promptsChannel string
@@ -89,6 +90,13 @@ func (p *fakePlatform) AcknowledgeRequest(_ context.Context, m Message, allowed 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.acks = append(p.acks, requestAck{message: m, allowed: allowed})
+	return nil
+}
+
+func (p *fakePlatform) CompleteRequest(_ context.Context, m Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.completed = append(p.completed, m)
 	return nil
 }
 
@@ -167,6 +175,12 @@ func (p *fakePlatform) acknowledgedRequests() []requestAck {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]requestAck(nil), p.acks...)
+}
+
+func (p *fakePlatform) completedRequests() []Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Message(nil), p.completed...)
 }
 
 // openedThreads returns the texts of the threads the core asked to open.

@@ -417,8 +417,9 @@ commands inside message threads** and its slash-command payload carries no `thre
    answering their colleague in a thread the bot happens to be in must not draw a visible
    reply about somebody's allowlist. Their *mention*, or their DM, is a request, and a
    refusal is the answer to it.
-8. **A mention is acknowledged before work or refusal.** Slack reacts `:eyes:` when the
-   sender is allowed; otherwise it reacts `:shrug:` and sends that person a private refusal.
+8. **An addressed request is acknowledged before work or refusal.** The app surface
+   reacts `:eyes:` to an allowed mention or one-to-one DM; a successful turn adds
+   `:white_check_mark:`. An unallowed request gets `:shrug:` and a private refusal.
 
 What reaches a session, and what does not:
 
@@ -477,9 +478,12 @@ already warm: a help request must not dial, create or wake a session to answer i
 ## 6. Rendering
 
 **Native Slack streaming is the primary path**; a patched placeholder is the documented
-fallback.
+fallback. Lifecycle status can show `processing` while the agent works, but the reply
+message is created only when the first visible text arrives. Thinking and tool-call
+arguments therefore do not leave an empty response in the conversation; a turn with no
+streamed deltas posts its final answer directly when it is ready.
 
-- `chat.startStream` on turn start; `chat.appendStream` with
+- `chat.startStream` on the first visible text delta; `chat.appendStream` with
   - `markdown_text` chunks for assistant text (standard markdown passes through — **no
     mrkdwn conversion table**),
   - `task_update` chunks for `tool_execution_start`/`_end` (`in_progress` →
@@ -488,8 +492,8 @@ fallback.
 
 Constraints and behaviours:
 
-- Appends are coalesced on `flush_ms`, never per token (the daemon already coalesces at
-  50 ms / 8 KB).
+- The first visible text starts the reply immediately; later appends are coalesced on
+  `flush_ms`, never per token (the daemon already coalesces at 50 ms / 8 KB).
 - `cannot_provide_both_markdown_text_and_chunks` per request — compose chunks.
 - Streaming to a channel requires `recipient_user_id` + `recipient_team_id`; thread
   replies use `thread_ts`.

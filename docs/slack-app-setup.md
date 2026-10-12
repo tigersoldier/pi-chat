@@ -210,7 +210,7 @@ Reference for what you just applied. Nothing here needs action.
 | `mpim:history` | read group direct messages | a multi-person DM that includes the bot |
 | `users:read` | look up who a user ID is | the names in a thread transcript: without it, lines read `[U123]` instead of `[Alice (U123)]` — the agent gets IDs either way, and the fallback is deliberate |
 | `files:read` | download files shared with the app | handing images from requests and thread context to the agent (built; an older install missing the scope must be reinstalled) |
-| `reactions:write` | add emoji reactions | 👀 on an accepted mention; 🤷 when access is denied |
+| `reactions:write` | add emoji reactions | 👀 on an accepted mention or one-to-one DM; ✅ after a successful turn; 🤷 when access is denied |
 | `assistant:write` | act as a Slack agent | **agent variant only** — required by `app_context_changed` and the legacy `assistant.threads.*` methods. The agent status and title methods pi-chat uses (`agents.sessions.setStatus`/`rename`) need `chat:write` alone |
 
 ### Bot events
