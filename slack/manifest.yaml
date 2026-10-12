@@ -1,5 +1,9 @@
 # pi-chat — Slack app manifest (standard bot)
 #
+# This variant deliberately omits Slack's agent messaging experience, so it has
+# no agent-session status or stop button. Prefer manifest-agent.yaml unless the
+# workspace cannot use the agent experience.
+#
 # Paste this into Slack to create the app with every scope, event and setting
 # pi-chat needs, instead of clicking through half a dozen settings pages.
 #

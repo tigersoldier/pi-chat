@@ -32,7 +32,7 @@ and they share one core, one store and one session pool:
 
 | Surface | Needs | Gives | Off when |
 |---|---|---|---|
-| **App** (default) | an installed app: `xapp-…` and `xoxb-…` | mentions, DMs, slash commands, buttons, status, notifications | `slack.enabled = false`, or either token file missing |
+| **App** (default) | an installed app: `xapp-…` and `xoxb-…` | mentions, DMs, slash commands, buttons, notifications; with the agent manifest, status and a stop button | `slack.enabled = false`, or either token file missing |
 | **Self-DM** (opt-in) | either your own `xoxc-…` token and `d` cookie, or a per-person `xoxp-…` token minted by the app | a private control channel in "Notes to self" | `slack.self_dm.enabled` is false (the default) |
 
 The mux routes a call by channel id, so the app's DM with you and your own
@@ -70,8 +70,11 @@ conversation.
    operations use the admin token, and the long-lived per-thread connections
    cannot destroy sessions.
 
-3. **A Slack app** — created from **[slack/manifest.yaml](slack/manifest.yaml)**;
-   walkthrough: **[docs/slack-app-setup.md](docs/slack-app-setup.md)**. The app is
+3. **A Slack app** — preferably created from
+   **[slack/manifest-agent.yaml](slack/manifest-agent.yaml)** for Slack's agent status and
+   stop button; use [slack/manifest.yaml](slack/manifest.yaml) only when the workspace
+   cannot use the agent experience. Walkthrough:
+   **[docs/slack-app-setup.md](docs/slack-app-setup.md)**. The app is
    optional: with no app tokens, the daemon runs the self-DM surface alone
    (**[docs/slack-self-dm-setup.md](docs/slack-self-dm-setup.md)**) — and with
    neither, it refuses to start and says so.

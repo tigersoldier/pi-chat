@@ -10,8 +10,10 @@ command.
 | `manifest-agent.yaml` | **Agent messaging experience** | **Recommended.** Slack's agent UX for DMs: a conversation timeline, a real agent status while a turn runs, and an interactive stop button. Needs the agent feature; where it is unavailable, pi-chat logs it once and runs without a status. |
 | `manifest.yaml` | Standard bot | A smaller app for a workspace where the agent feature is unavailable or an admin has it disabled. Same bot in every other respect — no timeline, no status, no stop button. |
 
-Both declare the same scopes and events. Nothing in pi-chat requires the agent one: it is a
-surface, not a dependency.
+They share the core messaging scopes and events. The agent manifest additionally declares
+`features.agent_view`, `assistant:write`, and the agent-related events (`app_home_opened`,
+`agent_session_stopped`, `app_context_changed`, and `agent_session_title_changed`). Nothing
+in pi-chat requires the agent one: it is a surface, not a dependency.
 
 Both are ordinary YAML; the comments mark the fields worth customizing (app name,
 descriptions, the slash-command name) and the fields that are load-bearing (scopes,
@@ -29,11 +31,17 @@ diff of what changes and then asks you to reinstall, so nothing changes silently
 the supported way to pick up a new scope or event: one paste instead of one click per
 setting, and the reinstall is the same either way.
 
-Moving an existing plain-bot app to `manifest-agent.yaml` is one such paste. Two things to
-know: the reinstall may issue a new bot token (check the `xoxb-` file and rewrite it if the
-prefix or value changed), and the agent experience is an admin setting — Admin → Apps and
-workflows → the app → App Settings → **AI agent experience** → Enabled — that needs a paid
-plan. Where it is off, the bot keeps working exactly as before.
+Moving an existing plain-bot app to `manifest-agent.yaml` is one such paste. The manifest
+declares `features.agent_view`; the equivalent app-level setting is in the Slack API
+dashboard at <https://api.slack.com/apps> → select the app → **Agents** (sometimes labeled
+**Agents & AI Apps**). Separately, a workspace/org admin can allow or disable the experience
+for the installed app: **Admin → Apps and workflows → Installed apps → [app] → App Settings
+→ AI agent experience**. Availability depends on the workspace plan and admin settings.
+Where the experience is disabled, the bot keeps working but Slack does not show agent
+sessions/status. Reinstall after applying manifest scope or event changes; Slack may issue a
+new bot token, so check the `xoxb-` file and update it if needed. Restart `pi-chatd` after
+changing app/admin settings so it reloads credentials and retries any previously unsupported
+agent status.
 
 ## What a manifest cannot do
 

@@ -42,10 +42,15 @@ socket. Consequences worth knowing before you start:
 3. Pick the workspace you want the bot in, and click **Next**.
 4. Paste the whole of [`slack/manifest-agent.yaml`](../slack/manifest-agent.yaml) into
    the field. That is the recommended app: it gives the DM a conversation timeline and the
-   agent a real status with a working stop button. If your workspace has no agent feature —
-   it is an admin setting, and Slack offers it on paid plans — or you want the smallest
-   possible app instead, paste [`slack/manifest.yaml`](../slack/manifest.yaml): same bot,
-   no agent surface. See [the agent variant](#the-agent-variant) below.
+   agent a real status with a working stop button. This manifest declares `features.agent_view`.
+   If configuring the app by hand, enable **Agents** (sometimes **Agents & AI Apps**) in the
+   app's settings at <https://api.slack.com/apps> → select the app. Separately, a workspace
+   or org admin can allow/disable the experience for the installed app at **Admin → Apps and
+   workflows → Installed apps → [app] → App Settings → AI agent experience**. If the
+   workspace does not support the feature, or its admin disables it, use
+   [`slack/manifest.yaml`](../slack/manifest.yaml) instead: same core bot, no agent status,
+   timeline, or stop button. Availability may depend on the workspace plan. See
+   [the agent variant](#the-agent-variant) below.
 5. Review the summary Slack shows — it lists the scopes, events and settings it is about
    to apply — and click **Create**.
 
@@ -318,7 +323,8 @@ Slack's own pages, or who need to check what the manifest applied.
 | Features → **Interactivity & Shortcuts** | enable; no Request URL needed |
 | Features → **Slash Commands** | create `/pi`; under Socket Mode the Request URL is never called, but Slack still parses it, so any parseable `https://` placeholder works |
 | Settings → **Install App** | install; copy the bot token |
-| Features → **Agents & AI Apps** (optional) | enable the agent experience; equivalent to the agent manifest |
+| App settings → **Agents** (sometimes **Agents & AI Apps**) | declare the app as an agent; `manifest-agent.yaml` sets `features.agent_view` |
+| Workspace Admin → Apps and workflows → Installed apps → app → App Settings → **AI agent experience** | allow the experience for this installation; separate from the app manifest |
 
 Then continue at [Step 2](#step-2--generate-the-app-level-token).
 
@@ -331,7 +337,7 @@ Then continue at [Step 2](#step-2--generate-the-app-level-token).
 | `not_in_channel` | Invite the bot: `/invite @pi` |
 | Nothing happens on `@pi hello` | The app is not a member of that conversation, `app_mention` is not subscribed, Socket Mode is off, or `allowed_users` does not contain you. Slack's app page shows each toggle; pi-chatd logs the refusal |
 | DMs do not reach the bot | The Messages Tab setting is off, or `im:history` / `message.im` is missing |
-| `feature_disabled` | The agent manifest was used on a workspace without the agent feature. Use `slack/manifest.yaml` instead |
+| `feature_disabled` | The workspace does not support Agent Sessions or its admin disabled the AI agent experience for this app. Ask an admin to enable it, then restart `pi-chatd` (it remembers unsupported status for the life of the process), or use `slack/manifest.yaml` without session status |
 | Events arrive twice or not at all | Two instances of `pi-chatd` are running. Socket Mode splits events across connections, so the daemon is deliberately single-instance |
 | `/pi` worked once, then stopped | A scope or event change disabled the install. Reinstall |
 | `invalid_url` / `dispatch_failed` on `/pi` | The placeholder Request URL is unparseable. Slack validates it even though Socket Mode never calls it; use a real-looking HTTPS URL |
@@ -354,7 +360,8 @@ Never commit either file. The repository's `.gitignore` blocks `*.token`, `*-tok
 
 ## Checklist
 
-- [ ] App created from `slack/manifest.yaml` (or the agent variant)
+- [ ] App created from `slack/manifest-agent.yaml` for Slack agent status (or
+      `slack/manifest.yaml` if the workspace cannot use it)
 - [ ] App-level token created with `connections:write` → `slack-app-token`
 - [ ] App installed to the workspace, bot token → `slack-bot-token`
 - [ ] `chmod 600` on both token files
