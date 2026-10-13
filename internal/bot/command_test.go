@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
+	"github.com/tigersoldier/pi-gateway/protocol"
 
 	"github.com/tigersoldier/pi-chat/internal/config"
 	"github.com/tigersoldier/pi-chat/internal/store"
@@ -72,6 +73,12 @@ func TestCommandScope(t *testing.T) {
 		{"resume", true, true},
 		{"delete", false, false},
 		{"delete", true, true},
+		{"abort", false, false},
+		{"abort", true, true},
+		{"model", false, false},
+		{"model", true, true},
+		{"stop", false, false},
+		{"stop", true, true},
 	}
 	for _, test := range tests {
 		if got := controls()[test.name].scope.allows(test.inThread); got != test.want {
@@ -111,8 +118,13 @@ func TestDispatchHelpListsTheCommandsOfItsContext(t *testing.T) {
 
 		waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
 		text := platform.postedNotices()[0].Text
-		if !strings.Contains(text, "@pi /status") || !strings.Contains(text, "@pi /delete") {
-			t.Errorf("the thread help does not list the thread commands:\n%s", text)
+		if !strings.Contains(text, "@pi /status") || !strings.Contains(text, "@pi /delete") ||
+			!strings.Contains(text, "@pi /abort") || !strings.Contains(text, "@pi /model [provider/model]") ||
+			!strings.Contains(text, "@pi /stop") {
+			t.Errorf("the thread help does not list the implemented thread commands:\n%s", text)
+		}
+		if strings.Contains(text, "not in this build yet") {
+			t.Errorf("the help marks a command implemented here as pending:\n%s", text)
 		}
 		if strings.Contains(text, "• `/pi resume`") {
 			t.Errorf("the thread help lists a channel command:\n%s", text)
@@ -243,8 +255,12 @@ func TestDispatchResumeInThreadOffersOnlyThatThreadsRetiredSessions(t *testing.T
 	b.HandleCommand(context.Background(), commandRequest(thread.ThreadTS, "/resume"))
 	waitFor(t, "the retired picker", func() bool { return len(platform.postedNotices()) == 1 })
 	notice := platform.postedNotices()[0]
-	if len(notice.Buttons) != 1 || notice.Buttons[0].Value != "/sessions/old.jsonl" || notice.Buttons[0].ActionID != ActionResumeRetired {
+	if len(notice.Buttons) != 1 || notice.Buttons[0].ActionID != ActionResumeRetired {
 		t.Fatalf("retired picker = %+v, want only this thread's old session", notice.Buttons)
+	}
+	choice, ok := decodeRetiredChoice(notice.Buttons[0].Value)
+	if !ok || choice.SessionPath != "/sessions/old.jsonl" || choice.Thread.Key() != thread.Key() {
+		t.Errorf("retired button choice = %+v, %v; want this thread and its old session", choice, ok)
 	}
 	if notice.Thread == nil || notice.Thread.ThreadTS != thread.ThreadTS {
 		t.Errorf("retired picker was not posted in the original thread: %+v", notice.Thread)
@@ -268,8 +284,8 @@ func TestResumeRetiredSessionRestoresOriginalThreadEvenIfGatewayAttachMustRetry(
 	b.gw = &fakeGateway{rows: []gwclient.SessionRow{{Path: path, Name: "old-session", ID: "sid-old", Cwd: "/work/old/wt"}}}
 
 	b.HandleAction(context.Background(), Action{
-		EventID: "Ev-resume-retired", Channel: thread.Channel, Thread: &thread, UserID: "U1", Workspace: thread.Workspace,
-		ActionID: ActionResumeRetired, Value: path, MessageTS: "1700000000.000900",
+		EventID: "Ev-resume-retired", Channel: thread.Channel, UserID: "U1", Workspace: thread.Workspace,
+		ActionID: ActionResumeRetired, Value: encodeRetiredChoice(thread, path), ReplyTo: "response-url",
 	})
 	waitFor(t, "restored row", func() bool { return th.snapshot().SessionPath == path })
 	row, found, err := st.Thread(context.Background(), thread.Key())
@@ -364,25 +380,154 @@ func TestResumeSessionRefusesAValueThatIsNotInTheCatalog(t *testing.T) {
 	}
 }
 
-func TestDispatchAnswersReservedCommandsInsteadOfForwardingThem(t *testing.T) {
-	// The grammar reserves more commands than this build implements, and
-	// forwarding one of those would send its literal text to the agent: a clear
-	// "not yet" is better. `/delete` used to be answered here and is not any more
-	// — it deletes.
-	for _, name := range []string{"/abort", "/model", "/stop"} {
-		t.Run(name, func(t *testing.T) {
+func TestDispatchControlCommandsDoNotReachTheAgentWithoutASession(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{"abort", "no session"},
+		{"model", "no session"},
+		{"stop", "no session"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			b, platform, _ := newTestBot(t)
 
-			b.HandleCommand(context.Background(), commandRequest("1700000000.000100", name))
+			b.HandleCommand(context.Background(), commandRequest("1700000000.000100", "/"+test.name))
 
 			waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
 			if platform.startedTurns() != 0 {
-				t.Fatal("a reserved command reached the agent")
+				t.Fatal("a control command reached the agent")
 			}
-			if text := platform.postedNotices()[0].Text; !strings.Contains(text, "not in this build") {
-				t.Errorf("the answer does not explain itself: %q", text)
+			if text := strings.ToLower(platform.postedNotices()[0].Text); !strings.Contains(text, test.want) {
+				t.Errorf("the answer %q does not contain %q", text, test.want)
 			}
 		})
+	}
+}
+
+func TestAbortCommandWithoutRunningTurn(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: thread.Key(), WorkspaceID: thread.Workspace, ChannelID: thread.Channel,
+		ThreadTS: thread.ThreadTS, SessionPath: "/sessions/a.jsonl", State: store.StateCold,
+	})
+
+	b.HandleCommand(context.Background(), commandRequest(thread.ThreadTS, "/abort"))
+
+	waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
+	if text := platform.postedNotices()[0].Text; !strings.Contains(text, "No turn is running") {
+		t.Errorf("the answer does not describe the idle session: %q", text)
+	}
+	if platform.startedTurns() != 0 {
+		t.Fatal("/abort reached the agent as a turn")
+	}
+}
+
+func TestModelAndStopRefuseDuringAThreadTurn(t *testing.T) {
+	for _, name := range []string{"model", "stop"} {
+		t.Run(name, func(t *testing.T) {
+			b, platform, _ := newTestBot(t)
+			thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+			th, err := b.threadFor(thread)
+			if err != nil {
+				t.Fatalf("threadFor: %v", err)
+			}
+			th.update(func(row *store.ThreadRow) {
+				row.SessionPath = "/sessions/a.jsonl"
+				row.State = store.StateWarm
+			})
+			th.turnMu.Lock()
+			b.HandleCommand(context.Background(), commandRequest(thread.ThreadTS, "/"+name))
+			waitFor(t, "the busy-session answer", func() bool { return len(platform.postedNotices()) == 1 })
+			th.turnMu.Unlock()
+
+			if text := platform.postedNotices()[0].Text; !strings.Contains(text, "turn is running") {
+				t.Errorf("the answer %q does not explain the refusal", text)
+			}
+			if stopped := b.life.(*fakeLifecycle).stoppedSessions(); len(stopped) != 0 {
+				t.Errorf("stopped sessions = %v, want none while a turn runs", stopped)
+			}
+		})
+	}
+}
+
+func TestStopStopsOnlyTheOwnedSessionAndKeepsItsRow(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: thread.Key(), WorkspaceID: thread.Workspace, ChannelID: thread.Channel,
+		ThreadTS: thread.ThreadTS, SessionName: "owned", SessionPath: "/sessions/a.jsonl",
+		State: store.StateWarm,
+	})
+
+	b.HandleCommand(context.Background(), commandRequest(thread.ThreadTS, "/stop"))
+
+	waitFor(t, "the stop result", func() bool { return len(platform.postedNotices()) == 1 })
+	if got := b.life.(*fakeLifecycle).stoppedSessions(); len(got) != 1 || got[0] != "/sessions/a.jsonl" {
+		t.Fatalf("stopped sessions = %v, want only the thread's session", got)
+	}
+	row, found, err := st.Thread(context.Background(), thread.Key())
+	if err != nil || !found {
+		t.Fatalf("thread row: found=%v err=%v", found, err)
+	}
+	if row.SessionPath != "/sessions/a.jsonl" || row.State != store.StateCold {
+		t.Errorf("stop did not preserve the resumable session as cold: %+v", row)
+	}
+	if text := platform.postedNotices()[0].Text; !strings.Contains(text, "session and its worktree are kept") {
+		t.Errorf("the answer does not explain what stop preserves: %q", text)
+	}
+}
+
+func TestStopRetriesTheTransientDetachRace(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	seedThread(t, st, store.ThreadRow{
+		ThreadKey: thread.Key(), WorkspaceID: thread.Workspace, ChannelID: thread.Channel,
+		ThreadTS: thread.ThreadTS, SessionName: "owned", SessionPath: "/sessions/a.jsonl",
+		State: store.StateWarm,
+	})
+	life := b.life.(*fakeLifecycle)
+	life.failStopSequence(&gwclient.ResponseError{Code: protocol.CodeSessionAttached})
+
+	r := request{thread: &thread, channel: thread.Channel, userID: "U1", workspace: thread.Workspace}
+	if err := b.cmdStop(context.Background(), r, ""); err != nil {
+		t.Fatalf("cmdStop after a transient detach refusal: %v", err)
+	}
+	if got := life.stopCallCount(); got != 2 {
+		t.Errorf("stop calls = %d, want one retry after session_attached", got)
+	}
+	if got := life.stoppedSessions(); len(got) != 1 || got[0] != "/sessions/a.jsonl" {
+		t.Errorf("stopped sessions = %v, want the owned session", got)
+	}
+	if got := platform.postedNotices(); len(got) != 1 || !strings.Contains(got[0].Text, "session and its worktree are kept") {
+		t.Errorf("stop answer = %+v", got)
+	}
+}
+
+func TestModelReferenceRequiresConfiguredProviderAndID(t *testing.T) {
+	models := []gwclient.Model{
+		{Provider: "openai", ID: "gpt-5", Name: "GPT-5"},
+		{Provider: "anthropic", ID: "claude-sonnet", Name: "Claude Sonnet"},
+		{ID: "local-model"},
+	}
+	for _, test := range []struct {
+		ref  string
+		want string
+	}{
+		{"openai/gpt-5", "gpt-5"},
+		{"anthropic/claude-sonnet", "claude-sonnet"},
+		{"local-model", "local-model"},
+	} {
+		model, ok := findAvailableModel(models, test.ref)
+		if !ok || model.ID != test.want {
+			t.Errorf("findAvailableModel(%q) = %+v, %v", test.ref, model, ok)
+		}
+	}
+	for _, ref := range []string{"gpt-5", "openai/not-configured", "OpenAI/gpt-5"} {
+		if model, ok := findAvailableModel(models, ref); ok {
+			t.Errorf("findAvailableModel(%q) unexpectedly matched %+v", ref, model)
+		}
 	}
 }
 

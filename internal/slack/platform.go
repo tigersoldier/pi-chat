@@ -138,9 +138,10 @@ func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
 	if channel == "" && n.Thread != nil {
 		channel = n.Thread.Channel
 	}
+	replaceOriginal := n.ReplaceOriginal || n.Update != ""
 	switch {
 	case n.ReplyTo != "":
-		err := p.api.Respond(ctx, n.ReplyTo, n.Text, blocks, n.Update != "")
+		err := p.api.Respond(ctx, n.ReplyTo, n.Text, blocks, replaceOriginal)
 		if err == nil {
 			return nil
 		}
@@ -148,7 +149,7 @@ func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
 		// — whether it was the first post or the replacement of a confirmation. A
 		// replace that fails leaves the original in place, which is stale but
 		// readable; silence is not.
-		if n.Update != "" {
+		if replaceOriginal {
 			p.log.Warn("cannot replace the message; posting the answer instead", "error", err)
 		} else {
 			p.log.Warn("cannot answer through the response URL; posting instead", "error", err)

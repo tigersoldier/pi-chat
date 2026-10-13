@@ -25,6 +25,10 @@ const (
 
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ctx = turnCtx
+
 	var st *turnState
 	held := false
 	waited := false
@@ -37,6 +41,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		active := th.cur.Load()
 		if active == nil {
 			st = newPromptTurnState()
+			st.cancel = cancel
 			if th.cur.CompareAndSwap(nil, st) {
 				break
 			}
@@ -458,6 +463,7 @@ func reconcileObservedText(st *turnState, final string, before [32]byte, haveBef
 // (DESIGN.md §4). Everything it does is a buffer append or a channel close;
 // the rendering side reads the buffers from other goroutines.
 type turnState struct {
+	cancel         context.CancelFunc
 	mu             sync.Mutex
 	pending        strings.Builder // text not yet rendered
 	messages       []string        // completed assistant messages with visible text

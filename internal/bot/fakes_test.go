@@ -244,13 +244,34 @@ func (g *fakeGateway) Sessions(context.Context) ([]gwclient.SessionRow, error) {
 
 func (g *fakeGateway) Status(context.Context) string { return g.status }
 
-// fakeLifecycle records the sessions the core asks the gateway to delete, and
-// can be told to refuse — which is how the paths where a delete must not happen
-// are tested.
+// fakeLifecycle records the sessions the core asks the gateway to stop or
+// delete, and can be told to refuse — which is how the paths where either
+// operation must not happen are tested.
 type fakeLifecycle struct {
-	mu      sync.Mutex
-	deleted []string
-	err     error
+	mu         sync.Mutex
+	stopped    []string
+	deleted    []string
+	stopErrors []error
+	stopCalls  int
+	err        error
+}
+
+func (l *fakeLifecycle) StopSession(_ context.Context, path string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stopCalls++
+	if len(l.stopErrors) > 0 {
+		err := l.stopErrors[0]
+		l.stopErrors = l.stopErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	if l.err != nil {
+		return l.err
+	}
+	l.stopped = append(l.stopped, path)
+	return nil
 }
 
 func (l *fakeLifecycle) DeleteSession(_ context.Context, path string) error {
@@ -261,6 +282,25 @@ func (l *fakeLifecycle) DeleteSession(_ context.Context, path string) error {
 	}
 	l.deleted = append(l.deleted, path)
 	return nil
+}
+
+func (l *fakeLifecycle) failStopSequence(errs ...error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stopErrors = append([]error(nil), errs...)
+}
+
+func (l *fakeLifecycle) stopCallCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stopCalls
+}
+
+// stoppedSessions returns the paths the core stopped, in order.
+func (l *fakeLifecycle) stoppedSessions() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.stopped...)
 }
 
 // deletedSessions returns the paths the core deleted, in order.

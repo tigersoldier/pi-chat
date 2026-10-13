@@ -73,6 +73,15 @@ func TestPostChoosesWhereANoticeGoes(t *testing.T) {
 			wantMethod:  "response",
 			wantReplace: true,
 		},
+		{
+			name: "a response URL replaces an ephemeral source without a timestamp",
+			mutate: func(n *bot.Notice) {
+				n.ReplyTo = "RESPONSE_URL"
+				n.ReplaceOriginal = true
+			},
+			wantMethod:  "response",
+			wantReplace: true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

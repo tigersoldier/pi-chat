@@ -295,6 +295,10 @@ func TestDeleteCancelDeletesNothing(t *testing.T) {
 
 	press := deletePress(row.SessionPath)
 	press.ActionID = ActionDeleteCancel
+	// Slack omits an ephemeral source message's timestamp, but supplies a
+	// response URL that can replace it.
+	press.MessageTS = ""
+	press.ReplyTo = "response-url"
 	b.HandleAction(context.Background(), press)
 
 	waitFor(t, "the answer", func() bool { return len(platform.postedNotices()) == 1 })
@@ -311,7 +315,10 @@ func TestDeleteCancelDeletesNothing(t *testing.T) {
 	// The confirmation is replaced rather than left behind: a stale Delete button
 	// in a thread is a trap.
 	if notice.Update != press.MessageTS {
-		t.Errorf("the confirmation was not replaced (Update = %q)", notice.Update)
+		t.Errorf("the confirmation update timestamp = %q, want %q", notice.Update, press.MessageTS)
+	}
+	if !notice.ReplaceOriginal {
+		t.Error("the ephemeral confirmation must be replaced through response_url even without a message timestamp")
 	}
 }
 

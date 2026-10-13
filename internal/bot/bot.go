@@ -672,7 +672,12 @@ func (b *Bot) stopTurn(ctx context.Context, a Action) {
 		b.log.Debug("a stop arrived for a thread with no session", "thread", a.Thread.Key())
 		return
 	}
-	if th.abort(ctx) {
+	stopped, err := th.abort(ctx)
+	if err != nil {
+		b.log.Warn("cannot stop the turn", "thread", th.key, "error", err)
+		return // keep the indicator while the turn may still be running
+	}
+	if stopped {
 		// The turn clears the status itself, wherever it ends.
 		b.log.Info("stopped the turn", "thread", th.key, "user", a.UserID)
 		return

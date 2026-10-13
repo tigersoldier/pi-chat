@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
@@ -20,6 +21,22 @@ import (
 // identity and whatever the agent wrote stays on disk, but the thread must stop
 // pointing at the tombstoned session so the next message starts a new one
 // deliberately.
+func TestAttachExistingNeverCreatesASession(t *testing.T) {
+	b, _, _ := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	th, err := b.threadFor(thread)
+	if err != nil {
+		t.Fatalf("threadFor: %v", err)
+	}
+
+	if _, err := th.attachExisting(context.Background()); !errors.Is(err, errNoSession) {
+		t.Fatalf("attachExisting error = %v, want %v", err, errNoSession)
+	}
+	if row := th.snapshot(); row.SessionPath != "" || row.ProjectDir != "" {
+		t.Errorf("an attach-only operation provisioned a session: %+v", row)
+	}
+}
+
 func TestForgetSessionReservesTheKeyButDropsTheSession(t *testing.T) {
 	b, _, st := newTestBot(t)
 	key := "T1:C1:1700000000.000100"
@@ -542,5 +559,73 @@ func TestObservedTurnForgetsDeletedSession(t *testing.T) {
 	}
 	if _, known := th.assistantBaseline(); known {
 		t.Error("deleted session's assistant baseline survived cleanup")
+	}
+}
+
+type fakeTurnAborter struct {
+	running    bool
+	state      protocol.PiState
+	stateErr   error
+	abortErr   error
+	stateCalls int
+	abortCalls int
+}
+
+func (f *fakeTurnAborter) TurnRunning() bool { return f.running }
+
+func (f *fakeTurnAborter) GetState(context.Context) (protocol.PiState, error) {
+	f.stateCalls++
+	return f.state, f.stateErr
+}
+
+func (f *fakeTurnAborter) Abort(context.Context) (*gwclient.Response, error) {
+	f.abortCalls++
+	return nil, f.abortErr
+}
+
+func TestAbortGatewayTurnFindsTurnOwnedByAnotherClient(t *testing.T) {
+	client := &fakeTurnAborter{state: protocol.PiState{IsStreaming: true}}
+	stopped, err := abortGatewayTurn(context.Background(), client)
+	if err != nil || !stopped {
+		t.Fatalf("abortGatewayTurn = %v, %v; want stopped", stopped, err)
+	}
+	if client.stateCalls != 1 || client.abortCalls != 1 {
+		t.Errorf("state calls = %d, abort calls = %d; want one of each", client.stateCalls, client.abortCalls)
+	}
+}
+
+func TestAbortGatewayTurnLeavesAnIdleSessionAlone(t *testing.T) {
+	client := &fakeTurnAborter{}
+	stopped, err := abortGatewayTurn(context.Background(), client)
+	if err != nil || stopped {
+		t.Fatalf("abortGatewayTurn = %v, %v; want no running turn", stopped, err)
+	}
+	if client.abortCalls != 0 {
+		t.Errorf("Abort was called %d times on an idle session", client.abortCalls)
+	}
+}
+
+func TestAbortCancelsLocalTurnSetupBeforeAttach(t *testing.T) {
+	b, platform, _ := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	th, err := b.threadFor(thread)
+	if err != nil {
+		t.Fatalf("threadFor: %v", err)
+	}
+	turnCtx, cancel := context.WithCancel(context.Background())
+	st := newPromptTurnState()
+	st.cancel = cancel
+	th.cur.Store(st)
+	defer th.cur.Store(nil)
+
+	r := request{thread: &thread, channel: thread.Channel, userID: "U1", workspace: thread.Workspace}
+	if err := b.cmdAbort(context.Background(), r, ""); err != nil {
+		t.Fatalf("cmdAbort during setup: %v", err)
+	}
+	if err := turnCtx.Err(); err != context.Canceled {
+		t.Errorf("turn setup context error = %v, want context.Canceled", err)
+	}
+	if notices := platform.postedNotices(); len(notices) != 1 || !strings.Contains(notices[0].Text, "current turn was stopped") {
+		t.Errorf("abort answer = %+v, want setup cancellation instead of an idle-session answer", notices)
 	}
 }

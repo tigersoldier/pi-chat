@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -60,6 +61,8 @@ const (
 	resumeLimit = 5
 	// commandLimit is how many of the session's own commands /help lists.
 	commandLimit = 20
+	// modelLimit keeps /model's picker readable when many providers are configured.
+	modelLimit = 20
 )
 
 // Texts for the situations where the bot has to say no or explain itself.
@@ -140,7 +143,7 @@ func controls() map[string]control {
 		"abort": {
 			scope:   scopeThread,
 			summary: "cancel the running turn; queued prompts survive",
-			pending: "phase 2",
+			run:     (*Bot).cmdAbort,
 		},
 		"delete": {
 			scope:   scopeThread,
@@ -150,12 +153,13 @@ func controls() map[string]control {
 		"model": {
 			scope:   scopeThread,
 			summary: "show or switch the session's model",
-			pending: "phase 2",
+			usage:   "[provider/model]",
+			run:     (*Bot).cmdModel,
 		},
 		"stop": {
 			scope:   scopeThread,
 			summary: "stop the session's pi process (it can be reopened)",
-			pending: "phase 2",
+			run:     (*Bot).cmdStop,
 		},
 	}
 }
@@ -233,6 +237,175 @@ func (b *Bot) cmdNew(ctx context.Context, r request, arg string) error {
 		})
 	}
 	return nil
+}
+
+// cmdAbort cancels the active turn without disturbing prompts already queued
+// by pi-gatewayd (DESIGN.md §5).
+func (b *Bot) cmdAbort(ctx context.Context, r request, _ string) error {
+	th, ok := b.tracked(*r.thread)
+	if !ok || (th.snapshot().SessionPath == "" && !th.busy()) {
+		b.answer(ctx, r, "This thread has no session to abort yet.")
+		return nil
+	}
+	stopped, err := th.abort(ctx)
+	if err != nil {
+		return fmt.Errorf("abort the running turn: %w", err)
+	}
+	if !stopped {
+		b.answer(ctx, r, "No turn is running in this thread.")
+		return nil
+	}
+	b.answer(ctx, r, "The current turn was stopped. Queued prompts will still run.")
+	return nil
+}
+
+// cmdModel lists the session's configured models, or switches the model when
+// given an exact provider/model reference. It only attaches to an existing
+// session and refuses to inspect or change model state during a turn.
+func (b *Bot) cmdModel(ctx context.Context, r request, arg string) error {
+	th, ok := b.tracked(*r.thread)
+	if !ok || th.snapshot().SessionPath == "" {
+		b.answer(ctx, r, "This thread has no session yet — send me a prompt and it gets one.")
+		return nil
+	}
+	if !th.turnMu.TryLock() {
+		b.answer(ctx, r, "A turn is running here. Wait for it to finish before changing the model.")
+		return nil
+	}
+	defer th.turnMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+	defer cancel()
+	client, err := th.attachExisting(ctx)
+	if err != nil {
+		return fmt.Errorf("attach to the session: %w", err)
+	}
+	if client.TurnRunning() {
+		b.answer(ctx, r, "A turn is running here. Wait for it to finish before changing the model.")
+		return nil
+	}
+	models, err := client.GetAvailableModels(ctx)
+	if err != nil {
+		return fmt.Errorf("list available models: %w", err)
+	}
+	if arg != "" {
+		model, found := findAvailableModel(models, arg)
+		if !found {
+			b.answer(ctx, r, fmt.Sprintf("No configured model matches that reference. Use `%smodel` to see the available models.", threadForm))
+			return nil
+		}
+		if _, err := client.SetModel(ctx, model.Provider, model.ID); err != nil {
+			return fmt.Errorf("switch to model %s: %w", modelReference(model), err)
+		}
+		b.answer(ctx, r, "Switched this session to `"+modelReference(model)+"`.")
+		return nil
+	}
+
+	state, err := client.GetState(ctx)
+	if err != nil {
+		return fmt.Errorf("read the current model: %w", err)
+	}
+	current := modelReference(gwclient.Model{Provider: state.Model.Provider, ID: state.Model.ID})
+	lines := []string{"*Current model* `" + current + "`", "", "*Available models*"}
+	if len(models) == 0 {
+		lines = append(lines, "No models are configured.")
+	} else {
+		sort.Slice(models, func(i, j int) bool { return modelReference(models[i]) < modelReference(models[j]) })
+		for i, model := range models {
+			if i == modelLimit {
+				lines = append(lines, fmt.Sprintf("_…and %d more_", len(models)-modelLimit))
+				break
+			}
+			ref := modelReference(model)
+			line := fmt.Sprintf("• `%s`", ref)
+			if ref == current {
+				line = fmt.Sprintf("• `%s` — current", ref)
+			}
+			lines = append(lines, line)
+		}
+	}
+	b.answer(ctx, r, strings.Join(lines, "\n"))
+	return nil
+}
+
+// stopAfterDetach retries only the gateway's attached-client refusal. gw_bye
+// has no acknowledgement, so the just-closed thread connection can briefly
+// remain registered when the separate admin stop arrives. A persistent refusal
+// still fails safely; this never changes the stop's force=false behavior.
+func (b *Bot) stopAfterDetach(ctx context.Context, path string) error {
+	for attempt := range 5 {
+		err := b.life.StopSession(ctx, path)
+		if !isSessionAttached(err) || attempt == 4 {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(25<<attempt) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+// cmdStop gracefully stops the session's pi process but keeps its session file
+// and workspace. It never forces a stop; a busy or shared session is refused by
+// the gateway rather than interrupted (DESIGN.md §5, §8).
+func (b *Bot) cmdStop(ctx context.Context, r request, _ string) error {
+	th, ok := b.tracked(*r.thread)
+	if !ok || th.snapshot().SessionPath == "" {
+		b.answer(ctx, r, "This thread has no session to stop.")
+		return nil
+	}
+	if !th.turnMu.TryLock() {
+		b.answer(ctx, r, "A turn is running here. Stop it with `/abort`, or wait for it to finish.")
+		return nil
+	}
+	defer th.turnMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, stopTimeout)
+	defer cancel()
+	path := th.snapshot().SessionPath
+	// Stop requires the admin capability and refuses attached clients. Release
+	// this thread's binding first, then let the gateway decide whether any other
+	// client or active turn still makes a non-forced stop unsafe.
+	th.close(ctx)
+	th.update(func(row *store.ThreadRow) {
+		if row.SessionPath == path {
+			row.State = store.StateCold
+		}
+	})
+	if err := b.stopAfterDetach(ctx, path); err != nil {
+		if isGone(err) {
+			th.forgetSessionForPath(ctx, path)
+		}
+		return fmt.Errorf("stop the session without force: %w", err)
+	}
+	th.log.Info("stopped the session's pi process", "path", path)
+	b.answer(ctx, r, "Stopped pi. The session and its worktree are kept; the next prompt will reopen it.")
+	return nil
+}
+
+func modelReference(model gwclient.Model) string {
+	if model.Provider == "" {
+		return model.ID
+	}
+	return model.Provider + "/" + model.ID
+}
+
+func findAvailableModel(models []gwclient.Model, reference string) (gwclient.Model, bool) {
+	for _, model := range models {
+		if modelReference(model) == reference {
+			return model, true
+		}
+	}
+	return gwclient.Model{}, false
 }
 
 // cmdDelete answers @pi /delete. It asks before it deletes: the session file is
@@ -362,7 +535,7 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 	// Say what is happening before doing it: the answer is a message the user is
 	// already looking at, and the work below is slower than that.
 	b.reply(ctx, Notice{Thread: &th.t, Channel: th.t.Channel, UserID: a.UserID, Ephemeral: true,
-		ReplyTo: a.ReplyTo, Update: a.MessageTS,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS, ReplaceOriginal: true,
 		Text: fmt.Sprintf("Deleting `%s`…", row.SessionName)})
 
 	report, err := th.destroy(ctx)
@@ -372,7 +545,7 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 	if err != nil {
 		b.log.Warn("cannot delete the session", "thread", th.key, "error", err)
 		b.reply(ctx, Notice{Thread: &th.t, Channel: th.t.Channel, UserID: a.UserID, Ephemeral: true,
-			ReplyTo: a.ReplyTo, Update: a.MessageTS,
+			ReplyTo: a.ReplyTo, Update: a.MessageTS, ReplaceOriginal: true,
 			Text: "Nothing was deleted: " + err.Error()})
 		return
 	}
@@ -383,15 +556,15 @@ func (b *Bot) deleteSession(ctx context.Context, a Action) {
 		"branches", len(report.Cleanup.PrunedBranches),
 		"left", len(report.Cleanup.LeftBehind))
 	b.reply(ctx, Notice{Thread: &th.t, Channel: th.t.Channel, UserID: a.UserID, Ephemeral: true,
-		ReplyTo: a.ReplyTo, Update: a.MessageTS,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS, ReplaceOriginal: true,
 		Text: deleteAnswer(row, report)})
 }
 
 // cancelDelete answers the Cancel button: the confirmation is replaced and
 // nothing else happens.
 func (b *Bot) cancelDelete(ctx context.Context, a Action) {
-	b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
-		ReplyTo: a.ReplyTo, Update: a.MessageTS,
+	b.reply(ctx, Notice{Thread: a.Thread, Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS, ReplaceOriginal: true,
 		Text: "Nothing was deleted."})
 }
 
@@ -719,6 +892,33 @@ func (b *Bot) pickResumable(ctx context.Context, r request) error {
 	return b.plat.Post(ctx, n)
 }
 
+type retiredChoice struct {
+	Version     int    `json:"v"`
+	Thread      Thread `json:"t"`
+	SessionPath string `json:"p"`
+}
+
+func encodeRetiredChoice(thread Thread, sessionPath string) string {
+	thread.Surface = thread.SurfaceName()
+	value, _ := json.Marshal(retiredChoice{Version: 1, Thread: thread, SessionPath: sessionPath})
+	return string(value)
+}
+
+func decodeRetiredChoice(value string) (retiredChoice, bool) {
+	var choice retiredChoice
+	if err := json.Unmarshal([]byte(value), &choice); err != nil || choice.Version != 1 ||
+		choice.SessionPath == "" || choice.Thread.Channel == "" || choice.Thread.ThreadTS == "" {
+		return retiredChoice{}, false
+	}
+	switch choice.Thread.SurfaceName() {
+	case SurfaceApp, SurfaceSelfDM:
+		choice.Thread.Surface = choice.Thread.SurfaceName()
+	default:
+		return retiredChoice{}, false
+	}
+	return choice, true
+}
+
 // pickRetired answers @pi /resume with the sessions this thread replaced with
 // /new. Unlike root adoption, each choice returns to the same chat identity.
 func (b *Bot) pickRetired(ctx context.Context, r request) error {
@@ -763,7 +963,7 @@ func (b *Bot) pickRetired(ctx context.Context, r request) error {
 		n.Buttons = append(n.Buttons, Button{
 			ActionID: ActionResumeRetired,
 			Text:     sessionLabel(row),
-			Value:    old.SessionPath,
+			Value:    encodeRetiredChoice(th.t, old.SessionPath),
 		})
 		if len(n.Buttons) == resumeLimit {
 			break
@@ -832,7 +1032,7 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 	// cannot be adopted twice by an old button.
 	if a.MessageTS != "" || a.ReplyTo != "" {
 		b.reply(ctx, Notice{Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
-			ReplyTo: a.ReplyTo, Update: a.MessageTS,
+			ReplyTo: a.ReplyTo, Update: a.MessageTS, ReplaceOriginal: true,
 			Text: fmt.Sprintf("Adopted `%s`. Continue in the new thread.", sessionName(*chosen))})
 	}
 }
@@ -841,12 +1041,26 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 // The path is input from the adapter, so it is rechecked against both the
 // thread's retired records and the gateway catalog before moving its binding.
 func (b *Bot) resumeRetiredSession(ctx context.Context, a Action) {
-	r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo, thread: a.Thread}
-	if a.Thread == nil || a.Thread.ThreadTS == "" || a.Value == "" {
+	choice, ok := decodeRetiredChoice(a.Value)
+	if !ok {
+		r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo, thread: a.Thread}
 		b.answer(ctx, r, "That retired-session choice no longer identifies a thread. Ask for `@pi /resume` again.")
 		return
 	}
-	th, ok := b.tracked(*a.Thread)
+	thread := choice.Thread
+	if thread.Channel != a.Channel || (a.Workspace != "" && thread.Workspace != a.Workspace) {
+		r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo, thread: a.Thread}
+		b.answer(ctx, r, "That retired-session choice came from another conversation. Ask for `@pi /resume` again.")
+		return
+	}
+	if a.Thread != nil && (a.Thread.Channel != thread.Channel || a.Thread.ThreadTS != thread.ThreadTS ||
+		(a.Thread.Workspace != "" && a.Thread.Workspace != thread.Workspace)) {
+		r := request{channel: a.Channel, userID: a.UserID, workspace: a.Workspace, replyTo: a.ReplyTo, thread: a.Thread}
+		b.answer(ctx, r, "That retired-session choice no longer identifies this thread. Ask for `@pi /resume` again.")
+		return
+	}
+	r := request{channel: a.Channel, userID: a.UserID, workspace: thread.Workspace, replyTo: a.ReplyTo, thread: &thread}
+	th, ok := b.tracked(thread)
 	if !ok {
 		b.answer(ctx, r, "I cannot find this thread's state, so I did not restore anything.")
 		return
@@ -868,7 +1082,7 @@ func (b *Bot) resumeRetiredSession(ctx context.Context, a Action) {
 	}
 	var selected *store.RetiredSession
 	for i := range retired {
-		if retired[i].SessionPath == a.Value {
+		if retired[i].SessionPath == choice.SessionPath {
 			selected = &retired[i]
 			break
 		}
@@ -913,12 +1127,8 @@ func (b *Bot) resumeRetiredSession(ctx context.Context, a Action) {
 	if note := b.chatToolsUnavailableNotice(ctx, chosen.Path); note != "" {
 		message += "\n" + note
 	}
-	b.answer(ctx, r, message)
-	if a.MessageTS != "" || a.ReplyTo != "" {
-		b.reply(ctx, Notice{Thread: &th.t, Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
-			ReplyTo: a.ReplyTo, Update: a.MessageTS,
-			Text: fmt.Sprintf("Restored `%s` in this thread.", sessionName(*chosen))})
-	}
+	b.reply(ctx, Notice{Thread: &th.t, Channel: a.Channel, UserID: a.UserID, Ephemeral: true,
+		ReplyTo: a.ReplyTo, Update: a.MessageTS, ReplaceOriginal: true, Text: message})
 }
 
 // How to keep going in a thread the bot just opened. The grammar differs by
