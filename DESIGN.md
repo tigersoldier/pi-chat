@@ -515,10 +515,11 @@ Constraints and behaviours:
   streams fine, so the documented requirement is about channel-level streams. The retry
   has never fired and stays as insurance.
 - **Text that has arrived is always rendered before the answer is finalised.** Streaming
-  is progress, not the record: `Finish` presents the authoritative answer
-  (`GetLastAssistantText`) and *corrects* the message when it differs from what streamed.
-  A turn that produced several messages therefore ends showing the final answer, not a
-  concatenation of intermediates.
+  is progress, not the record: `Finish` uses `GetLastAssistantText` to correct the last
+  streamed assistant message when it differs. If a turn emits multiple assistant messages
+  with visible text, keep them in order and separate them with a blank line (`\n\n`), rather
+  than dropping earlier responses. A later user turn gets its own reply message instead of
+  updating the previous turn's answer.
 - **Status and title, two tiers:**
   - *Declared as an agent* (`slack/manifest.yaml`, Slack's agent messaging
     experience): `agents.sessions.setStatus` takes real lifecycle values that map onto

@@ -17,7 +17,10 @@ import (
 // startGrace bounds how long a turn waits for evidence that the agent actually
 // started. pi publishes agent_start before doing any work, so this is only
 // reached when a prompt is accepted and then produces nothing.
-const startGrace = 15 * time.Second
+const (
+	startGrace                = 15 * time.Second
+	assistantMessageSeparator = "\n\n"
+)
 
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
@@ -109,11 +112,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if err != nil {
 		th.log.Warn("cannot read the answer", "error", err)
 	}
-	if final == "" {
-		// The streamed deltas are the fallback when the answer cannot be read
-		// back, for example after the session died mid-turn.
-		final = st.text()
-	}
+	// GetLastAssistantText returns just the last assistant message. Preserve
+	// any earlier visible messages from this turn, separated as paragraphs,
+	// while letting the authoritative final text correct the last one.
+	final = st.authoritativeText(final)
 	if final == "" || (final == before && !st.sawWork()) {
 		return errors.New("the agent produced no answer")
 	}
@@ -135,10 +137,11 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 // (DESIGN.md §4). Everything it does is a buffer append or a channel close;
 // the rendering side reads the buffers from other goroutines.
 type turnState struct {
-	mu      sync.Mutex
-	pending strings.Builder // text not yet rendered
-	all     strings.Builder // everything produced so far
-	work    bool
+	mu             sync.Mutex
+	pending        strings.Builder // text not yet rendered
+	messages       []string        // completed assistant messages with visible text
+	currentMessage strings.Builder // visible text in the current assistant message
+	work           bool
 
 	// firstTextCh wakes the renderer as soon as user-visible text arrives, so
 	// it can create a reply without showing an empty message during thinking.
@@ -187,7 +190,11 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		}
 		s.markWork()
 
-	case "message_start", "turn_start", "agent_start", "tool_execution_start", "tool_execution_update":
+	case "message_start":
+		s.startMessage()
+		s.markWork()
+
+	case "turn_start", "agent_start", "tool_execution_start", "tool_execution_update":
 		s.markWork()
 
 	case "agent_settled":
@@ -253,13 +260,25 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	}
 }
 
+func (s *turnState) startMessage() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentMessage.Len() > 0 {
+		s.messages = append(s.messages, s.currentMessage.String())
+		s.currentMessage.Reset()
+	}
+}
+
 func (s *turnState) append(delta string) {
 	if delta == "" {
 		return
 	}
 	s.mu.Lock()
+	if s.currentMessage.Len() == 0 && len(s.messages) > 0 {
+		s.pending.WriteString(assistantMessageSeparator)
+	}
 	s.pending.WriteString(delta)
-	s.all.WriteString(delta)
+	s.currentMessage.WriteString(delta)
 	s.mu.Unlock()
 	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
 }
@@ -288,7 +307,37 @@ func (s *turnState) sawWork() bool {
 func (s *turnState) text() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.all.String()
+	return s.streamedText()
+}
+
+// authoritativeText combines earlier streamed assistant messages with the
+// gateway's authoritative text for the last one. An empty final falls back to
+// the full stream, which is all that is available when reading it back failed.
+func (s *turnState) authoritativeText(final string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if final == "" {
+		return s.streamedText()
+	}
+	if len(s.messages) == 0 {
+		return final
+	}
+	return strings.Join(s.messages, assistantMessageSeparator) + assistantMessageSeparator + final
+}
+
+// streamedText joins all streamed message text while the mutex is held.
+func (s *turnState) streamedText() string {
+	prior := strings.Join(s.messages, assistantMessageSeparator)
+	current := s.currentMessage.String()
+	switch {
+	case prior == "":
+		return current
+	case current == "":
+		return prior
+	default:
+		return prior + assistantMessageSeparator + current
+	}
 }
 
 // hasPending reports whether there is text waiting for the renderer.
