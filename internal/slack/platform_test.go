@@ -464,6 +464,55 @@ func TestPatchModeNeverStreams(t *testing.T) {
 	}
 }
 
+func TestEachTurnPostsANewReply(t *testing.T) {
+	posted := 0
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method != "chat.postMessage" {
+			return ""
+		}
+		posted++
+		return fmt.Sprintf(`{"ok":true,"ts":"1700000000.0000%02d"}`, posted)
+	}}
+	platform := newTestPlatform(t, stub, "patch")
+	ctx := context.Background()
+
+	// A later user prompt gets its own renderer and response; it must not reuse
+	// the previous turn's message handle.
+	for _, answer := range []string{"first response", "second response"} {
+		r := testRenderer(t, platform)
+		if err := r.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Delta(ctx, answer); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Finish(ctx, answer); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var messages, updated []string
+	for _, call := range stub.recorded() {
+		switch call.method {
+		case "chat.postMessage":
+			messages = append(messages, call.params["text"].(string))
+		case "chat.update":
+			updated = append(updated, call.params["ts"].(string))
+		}
+	}
+	if len(messages) != 2 {
+		t.Fatalf("posted %d replies, want one new reply for each turn", len(messages))
+	}
+	if len(updated) != 4 {
+		t.Fatalf("updated %d times, want streaming patches to each reply", len(updated))
+	}
+	for i, ts := range updated {
+		if want := fmt.Sprintf("1700000000.0000%02d", i/2+1); ts != want {
+			t.Errorf("update %d targeted %q, want the current turn's reply %q", i, ts, want)
+		}
+	}
+}
+
 func TestFailKeepsThePartialAnswer(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "patch")

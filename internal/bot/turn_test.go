@@ -52,6 +52,44 @@ func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 	}
 }
 
+func TestTurnStateSeparatesAssistantMessages(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(gwclient.Event{Type: "message_start"}, log)
+	st.feed(textDelta(t, "First "), log)
+	st.feed(textDelta(t, "response."), log)
+	if got := st.takePending(); got != "First response." {
+		t.Fatalf("first message = %q, want %q", got, "First response.")
+	}
+
+	st.feed(gwclient.Event{Type: "message_start"}, log)
+	st.feed(textDelta(t, "Second"), log)
+	if got := st.takePending(); got != "\n\nSecond" {
+		t.Fatalf("next message delta = %q, want a paragraph break before it", got)
+	}
+	if got := st.text(); got != "First response.\n\nSecond" {
+		t.Fatalf("full text = %q, want both messages separated by a paragraph", got)
+	}
+	if got := st.authoritativeText("Final second response."); got != "First response.\n\nFinal second response." {
+		t.Fatalf("authoritative text = %q, want prior message and corrected final response", got)
+	}
+}
+
+func TestTurnStateSkipsEmptyAssistantMessages(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(gwclient.Event{Type: "message_start"}, log)
+	st.feed(gwclient.Event{Type: "message_end"}, log)
+	st.feed(gwclient.Event{Type: "message_start"}, log)
+	st.feed(textDelta(t, "The answer."), log)
+
+	if got := st.text(); got != "The answer." {
+		t.Fatalf("text after an empty message = %q, want no leading separator", got)
+	}
+}
+
 func TestTurnStateIgnoresThinkingDeltas(t *testing.T) {
 	st := newTurnState()
 
