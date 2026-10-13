@@ -90,7 +90,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	}
 
 	stopFlush := th.flush(ctx, st, r)
-	defer stopFlush()
+	defer func() {
+		st.finishOpenTasks()
+		stopFlush()
+	}()
 
 	// What the thread has been saying since the last turn rides in front of this
 	// request (DESIGN.md §4). The fetch happens here — after the session exists
@@ -203,6 +206,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		return errors.New("the agent produced no answer")
 	}
 
+	st.finishOpenTasks()
 	stopFlush()
 	if err := r.Finish(ctx, final); err != nil {
 		return fmt.Errorf("finish the reply: %w", err)
@@ -214,8 +218,8 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 }
 
 // renderObservedTurn renders a turn the session started without a Slack
-// prompt. It waits for actual assistant text before creating a Slack reply, so
-// synthetic or textless wakes never become empty Slack replies.
+// prompt. It waits for visible text or task progress before creating a Slack
+// reply, so synthetic wakes never become empty Slack replies.
 func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	th.turnMu.Lock()
 	defer th.finishTurn(st)
@@ -288,14 +292,15 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	}
 
 	// A native completion can wake the parent without it producing a reply.
-	// Don't create an empty placeholder (or show the synthetic wake message).
-	for st.text() == "" {
+	// Don't create an empty placeholder unless task progress is available.
+	for st.text() == "" && !st.hasPendingTaskUpdates() {
 		select {
 		case <-st.textCh:
+		case <-st.taskCh:
 		case <-st.doneCh:
-			if st.text() == "" {
+			if st.text() == "" && !st.hasPendingTaskUpdates() {
 				reconcile()
-				if st.text() == "" {
+				if st.text() == "" && !st.hasPendingTaskUpdates() {
 					if client != nil && !st.sessionDeleted() {
 						th.saveCursorAfterActivity(ctx, client)
 					}
@@ -306,7 +311,7 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 			if err := reconnect(); err != nil {
 				if isDone() {
 					reconcile()
-					if st.text() != "" {
+					if st.text() != "" || st.hasPendingTaskUpdates() {
 						continue
 					}
 				}
@@ -325,7 +330,13 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 		return
 	}
 	stopFlush := th.flush(ctx, st, r)
-	defer stopFlush()
+	defer func() {
+		st.finishOpenTasks()
+		stopFlush()
+	}()
+	if st.hasPendingTaskUpdates() {
+		st.signalTaskUpdate()
+	}
 
 	var waitErr error
 waitForCompletion:
@@ -349,6 +360,7 @@ waitForCompletion:
 	if st.sessionDeleted() && waitErr == nil {
 		waitErr = fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
 	}
+	st.finishOpenTasks()
 	stopFlush()
 	if waitErr == nil {
 		reconcile()
@@ -360,8 +372,11 @@ waitForCompletion:
 		if err := r.Fail(terminalCtx, waitErr); err != nil {
 			th.log.Error("cannot report the asynchronous reply failure", "error", err)
 		}
-	} else if final := st.text(); final != "" {
-		th.rememberAssistant(final)
+	} else {
+		final := st.text()
+		if final != "" {
+			th.rememberAssistant(final)
+		}
 		if err := r.Finish(terminalCtx, final); err != nil {
 			th.log.Error("cannot finish the asynchronous reply", "error", err)
 		}
@@ -460,12 +475,15 @@ func reconcileObservedText(st *turnState, final string, before [32]byte, haveBef
 //
 // It is written by the connection's OnEvent callback, which runs on the read
 // goroutine and therefore must not block or call back into the gateway
-// (DESIGN.md §4). Everything it does is a buffer append or a channel close;
+// (DESIGN.md §4). Everything it does is a buffer append or a channel signal;
 // the rendering side reads the buffers from other goroutines.
 type turnState struct {
 	cancel         context.CancelFunc
 	mu             sync.Mutex
 	pending        strings.Builder // text not yet rendered
+	pendingTasks   []TaskProgress  // task updates not yet rendered
+	activeTasks    map[string]TaskProgress
+	activeTaskIDs  []string
 	messages       []string        // completed assistant messages with visible text
 	currentMessage strings.Builder // visible text in the current assistant message
 	shown          strings.Builder // text already handed to a renderer
@@ -494,15 +512,18 @@ type turnState struct {
 	doneCh     chan struct{} // closed on a terminal event
 	textCh     chan struct{} // closed on the first assistant text delta
 	finishedCh chan struct{} // closed after this turn's renderer is finished
+	taskCh     chan struct{} // wakes the renderer when a task update arrives
 }
 
 func newTurnState() *turnState {
 	return &turnState{
+		activeTasks: make(map[string]TaskProgress),
 		firstTextCh: make(chan struct{}),
 		workCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
 		textCh:      make(chan struct{}),
 		finishedCh:  make(chan struct{}),
+		taskCh:      make(chan struct{}, 1),
 	}
 }
 
@@ -529,10 +550,19 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		s.startMessage()
 		s.markWork()
 
-	case "turn_start", "agent_start", "tool_execution_start", "tool_execution_update":
+	case "turn_start", "agent_start", "tool_execution_update":
+		s.markWork()
+
+	case "tool_execution_start":
+		s.recordToolTask(ev, TaskInProgress)
+		s.markWork()
+
+	case "tool_execution_end":
+		s.recordToolTask(ev, TaskComplete)
 		s.markWork()
 
 	case "agent_settled":
+		s.finishOpenTasks()
 		// The only reliable end of work. message_end ends one message and
 		// turn_end ends one turn of the agent loop: a single prompt can produce
 		// several of each (a tool call, then the answer), so treating either as
@@ -548,6 +578,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		if turn.State == "running" {
 			s.markWork()
 		} else {
+			s.finishOpenTasks()
 			s.markDone()
 		}
 
@@ -558,6 +589,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 			// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
 			// because the read goroutine must not write to the database.
 			s.deleted.Store(true)
+			s.finishOpenTasks()
 			s.markDone()
 		}
 
@@ -593,6 +625,110 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	case "extension_error":
 		log.Warn("pi reported an extension error", "event", string(ev.Raw))
 	}
+}
+
+func (s *turnState) recordToolTask(ev gwclient.Event, status TaskProgressStatus) {
+	var tool struct {
+		ToolCallID string `json:"toolCallId"`
+		ToolName   string `json:"toolName"`
+		IsError    bool   `json:"isError"`
+	}
+	if err := ev.Unmarshal(&tool); err != nil {
+		return
+	}
+	id := strings.TrimSpace(tool.ToolCallID)
+	name := strings.TrimSpace(stripANSI(tool.ToolName))
+	if id == "" || name == "" {
+		return
+	}
+	if ev.Type == "tool_execution_end" && tool.IsError {
+		status = TaskError
+	}
+	title := taskTitle(name)
+	update := TaskProgress{
+		ID:     "tool-" + id,
+		Title:  title,
+		Status: status,
+	}
+
+	s.mu.Lock()
+	if status == TaskInProgress {
+		if _, exists := s.activeTasks[update.ID]; !exists {
+			s.activeTaskIDs = append(s.activeTaskIDs, update.ID)
+		}
+		s.activeTasks[update.ID] = update
+	} else {
+		delete(s.activeTasks, update.ID)
+		for i, activeID := range s.activeTaskIDs {
+			if activeID == update.ID {
+				s.activeTaskIDs = append(s.activeTaskIDs[:i], s.activeTaskIDs[i+1:]...)
+				break
+			}
+		}
+	}
+	s.pendingTasks = append(s.pendingTasks, update)
+	s.mu.Unlock()
+	s.signalTaskUpdate()
+}
+
+func taskTitle(toolName string) string {
+	switch strings.ToLower(toolName) {
+	case "read":
+		return "Reading files"
+	case "write", "edit":
+		return "Updating files"
+	case "bash":
+		return "Running a command"
+	case "grep", "find":
+		return "Searching files"
+	case "ls":
+		return "Listing files"
+	default:
+		name := strings.Join(strings.Fields(toolName), " ")
+		if runes := []rune(name); len(runes) > 100 {
+			name = string(runes[:100]) + "…"
+		}
+		if name == "" {
+			return "Using a tool"
+		}
+		return "Using " + name
+	}
+}
+
+func (s *turnState) finishOpenTasks() {
+	s.mu.Lock()
+	updates := make([]TaskProgress, 0, len(s.activeTasks))
+	for _, id := range s.activeTaskIDs {
+		task, ok := s.activeTasks[id]
+		if !ok {
+			continue
+		}
+		task.Status = TaskError
+		task.Details = "The turn ended before this operation reported completion."
+		updates = append(updates, task)
+	}
+	clear(s.activeTasks)
+	s.activeTaskIDs = nil
+	s.pendingTasks = append(s.pendingTasks, updates...)
+	s.mu.Unlock()
+	if len(updates) > 0 {
+		s.signalTaskUpdate()
+	}
+}
+
+func (s *turnState) signalTaskUpdate() {
+	select {
+	case s.taskCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *turnState) takeTaskUpdates() []TaskProgress {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	updates := append([]TaskProgress(nil), s.pendingTasks...)
+	s.pendingTasks = nil
+	return updates
 }
 
 func (s *turnState) startMessage() {
@@ -722,7 +858,13 @@ func (s *turnState) streamedText() string {
 func (s *turnState) hasPending() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pending.Len() > 0
+	return s.pending.Len() > 0 || len(s.pendingTasks) > 0
+}
+
+func (s *turnState) hasPendingTaskUpdates() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pendingTasks) > 0
 }
 
 // takePending returns and clears the text produced since the last call.
@@ -865,6 +1007,7 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 				// it on the turn for the turn path to persist after the read loop
 				// has returned; the gateway callback must not write the store.
 				cur.deleted.Store(true)
+				cur.finishOpenTasks()
 				cur.markDone()
 				return
 			}
@@ -909,13 +1052,25 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 				return
 			}
 			renderCtx := ctx
-			if exiting {
+			if exiting || ctx.Err() != nil {
 				// loopCtx is already canceled here, and on shutdown so is ctx.
 				// The last render gets its own budget instead of being
 				// abandoned by the cancellation that triggered it.
 				var cancelRender context.CancelFunc
 				renderCtx, cancelRender = context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 				defer cancelRender()
+			}
+			if tasks := st.takeTaskUpdates(); len(tasks) > 0 {
+				if reporter, ok := r.(TaskProgressReporter); ok {
+					if err := reporter.UpdateTasks(renderCtx, tasks); err != nil {
+						th.log.Warn("cannot update task progress", "thread", th.key, "tasks", len(tasks), "error", err)
+					}
+					th.noteProgress(renderCtx, r)
+				}
+			}
+			delta := st.takePending()
+			if delta == "" {
+				return
 			}
 			if !started && !startAttempted {
 				startAttempted = true
@@ -927,10 +1082,6 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 					started = true
 					th.noteProgress(renderCtx, r)
 				}
-			}
-			delta := st.takePending()
-			if delta == "" {
-				return
 			}
 			if err := r.Delta(renderCtx, delta); err != nil {
 				th.log.Warn("cannot update the reply", "error", err)
@@ -950,6 +1101,8 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 				return
 			case <-firstTextCh:
 				firstTextCh = nil
+				render(false)
+			case <-st.taskCh:
 				render(false)
 			case <-ticker.C:
 				render(false)

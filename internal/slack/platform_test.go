@@ -337,6 +337,14 @@ func TestStartStreamPassesTheRecipient(t *testing.T) {
 		t.Fatalf("calls = %v, want one chat.startStream", stub.methods())
 	}
 	params := calls[0].params
+	if params["task_display_mode"] != "timeline" {
+		t.Fatalf("task_display_mode = %v, want timeline", params["task_display_mode"])
+	}
+	var initial []streamPayloadChunk
+	jsonParam(t, params, "chunks", &initial)
+	if len(initial) != 0 {
+		t.Fatalf("text-first stream starts with chunks %v, want an empty chunks array", initial)
+	}
 	for _, key := range []string{"channel", "thread_ts", "recipient_user_id", "recipient_team_id"} {
 		if params[key] == nil {
 			t.Fatalf("chat.startStream is missing %s: %v", key, params)
@@ -412,9 +420,118 @@ func TestStreamingAppendsAndFinishes(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v, want %v", got, want)
 	}
-	appended := stub.recorded()[1].params["markdown_text"]
-	if appended != "hello" {
-		t.Fatalf("appended %v, want \"hello\"", appended)
+	var chunks []streamPayloadChunk
+	jsonParam(t, stub.recorded()[1].params, "chunks", &chunks)
+	if len(chunks) != 1 || chunks[0].Type != "markdown_text" || chunks[0].Text != "hello" {
+		t.Fatalf("appended chunks = %+v, want one markdown_text chunk with hello", chunks)
+	}
+}
+
+func TestTaskUpdatesShareTheReplyStream(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	progress := bot.TaskProgress{ID: "tool-call-1", Title: "Running a command", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	progress.Status = bot.TaskComplete
+	other := bot.TaskProgress{ID: "tool-call-2", Title: "Reading files", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress, other}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := []string{"chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream"}
+	if got := stub.methods(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	var initial, text, complete []streamPayloadChunk
+	jsonParam(t, calls[0].params, "chunks", &initial)
+	jsonParam(t, calls[1].params, "chunks", &text)
+	jsonParam(t, calls[2].params, "chunks", &complete)
+	if len(initial) != 1 || initial[0].Type != "task_update" || initial[0].ID != progress.ID || initial[0].Status != string(bot.TaskInProgress) {
+		t.Fatalf("initial task chunks = %+v", initial)
+	}
+	if len(text) != 1 || text[0].Type != "markdown_text" || text[0].Text != "hello" {
+		t.Fatalf("text chunks = %+v", text)
+	}
+	if got := calls[0].params["task_display_mode"]; got != "timeline" {
+		t.Fatalf("task_display_mode = %v, want timeline", got)
+	}
+	if len(complete) != 2 || complete[0].Type != "task_update" || complete[0].ID != progress.ID || complete[0].Status != string(bot.TaskComplete) || complete[1].Type != "task_update" || complete[1].ID != other.ID || complete[1].Status != string(bot.TaskInProgress) {
+		t.Fatalf("batched task chunks = %+v", complete)
+	}
+}
+
+func TestTaskAppendFailureFallsBackToMessageUpdates(t *testing.T) {
+	stub := &stubSlack{policy: func(method string, params map[string]any) string {
+		if method != "chat.appendStream" {
+			return ""
+		}
+		var chunks []streamPayloadChunk
+		raw, ok := params["chunks"].(string)
+		if !ok || json.Unmarshal([]byte(raw), &chunks) != nil {
+			return "invalid_chunks"
+		}
+		if len(chunks) > 0 && chunks[0].Type == "task_update" {
+			return "invalid_chunks"
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	progress := bot.TaskProgress{ID: "tool-call-1", Title: "Reading files", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+	progress.Status = bot.TaskComplete
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err == nil {
+		t.Fatal("a refused task append should be reported")
+	}
+	if err := r.Delta(ctx, "answer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "answer"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"chat.startStream", "chat.appendStream", "chat.update", "chat.update"}
+	if got := stub.methods(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want message-update fallback after task append failure", got)
+	}
+}
+
+func TestTaskStreamFailureDefersFallbackUntilText(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"chat.startStream": "invalid_thread_ts"}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	progress := bot.TaskProgress{ID: "tool-call-1", Title: "Reading files", Status: bot.TaskInProgress}
+
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err == nil {
+		t.Fatal("a refused task stream should be reported to the best-effort caller")
+	}
+	if got := stub.methods(); strings.Join(got, ",") != "chat.startStream,chat.startStream" {
+		t.Fatalf("task update created a fallback reply before text: calls = %v", got)
+	}
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "answer"); err != nil {
+		t.Fatal(err)
+	}
+	if got := stub.methods(); strings.Join(got, ",") != "chat.startStream,chat.startStream,chat.postMessage,chat.update" {
+		t.Fatalf("fallback calls = %v", got)
 	}
 }
 
@@ -704,15 +821,25 @@ func TestDeltaChunksLongText(t *testing.T) {
 	}
 
 	appends := 0
+	var streamed strings.Builder
 	for _, call := range stub.recorded() {
 		if call.method != "chat.appendStream" {
 			continue
 		}
 		appends++
-		text, _ := call.params["markdown_text"].(string)
+		var chunks []streamPayloadChunk
+		jsonParam(t, call.params, "chunks", &chunks)
+		if len(chunks) != 1 || chunks[0].Type != "markdown_text" {
+			t.Fatalf("append chunks = %+v, want one markdown_text chunk", chunks)
+		}
+		text := chunks[0].Text
 		if len(text) > streamChunk {
 			t.Fatalf("append of %d bytes exceeds the %d-byte chunk", len(text), streamChunk)
 		}
+		streamed.WriteString(text)
+	}
+	if got, want := streamed.String(), strings.Repeat("x", 7000); got != want {
+		t.Fatalf("streamed %d bytes, want the original %d-byte text", len(got), len(want))
 	}
 	if appends < 3 {
 		t.Fatalf("7000 bytes went out in %d appends, want at least 3", appends)

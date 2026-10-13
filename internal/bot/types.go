@@ -229,6 +229,30 @@ type ProgressReporter interface {
 	Progress() string
 }
 
+// TaskProgress is a user-facing update about one operation the agent is
+// performing. It deliberately carries no tool arguments or output.
+type TaskProgress struct {
+	ID      string
+	Title   string
+	Status  TaskProgressStatus
+	Details string
+}
+
+type TaskProgressStatus string
+
+const (
+	TaskInProgress TaskProgressStatus = "in_progress"
+	TaskComplete   TaskProgressStatus = "complete"
+	TaskError      TaskProgressStatus = "error"
+)
+
+// TaskProgressReporter is an optional renderer capability. A platform that
+// can show structured progress implements it; other renderers keep streaming
+// the answer as before.
+type TaskProgressReporter interface {
+	UpdateTasks(ctx context.Context, updates []TaskProgress) error
+}
+
 // Status is a thread session's lifecycle state, in the vocabulary the core
 // reasons about. Mapping it onto a platform's own states is the adapter's job:
 // a platform that cannot show one simply does not implement StatusReporter.

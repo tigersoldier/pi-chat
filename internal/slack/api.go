@@ -586,11 +586,25 @@ func (a *API) SetAgentStatus(ctx context.Context, channel, threadTS, status stri
 	return a.call(ctx, "agents.sessions.setStatus", params, nil)
 }
 
-// StartStream opens a streaming message and returns its timestamp. Slack
-// requires the recipient for streams that are not thread replies, so pi-chat
-// passes whoever asked.
-func (a *API) StartStream(ctx context.Context, channel, threadTS, recipientUser, recipientTeam string) (string, error) {
-	params := map[string]any{"channel": channel}
+type streamPayloadChunk struct {
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Details string `json:"details,omitempty"`
+}
+
+// StartStream opens a timeline-mode, chunk-streaming message and returns its
+// timestamp. Even an empty initial chunks array establishes the mode required
+// by later chat.appendStream calls. Slack requires the recipient for streams
+// that are not thread replies, so pi-chat passes whoever asked. Initial task
+// chunks let a task card be the first visible part of the reply.
+func (a *API) StartStream(ctx context.Context, channel, threadTS, recipientUser, recipientTeam string, chunks []streamPayloadChunk) (string, error) {
+	if chunks == nil {
+		chunks = []streamPayloadChunk{}
+	}
+	params := map[string]any{"channel": channel, "task_display_mode": "timeline", "chunks": chunks}
 	if threadTS != "" {
 		params["thread_ts"] = threadTS
 	}
@@ -609,12 +623,12 @@ func (a *API) StartStream(ctx context.Context, channel, threadTS, recipientUser,
 	return out.TS, nil
 }
 
-// AppendStream adds the next piece of a streaming message.
-func (a *API) AppendStream(ctx context.Context, channel, ts, text string) error {
+// AppendStream adds markdown or task-update chunks to a streaming message.
+func (a *API) AppendStream(ctx context.Context, channel, ts string, chunks []streamPayloadChunk) error {
 	return a.call(ctx, "chat.appendStream", map[string]any{
-		"channel":       channel,
-		"ts":            ts,
-		"markdown_text": text,
+		"channel": channel,
+		"ts":      ts,
+		"chunks":  chunks,
 	}, nil)
 }
 
