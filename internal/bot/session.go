@@ -839,8 +839,19 @@ func (th *thread) destroy(ctx context.Context) (deleteReport, error) {
 //
 // The caller holds connMu.
 func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
+	return th.dialConfigured(ctx, "", th.snapshot().SessionPath, true)
+}
+
+// dialSession attaches in the handshake without replaying the event stream;
+// response checks read session entries directly. The caller holds connMu.
+func (th *thread) dialSession(ctx context.Context, sessionPath string) (*gwclient.Client, error) {
+	return th.dialConfigured(ctx, sessionPath, sessionPath, false)
+}
+
+// dialConfigured separates the optional handshake attachment from the session
+// identity used to reject stale events on an unbound connection.
+func (th *thread) dialConfigured(ctx context.Context, attachPath, eventPath string, resume bool) (*gwclient.Client, error) {
 	row := th.snapshot()
-	sessionPath := row.SessionPath
 	var eventClient atomic.Pointer[gwclient.Client]
 	epoch := th.sessionEpoch.Load()
 	cfg := gwclient.Config{
@@ -849,14 +860,16 @@ func (th *thread) dial(ctx context.Context) (*gwclient.Client, error) {
 		Name:      "pi-chat " + th.t.SessionName(),
 		Kind:      kind,
 		Tags:      map[string]string{"platform": platformName, "thread": th.key},
+		Session:   attachPath,
 		OnEvent: func(ev gwclient.Event) {
-			th.onSessionEventWithClient(sessionPath, ev, eventClient.Load(), epoch)
+			th.onSessionEventWithClient(eventPath, ev, eventClient.Load(), epoch)
 		},
 	}
 	// A previously driven thread resumes from its cursor for live sequence
-	// tracking. Frames outside an observed turn are discarded, and SwitchSession
-	// starts a live stream without promising replay of the cold interval.
-	if row.LastSeq > 0 || row.LeafID != "" {
+	// tracking. Frames outside an observed turn are discarded; an unbound dial
+	// then attaches with SwitchSession, which does not promise replay of the cold
+	// interval. The handshake-attached poller reads durable session entries.
+	if resume && (row.LastSeq > 0 || row.LeafID != "") {
 		cfg.Resume = &protocol.Resume{SinceSeq: row.LastSeq, LeafEntryID: row.LeafID}
 	} else {
 		cfg.LiveOnly = true
@@ -892,7 +905,17 @@ func (th *thread) saveCursorAfterActivity(ctx context.Context, client *gwclient.
 // saveCursor records how much of the session's event stream the connection has
 // consumed, so the next attach resumes from there.
 func (th *thread) saveCursor(ctx context.Context, client *gwclient.Client) {
-	th.saveCursorAt(ctx, client.LastSeq(), client.LeafID())
+	leaf := client.LeafID()
+	if leaf == "" {
+		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorTimeout)
+		_, err := client.GetEntries(queryCtx, "")
+		cancel()
+		if err != nil {
+			th.log.Debug("cannot initialize the session leaf cursor", "error", err)
+		}
+	}
+	cursor := client.Cursor()
+	th.saveCursorAt(ctx, cursor.SinceSeq, cursor.LeafEntryID)
 }
 
 func (th *thread) saveCursorAt(ctx context.Context, seq uint64, leaf string) {

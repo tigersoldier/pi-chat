@@ -30,10 +30,8 @@ five minutes).
 
 ## Step 1 — The app (owner)
 
-Use the repository's manifest, which already declares the user scopes for this
-mode — [`slack/manifest.yaml`](../slack/manifest.yaml) (or
-[`manifest-agent.yaml`](../slack/manifest-agent.yaml) if you also want Slack's
-agent surface):
+Use the repository's sole manifest, [`slack/manifest.yaml`](../slack/manifest.yaml),
+which declares the user scopes for this mode and Slack's agent experience:
 
 1. Create or update the app from the manifest (see
    [`slack-app-setup.md`](slack-app-setup.md) for the same walkthrough).

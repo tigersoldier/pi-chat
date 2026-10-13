@@ -213,7 +213,7 @@ func TestAttachmentNamesCannotCreateTranscriptLines(t *testing.T) {
 // Exercise runTurn itself, not only the image helper: this pins the images
 // array on the actual gateway prompt frame, including base64 bytes and MIME.
 func TestRunTurnSendsImagesOnTheGatewayWire(t *testing.T) {
-	th, _ := imageThread(t)
+	th, p := imageThread(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -283,5 +283,8 @@ func TestRunTurnSendsImagesOnTheGatewayWire(t *testing.T) {
 	want := protocol.NewImage([]byte("F1"), "image/png")
 	if len(wire.Images) != 1 || wire.Images[0] != want || !strings.Contains(wire.Message, "what is in this screenshot?") {
 		t.Fatalf("prompt on the gateway wire = %+v", wire)
+	}
+	if completed := p.completedRequests(); len(completed) != 1 || completed[0].TS != "1.2" {
+		t.Errorf("completed requests = %+v, want the successful prompt", completed)
 	}
 }

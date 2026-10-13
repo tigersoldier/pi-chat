@@ -76,6 +76,19 @@ func (m *MultiPlatform) AcknowledgeRequest(ctx context.Context, msg bot.Message,
 	return reporter.AcknowledgeRequest(ctx, msg, allowed)
 }
 
+// CompleteRequest reacts to the original message through its owning surface.
+func (m *MultiPlatform) CompleteRequest(ctx context.Context, msg bot.Message) error {
+	platform, err := m.forChannel(msg.Thread.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.RequestCompleter)
+	if !ok {
+		return nil
+	}
+	return reporter.CompleteRequest(ctx, msg)
+}
+
 // OpenThread opens the thread on the surface that owns the channel it is
 // opened in.
 func (m *MultiPlatform) OpenThread(ctx context.Context, channel, text string) (bot.Thread, error) {

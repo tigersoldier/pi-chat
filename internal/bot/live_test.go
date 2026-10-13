@@ -87,6 +87,9 @@ func TestLiveTurnThroughGateway(t *testing.T) {
 	if !strings.Contains(first.finals[0], "PONG") {
 		t.Fatalf("the answer %q does not contain PONG", first.finals[0])
 	}
+	if completed := platform.completedRequests(); len(completed) != 1 || completed[0].Text != "Reply with exactly the single word PONG and nothing else." {
+		t.Errorf("completed requests = %+v, want the successful first prompt", completed)
+	}
 
 	row := th.snapshot()
 	if row.SessionPath == "" || row.SessionName == "" {
@@ -125,6 +128,9 @@ func TestLiveTurnThroughGateway(t *testing.T) {
 	}
 	if !strings.Contains(second.finals[0], "PONG2") {
 		t.Fatalf("the resumed answer %q does not contain PONG2", second.finals[0])
+	}
+	if completed := platform.completedRequests(); len(completed) != 2 || completed[1].Text != "Reply with exactly the single word PONG2 and nothing else." {
+		t.Errorf("completed requests = %+v, want both successful prompts", completed)
 	}
 
 	// Same session, not a second one: the whole point of persisting the path and

@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	// placeholder is what a reply shows before the agent has produced anything.
+	// placeholder is the patch-mode reply state until its first text update.
 	placeholder = "_pi is working…_"
 
 	// maxMessage is Slack's practical message limit with room for a truncation
@@ -73,7 +73,7 @@ func newPlatform(api *slack.API, st State, id slack.Identity, cfg Config, log *s
 }
 
 // StartTurn builds the renderer for a reply to m. It has no side effect; the
-// core calls Start when the turn begins.
+// core calls Start only after the first user-visible text arrives.
 func (p *Platform) StartTurn(_ context.Context, m bot.Message) (bot.Renderer, error) {
 	return &renderer{
 		plat:     p,
@@ -322,6 +322,11 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.text.WriteString(text)
+	if r.ts == "" {
+		// Start may fail before a message handle exists. Retain the partial
+		// answer for Finish or Fail instead of updating an empty ts.
+		return nil
+	}
 	if time.Since(r.lastFlush) < r.plat.flush {
 		return nil
 	}
@@ -342,7 +347,13 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 	r.text.WriteString(final)
 
 	pieces := splitForSlack(final)
-	if err := r.plat.update(ctx, r.channel, r.ts, pieces[0]); err != nil {
+	if r.ts == "" {
+		ts, err := r.plat.post(ctx, r.channel, r.threadTS, pieces[0])
+		if err != nil {
+			return fmt.Errorf("post the final answer: %w", err)
+		}
+		r.ts = ts
+	} else if err := r.plat.update(ctx, r.channel, r.ts, pieces[0]); err != nil {
 		return err
 	}
 	for _, piece := range pieces[1:] {

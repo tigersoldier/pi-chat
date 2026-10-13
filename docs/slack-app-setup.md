@@ -40,16 +40,20 @@ socket. Consequences worth knowing before you start:
 1. Open <https://api.slack.com/apps> and click **Create New App**.
 2. Choose **From an app manifest**.
 3. Pick the workspace you want the bot in, and click **Next**.
-4. Paste the whole of [`slack/manifest-agent.yaml`](../slack/manifest-agent.yaml) into
-   the field. That is the recommended app: it gives the DM a conversation timeline and the
-   agent a real status with a working stop button. If your workspace has no agent feature —
-   it is an admin setting, and Slack offers it on paid plans — or you want the smallest
-   possible app instead, paste [`slack/manifest.yaml`](../slack/manifest.yaml): same bot,
-   no agent surface. See [the agent variant](#the-agent-variant) below.
+4. Paste [`slack/manifest.yaml`](../slack/manifest.yaml) into the field. This is pi-chat's
+   only manifest and declares `features.agent_view`, giving the DM an agent timeline, status,
+   and stop button when the workspace allows the experience. If configuring by hand, enable
+   **Agents** (sometimes **Agents & AI Apps**) in the app settings at
+   <https://api.slack.com/apps> → select the app. Separately, a workspace/org admin can
+   allow or disable the experience for the installed app at **Admin → Apps and workflows →
+   Installed apps → [app] → App Settings → AI agent experience**. If Agent Sessions are
+   unavailable or disabled, pi-chat still handles messages but Slack shows no agent status,
+   timeline, or stop button. Availability may depend on the workspace plan. See
+   [Agent sessions and settings](#agent-sessions-and-settings) below.
 5. Review the summary Slack shows — it lists the scopes, events and settings it is about
    to apply — and click **Create**.
 
-The comments at the top of the manifest mark what is worth customizing:
+These are the user-facing fields you can customize safely:
 
 | Field | Meaning |
 |---|---|
@@ -210,8 +214,8 @@ Reference for what you just applied. Nothing here needs action.
 | `mpim:history` | read group direct messages | a multi-person DM that includes the bot |
 | `users:read` | look up who a user ID is | the names in a thread transcript: without it, lines read `[U123]` instead of `[Alice (U123)]` — the agent gets IDs either way, and the fallback is deliberate |
 | `files:read` | download files shared with the app | handing images from requests and thread context to the agent (built; an older install missing the scope must be reinstalled) |
-| `reactions:write` | add emoji reactions | 👀 on an accepted mention; 🤷 when access is denied |
-| `assistant:write` | act as a Slack agent | **agent variant only** — required by `app_context_changed` and the legacy `assistant.threads.*` methods. The agent status and title methods pi-chat uses (`agents.sessions.setStatus`/`rename`) need `chat:write` alone |
+| `reactions:write` | add emoji reactions | 👀 on an accepted mention or one-to-one DM; ✅ after a successful turn; 🤷 when access is denied |
+| `assistant:write` | authorize Slack assistant methods | included for the agent app and required by `app_context_changed` and legacy `assistant.threads.*` methods, including pi-chat's suggested prompts. `agents.sessions.setStatus` and `agents.sessions.rename` need `chat:write` alone |
 
 ### Bot events
 
@@ -228,7 +232,8 @@ including conversations pi-chat does not care about. That is inherent to the Eve
 pi-chat ignores unmentioned channel/group-DM thread messages without replying, then reads
 them back as context on the next addressed turn.
 
-The agent manifest adds four events: `app_home_opened` (how a DM open is detected —
+In addition to the message events above, the manifest subscribes to four agent events:
+`app_home_opened` (how a DM open is detected —
 **no scope required**; pi-chat uses it to offer suggested prompts), `agent_session_stopped`
 (`chat:write`; subscribing is what makes the loading indicator's stop button real, and
 pressing it aborts the turn), `agent_session_title_changed`, and `app_context_changed` (the
@@ -252,11 +257,12 @@ One platform rule shapes the entire command grammar: **Slack forbids developer s
 commands inside message threads.** That is why root control is `/pi status` and thread
 control is `@pi /status`.
 
-## The agent variant
+## Agent sessions and settings
 
-[`slack/manifest-agent.yaml`](../slack/manifest-agent.yaml) declares the app as a Slack
-agent and enables Slack's agent messaging experience. Instead of a plain DM, the bot's
-Messages tab becomes a conversation timeline, and Slack renders a real agent status.
+[`slack/manifest.yaml`](../slack/manifest.yaml) declares the app as a Slack agent and
+turns on Slack's agent messaging experience. Instead of a plain DM, the bot's Messages tab
+becomes a conversation timeline, and Slack renders a real agent status when the workspace
+allows the experience.
 
 ### What each piece is for
 
@@ -270,9 +276,9 @@ credited with work it does not do:
 | `assistant:write` | no — not for agent status or titles | `agents.sessions.setStatus` and `agents.sessions.rename` need `chat:write` only. This scope is required by `app_context_changed` and the legacy `assistant.threads.*` methods — including `setSuggestedPrompts`, which is how pi-chat offers prompts built from your own repositories |
 | `app_home_opened` | no, and **no scope is required** | the DM-open signal (`tab == "messages"`), which replaces the retired `assistant_thread_started`. pi-chat uses it to offer suggested prompts when you open the conversation |
 
-Without `features.agent_view` the app is just a bot that happens to be chatty: no
-timeline, no status, no stop button. That is exactly what
-[`slack/manifest.yaml`](../slack/manifest.yaml) is, and why the two manifests exist.
+Without `features.agent_view`, a Slack app has no agent timeline, status, or stop button.
+The repository's sole manifest includes this feature; an older or custom app may need to be
+updated to it.
 
 What that buys pi-chat:
 
@@ -282,7 +288,7 @@ What that buys pi-chat:
 | a **stop button** while the agent works (via the `agent_session_stopped` event), wired to abort the turn | `/abort` typed by hand |
 | suggested prompts built from the repositories under `paths.repos_root`, offered when you open the conversation | a hard-coded list in the manifest that cannot know anything about your machine |
 
-Before choosing it, know the caveats:
+Keep these caveats in mind:
 
 - The workspace must have the agent feature enabled. Where it is not, calls fail with
   `feature_disabled`, and the bot still works but shows no status.
@@ -297,8 +303,8 @@ Before choosing it, know the caveats:
   and `assistant:write` is there for `app_context_changed` and the legacy
   `assistant.threads.*` methods.
 
-To switch an existing app: paste `slack/manifest-agent.yaml` into **Settings → App
-Manifest** and save. Slack will ask you to reinstall.
+To update an existing app: paste `slack/manifest.yaml` into **Settings → App Manifest**
+and save. Slack will ask you to reinstall.
 
 ---
 
@@ -312,13 +318,14 @@ Slack's own pages, or who need to check what the manifest applied.
 |---|---|
 | Create New App → From scratch | App name `pi`, pick the workspace |
 | Features → **Socket Mode** | enable; app-level token with `connections:write` |
-| Features → **OAuth & Permissions** → Bot Token Scopes | add the ten (or eleven) scopes in [the table above](#bot-token-scopes) |
-| Features → **Event Subscriptions** | enable; add the five (or nine) bot events; leave the Request URL empty |
+| Features → **OAuth & Permissions** → Bot Token Scopes | add the 11 bot scopes in [the table above](#bot-token-scopes) |
+| Features → **Event Subscriptions** | enable; add the nine bot events; leave the Request URL empty |
 | Features → **App Home** → Show Tabs | Messages Tab on, "allow users to send messages" on |
 | Features → **Interactivity & Shortcuts** | enable; no Request URL needed |
 | Features → **Slash Commands** | create `/pi`; under Socket Mode the Request URL is never called, but Slack still parses it, so any parseable `https://` placeholder works |
 | Settings → **Install App** | install; copy the bot token |
-| Features → **Agents & AI Apps** (optional) | enable the agent experience; equivalent to the agent manifest |
+| App settings → **Agents** (sometimes **Agents & AI Apps**) | declare the app as an agent; the manifest sets `features.agent_view` |
+| Workspace Admin → Apps and workflows → Installed apps → app → App Settings → **AI agent experience** | allow the experience for this installation; separate from the app manifest |
 
 Then continue at [Step 2](#step-2--generate-the-app-level-token).
 
@@ -331,13 +338,13 @@ Then continue at [Step 2](#step-2--generate-the-app-level-token).
 | `not_in_channel` | Invite the bot: `/invite @pi` |
 | Nothing happens on `@pi hello` | The app is not a member of that conversation, `app_mention` is not subscribed, Socket Mode is off, or `allowed_users` does not contain you. Slack's app page shows each toggle; pi-chatd logs the refusal |
 | DMs do not reach the bot | The Messages Tab setting is off, or `im:history` / `message.im` is missing |
-| `feature_disabled` | The agent manifest was used on a workspace without the agent feature. Use `slack/manifest.yaml` instead |
+| `feature_disabled` | The workspace does not support Agent Sessions or its admin disabled the AI agent experience for this app. Ask an admin to enable it, then restart `pi-chatd` (it remembers unsupported status for the life of the process). The bot can still handle messages without the agent UI. |
 | Events arrive twice or not at all | Two instances of `pi-chatd` are running. Socket Mode splits events across connections, so the daemon is deliberately single-instance |
 | `/pi` worked once, then stopped | A scope or event change disabled the install. Reinstall |
 | `invalid_url` / `dispatch_failed` on `/pi` | The placeholder Request URL is unparseable. Slack validates it even though Socket Mode never calls it; use a real-looking HTTPS URL |
 | The socket drops overnight | Socket Mode is a long-lived connection and is sensitive to network churn; the app reconnects, and the unit restarts it on failure |
 | Manifest paste rejected | Slack reports the offending field. The usual causes: editing a load-bearing value, or declaring a feature whose scope is missing — re-paste the file from this repository and customize only the fields listed in Step 1 |
-| `commands requires the commands bot scope` | The manifest declares `features.slash_commands` but not the `commands` scope. Both manifests in this repository include it; a hand-edited copy may have dropped it |
+| `commands requires the commands bot scope` | The manifest declares `features.slash_commands` but not the `commands` scope. The repository manifest includes it; a hand-edited copy may have dropped it |
 | Cannot install the app | The workspace restricts app installation — an admin must approve it, or you need a workspace where you can install apps |
 | Want to be listed in the Marketplace | Not possible with Socket Mode; that requires a public HTTP endpoint, which this project deliberately avoids |
 
@@ -354,7 +361,7 @@ Never commit either file. The repository's `.gitignore` blocks `*.token`, `*-tok
 
 ## Checklist
 
-- [ ] App created from `slack/manifest.yaml` (or the agent variant)
+- [ ] App created from `slack/manifest.yaml` (includes the agent experience)
 - [ ] App-level token created with `connections:write` → `slack-app-token`
 - [ ] App installed to the workspace, bot token → `slack-bot-token`
 - [ ] `chmod 600` on both token files

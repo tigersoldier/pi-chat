@@ -118,7 +118,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	}
 
 	allowed := b.allowed(m.UserID, m.Thread.Channel)
-	if m.Mentioned {
+	if m.Mentioned || m.Direct {
 		b.acknowledgeRequest(ctx, m, allowed)
 	}
 	if !allowed {
@@ -296,9 +296,10 @@ func (b *Bot) suggestions() []Suggestion {
 	return out
 }
 
-// Run performs periodic maintenance until ctx ends: it closes idle thread
-// connections, polls a bounded set of cold sessions for new assistant entries,
-// and prunes the dedupe table.
+// Run performs periodic maintenance until ctx ends: it checks responses left by
+// shutdown, closes idle thread connections, polls a bounded set of cold sessions
+// for new assistant entries, and prunes the dedupe table. On cancellation it
+// sends shutdown notices before releasing gateway connections.
 //
 // It blocks, and it is the caller's to run beside the socket, rather than a
 // goroutine started at construction: a service that spawns work in a
@@ -312,9 +313,13 @@ func (b *Bot) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownNotifyTimeout)
+			b.notifySessionsOfShutdown(shutdownCtx)
+			cancel()
 			b.Close()
 			return ctx.Err()
 		case <-sweep.C:
+			b.CheckShutdownResponses(ctx)
 			b.closeIdle(ctx)
 			b.pollColdSessions(ctx)
 		case <-prune.C:
@@ -386,11 +391,13 @@ func (b *Bot) closeIdle(ctx context.Context) {
 			continue
 		}
 		client := th.live()
+		// A gateway turn can outlive this process's turn goroutine (including a
+		// shutdown follow-up), so do not close its connection while it runs.
+		if client != nil && client.TurnRunning() {
+			th.turnMu.Unlock()
+			continue
+		}
 		if client != nil {
-			if client.TurnRunning() {
-				th.turnMu.Unlock()
-				continue
-			}
 			if now.Sub(row.LastActive) >= window {
 				if th.busy() {
 					th.turnMu.Unlock()
@@ -672,8 +679,8 @@ func (b *Bot) stopTurn(ctx context.Context, a Action) {
 	b.setStatus(ctx, th, StatusIdle)
 }
 
-// acknowledgeRequest asks the platform to acknowledge a tagged request. The
-// reaction is a receipt, not part of authorization or turn execution, so a
+// acknowledgeRequest asks the platform to acknowledge an addressed request.
+// The reaction is a receipt, not part of authorization or turn execution, so a
 // platform failure is logged and never blocks either.
 func (b *Bot) acknowledgeRequest(ctx context.Context, m Message, allowed bool) {
 	reporter, ok := b.plat.(RequestAcknowledger)
@@ -682,6 +689,18 @@ func (b *Bot) acknowledgeRequest(ctx context.Context, m Message, allowed bool) {
 	}
 	if err := reporter.AcknowledgeRequest(ctx, m, allowed); err != nil {
 		b.log.Warn("cannot acknowledge the request", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
+	}
+}
+
+// completeRequest marks a successfully completed prompt on its original
+// message. It is best-effort like the acknowledgement sent when work starts.
+func (b *Bot) completeRequest(ctx context.Context, m Message) {
+	reporter, ok := b.plat.(RequestCompleter)
+	if !ok {
+		return
+	}
+	if err := reporter.CompleteRequest(ctx, m); err != nil {
+		b.log.Warn("cannot mark the request complete", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
 	}
 }
 

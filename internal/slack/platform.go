@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	// placeholder is what a reply shows before the agent produces anything.
+	// placeholder is the patch-mode reply state until its first text update.
 	placeholder = "_pi is working…_"
 	// streamChunk is the largest piece sent in one chat.appendStream call,
 	// well under Slack's per-request markdown_text limit.
@@ -53,9 +53,9 @@ type Platform struct {
 	// without an indicator instead of asking again on every one.
 	statusRefused atomic.Bool
 
-	// promptsRefused is the same latch for suggestions: a plain-bot install has
-	// no agent surface to show them on, and the method needs a scope the default
-	// manifest deliberately does not request.
+	// promptsRefused is the same latch for suggestions: an older or custom app
+	// that is not declared as an agent may have no surface to show them on, or
+	// may not have granted the method's assistant:write scope.
 	promptsRefused atomic.Bool
 }
 
@@ -107,7 +107,7 @@ func (p *Platform) Conversation(ctx context.Context, t bot.Thread, oldest string
 }
 
 // StartTurn builds the renderer for a reply to m. It has no side effect: the
-// core calls Start on the renderer when the turn begins.
+// core calls Start only after the first user-visible text arrives.
 func (p *Platform) StartTurn(_ context.Context, m bot.Message) (bot.Renderer, error) {
 	return &renderer{
 		platform:      p,
@@ -181,6 +181,11 @@ func (p *Platform) AcknowledgeRequest(ctx context.Context, m bot.Message, allowe
 		reaction = "eyes"
 	}
 	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, reaction)
+}
+
+// CompleteRequest marks the original message after its turn succeeds.
+func (p *Platform) CompleteRequest(ctx context.Context, m bot.Message) error {
+	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, "white_check_mark")
 }
 
 // OpenThread posts a top-level message and returns the thread it starts: the
@@ -360,6 +365,11 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 	defer r.mu.Unlock()
 
 	r.text.WriteString(text)
+	if r.ts == "" {
+		// Start may fail before a message handle exists. Retain the partial
+		// answer for Finish or Fail without attempting to patch an empty ts.
+		return nil
+	}
 	if r.streaming {
 		err := r.appendStream(ctx, text)
 		if err == nil {
@@ -382,6 +392,19 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 	streamed := r.text.String()
 	if final == "" {
 		final = streamed
+	}
+	if r.ts == "" {
+		if final == "" {
+			return nil
+		}
+		ts, err := r.api.PostMessage(ctx, r.channel, r.threadTS, truncate(final, maxMessage))
+		if err != nil {
+			return fmt.Errorf("post the final answer: %w", err)
+		}
+		r.ts = ts
+		r.text.Reset()
+		r.text.WriteString(final)
+		return nil
 	}
 	if r.streaming {
 		switch err := r.api.StopStream(ctx, r.channel, r.ts); {

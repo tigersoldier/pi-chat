@@ -2,6 +2,7 @@ package selfdm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -204,6 +205,36 @@ func TestRendererPatchesTheSameMessage(t *testing.T) {
 	}
 }
 
+func TestFinishWithoutStartPostsTheReadyAnswer(t *testing.T) {
+	s, _, stub, st := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+		"chat.update":      func(url.Values) string { return `{"ok":true}` },
+	})
+	ctx := context.Background()
+	r, err := s.plat.StartTurn(ctx, bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "5.0"}})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	answer := "The answer is ready."
+	if err := r.Finish(ctx, answer); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	if got := stub.count("chat.postMessage"); got != 1 {
+		t.Fatalf("chat.postMessage called %d times, want one final answer", got)
+	}
+	if got := stub.count("chat.update"); got != 0 {
+		t.Fatalf("chat.update called %d times, want no empty placeholder update", got)
+	}
+	params := stub.params("chat.postMessage", 0)
+	if params.Get("thread_ts") != "5.0" || params.Get("text") != answer {
+		t.Errorf("posted answer = %+v, want thread_ts=5.0 and text=%q", params, answer)
+	}
+	if !st.posted[SurfaceName+"/9.1"] {
+		t.Error("final answer was not recorded in the surface ledger")
+	}
+}
+
 // TestRendererSplitsALongAnswer: truncating the end of an agent's work is worse
 // than a second message, so a long answer continues in a new one.
 func TestRendererSplitsALongAnswer(t *testing.T) {
@@ -301,6 +332,31 @@ func TestFailKeepsCauseWhenPartialAnswerIsLong(t *testing.T) {
 	}
 	if len(text) > maxMessage {
 		t.Fatalf("failure text is %d bytes, exceeds %d", len(text), maxMessage)
+	}
+}
+
+func TestFailPreservesTextWhenNoReplyWasStarted(t *testing.T) {
+	s, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+	})
+	ctx := context.Background()
+	r, err := s.plat.StartTurn(ctx, bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "5.0"}})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	if err := r.Delta(ctx, "partial answer"); err != nil {
+		t.Fatalf("Delta before Start: %v", err)
+	}
+	if got := stub.count("chat.postMessage"); got != 0 {
+		t.Fatalf("chat.postMessage called %d times while buffering", got)
+	}
+	cause := errors.New("Slack was unavailable when the reply started")
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	text := stub.params("chat.postMessage", 0).Get("text")
+	if !strings.Contains(text, "partial answer") || !strings.Contains(text, cause.Error()) {
+		t.Errorf("failure text = %q, want partial answer and cause", text)
 	}
 }
 

@@ -18,7 +18,10 @@ import (
 // startGrace bounds how long a turn waits for evidence that the agent actually
 // started. pi publishes agent_start before doing any work, so this is only
 // reached when a prompt is accepted and then produces nothing.
-const startGrace = 15 * time.Second
+const (
+	startGrace                = 15 * time.Second
+	assistantMessageSeparator = "\n\n"
+)
 
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
@@ -70,10 +73,6 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		return err
 	}
 	sessionPath := th.snapshot().SessionPath
-	if err := r.Start(ctx); err != nil {
-		return fmt.Errorf("start the reply: %w", err)
-	}
-	th.noteProgress(ctx, r)
 
 	// GetLastAssistantText returns the session's last answer, which is not
 	// necessarily an answer to *this* prompt, so remember it and refuse to
@@ -89,9 +88,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	defer stopFlush()
 
 	// What the thread has been saying since the last turn rides in front of this
-	// request (DESIGN.md §4). The fetch happens here — after the session exists,
-	// before the prompt — because the prompt is the only place a transcript can
-	// go, and because the reply is already on screen while it is read.
+	// request (DESIGN.md §4). The fetch happens here — after the session exists
+	// and before the prompt — because the prompt is the only place a transcript
+	// can go. The reply remains lazy until the agent produces visible text.
 	obs := th.observe(ctx, m)
 	prepared, err := th.preparePrompt(ctx, m, obs)
 	if err != nil {
@@ -188,11 +187,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if err != nil {
 		th.log.Warn("cannot read the answer", "error", err)
 	}
-	if final == "" {
-		// The streamed deltas are the fallback when the answer cannot be read
-		// back, for example after the session died mid-turn.
-		final = st.text()
-	}
+	// GetLastAssistantText returns just the last assistant message. Preserve
+	// earlier visible messages and fall back to streamed text if reading back
+	// failed, while letting the authoritative final text correct the last one.
+	final = st.authoritativeText(final)
 	if final != "" {
 		th.rememberAssistant(final)
 	}
@@ -204,7 +202,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if err := r.Finish(ctx, final); err != nil {
 		return fmt.Errorf("finish the reply: %w", err)
 	}
+	th.noteProgress(ctx, r)
 	th.touch()
+	th.b.completeRequest(ctx, m)
 	return nil
 }
 
@@ -319,16 +319,6 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 		th.log.Error("cannot start the asynchronous reply", "error", err)
 		return
 	}
-	if err := r.Start(ctx); err != nil {
-		th.log.Error("cannot start the asynchronous reply", "error", err)
-		terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		defer cancel()
-		if ferr := r.Fail(terminalCtx, err); ferr != nil {
-			th.log.Error("cannot report the asynchronous reply failure", "error", ferr)
-		}
-		return
-	}
-	th.noteProgress(ctx, r)
 	stopFlush := th.flush(ctx, st, r)
 	defer stopFlush()
 
@@ -468,14 +458,20 @@ func reconcileObservedText(st *turnState, final string, before [32]byte, haveBef
 // (DESIGN.md §4). Everything it does is a buffer append or a channel close;
 // the rendering side reads the buffers from other goroutines.
 type turnState struct {
-	mu      sync.Mutex
-	pending strings.Builder // text not yet rendered
-	all     strings.Builder // everything produced so far
-	shown   strings.Builder // text already handed to a renderer
-	work    bool
+	mu             sync.Mutex
+	pending        strings.Builder // text not yet rendered
+	messages       []string        // completed assistant messages with visible text
+	currentMessage strings.Builder // visible text in the current assistant message
+	shown          strings.Builder // text already handed to a renderer
+	work           bool
 	// promptReservation distinguishes a queued Slack prompt from an unsolicited
 	// turn so an early agent_start can be reserved and rendered separately.
 	promptReservation bool
+
+	// firstTextCh wakes the renderer as soon as user-visible text arrives, so
+	// it can create a reply without showing an empty message during thinking.
+	firstTextCh   chan struct{}
+	firstTextOnce sync.Once
 
 	// renderable marks the point where this reservation may accept session
 	// output. A live agent_start can claim it during prompt preparation; other
@@ -496,10 +492,11 @@ type turnState struct {
 
 func newTurnState() *turnState {
 	return &turnState{
-		workCh:     make(chan struct{}),
-		doneCh:     make(chan struct{}),
-		textCh:     make(chan struct{}),
-		finishedCh: make(chan struct{}),
+		firstTextCh: make(chan struct{}),
+		workCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		textCh:      make(chan struct{}),
+		finishedCh:  make(chan struct{}),
 	}
 }
 
@@ -522,7 +519,11 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		}
 		s.markWork()
 
-	case "message_start", "turn_start", "agent_start", "tool_execution_start", "tool_execution_update":
+	case "message_start":
+		s.startMessage()
+		s.markWork()
+
+	case "turn_start", "agent_start", "tool_execution_start", "tool_execution_update":
 		s.markWork()
 
 	case "agent_settled":
@@ -588,14 +589,27 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	}
 }
 
+func (s *turnState) startMessage() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentMessage.Len() > 0 {
+		s.messages = append(s.messages, s.currentMessage.String())
+		s.currentMessage.Reset()
+	}
+}
+
 func (s *turnState) append(delta string) {
 	if delta == "" {
 		return
 	}
 	s.mu.Lock()
+	if s.currentMessage.Len() == 0 && len(s.messages) > 0 {
+		s.pending.WriteString(assistantMessageSeparator)
+	}
 	s.pending.WriteString(delta)
-	s.all.WriteString(delta)
+	s.currentMessage.WriteString(delta)
 	s.mu.Unlock()
+	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
 	s.textOnce.Do(func() { close(s.textCh) })
 }
 
@@ -604,16 +618,21 @@ func (s *turnState) replace(text string) {
 		return
 	}
 	s.mu.Lock()
+	combined := text
+	if len(s.messages) > 0 {
+		combined = strings.Join(s.messages, assistantMessageSeparator) + assistantMessageSeparator + text
+	}
 	s.pending.Reset()
 	// Delta is append-only: send only an unseen suffix. A divergent final is
 	// corrected by Renderer.Finish instead of duplicating already-shown text.
 	shown := s.shown.String()
-	if strings.HasPrefix(text, shown) {
-		s.pending.WriteString(text[len(shown):])
+	if strings.HasPrefix(combined, shown) {
+		s.pending.WriteString(combined[len(shown):])
 	}
-	s.all.Reset()
-	s.all.WriteString(text)
+	s.currentMessage.Reset()
+	s.currentMessage.WriteString(text)
 	s.mu.Unlock()
+	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
 	s.textOnce.Do(func() { close(s.textCh) })
 }
 
@@ -660,7 +679,44 @@ func (s *turnState) sawWork() bool {
 func (s *turnState) text() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.all.String()
+	return s.streamedText()
+}
+
+// authoritativeText combines earlier streamed assistant messages with the
+// gateway's authoritative text for the last one. An empty final falls back to
+// the full stream, which is all that is available when reading it back failed.
+func (s *turnState) authoritativeText(final string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if final == "" {
+		return s.streamedText()
+	}
+	if len(s.messages) == 0 {
+		return final
+	}
+	return strings.Join(s.messages, assistantMessageSeparator) + assistantMessageSeparator + final
+}
+
+// streamedText joins all streamed message text while the mutex is held.
+func (s *turnState) streamedText() string {
+	prior := strings.Join(s.messages, assistantMessageSeparator)
+	current := s.currentMessage.String()
+	switch {
+	case prior == "":
+		return current
+	case current == "":
+		return prior
+	default:
+		return prior + assistantMessageSeparator + current
+	}
+}
+
+// hasPending reports whether there is text waiting for the renderer.
+func (s *turnState) hasPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending.Len() > 0
 }
 
 // takePending returns and clears the text produced since the last call.
@@ -826,21 +882,24 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 	cur.feed(ev, th.log)
 }
 
-// flush renders accumulated text on a ticker until the turn ends. The returned
-// function stops it and is safe to call more than once.
+// flush renders accumulated text until the turn ends. It creates the reply on
+// the first visible text, coalesces subsequent updates on a ticker, and flushes
+// on exit. The returned function is safe to call more than once.
 func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 	loopCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
+		startAttempted := false
+		started := false
 
-		// render sends whatever text has accumulated. It is called on the way
-		// out too: a short answer can arrive entirely between two ticks, and
-		// dropping it would mean showing nothing until the turn ends.
+		// render sends whatever text has accumulated. It is called as soon as
+		// the first text arrives, periodically thereafter, and on the way out.
+		// Starting here (rather than when the model starts thinking) keeps an
+		// empty reply out of the conversation until there is something to show.
 		render := func(exiting bool) {
-			delta := st.takePending()
-			if delta == "" {
+			if !st.hasPending() {
 				return
 			}
 			renderCtx := ctx
@@ -852,12 +911,28 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 				renderCtx, cancelRender = context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 				defer cancelRender()
 			}
+			if !started && !startAttempted {
+				startAttempted = true
+				if err := r.Start(renderCtx); err != nil {
+					// Keep the text in the renderer even without a reply handle,
+					// so a later Finish or Fail can still present it.
+					th.log.Warn("cannot start the reply", "error", err)
+				} else {
+					started = true
+					th.noteProgress(renderCtx, r)
+				}
+			}
+			delta := st.takePending()
+			if delta == "" {
+				return
+			}
 			if err := r.Delta(renderCtx, delta); err != nil {
 				th.log.Warn("cannot update the reply", "error", err)
 			}
 		}
 
 		ticker := time.NewTicker(time.Duration(th.b.cfg.Render.FlushMS) * time.Millisecond)
+		firstTextCh := st.firstTextCh
 		defer ticker.Stop()
 		for {
 			select {
@@ -867,6 +942,9 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 			case <-st.doneCh:
 				render(true)
 				return
+			case <-firstTextCh:
+				firstTextCh = nil
+				render(false)
 			case <-ticker.C:
 				render(false)
 			}
