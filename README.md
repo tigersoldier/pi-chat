@@ -21,10 +21,10 @@ mention or command starts a pi session in a thread, streams its answer back, and
 thread state across restarts. Phase 1 includes an allowlist, durable thread state, project
 worktrees, `/pi help|status|resume`, pass-through commands, idle close and cold resume.
 The Slack app manifest enables Agent Sessions, including status and a stop button when the
-workspace allows the agent experience. Opt-in read-only chat-tools
-v1 is implemented in this worktree and unit-tested, but has not yet been verified against
-a live Slack workspace. Remaining phase-2 work includes `/abort`, `/model`, interactive
-approvals, and the warm-session cap with eviction. Details: `PLAN.md`.
+workspace allows the agent experience. Opt-in read-only chat-tools v1 is implemented and
+unit-tested, but has not yet been verified against a live Slack workspace. Phase 2 is
+underway: `/abort`, `/model`, and `/stop` are implemented; interactive approvals, warm-session
+eviction/queueing, and streaming fallback hardening remain. Details: `PLAN.md`.
 
 ## Surfaces
 
@@ -117,10 +117,9 @@ Two trigger tokens, one vocabulary. Slack forbids developer slash commands
 inside message threads, which is why the two forms differ.
 
 > **What works today:** the mention forms and `/pi help`, `/pi status`, `/pi resume`,
-> `@pi /status`, `@pi /resume` for restoring a session retired in that thread, and
-> pass-through of pi's own commands. `/delete`, `/abort`, `/model` and
-> `/stop` are part of the grammar but answer "not in this build yet" until phase 2 — they
-> are never forwarded to the agent as text.
+> `@pi /status`, `@pi /resume` for restoring a session retired in that thread, `/abort`,
+> `/model [provider/model]`, `/stop`, `/delete` (with confirmation), and pass-through of
+> pi's own commands. Control commands are handled by pi-chat, never forwarded as agent text.
 
 | Where | Form | Example |
 |---|---|---|

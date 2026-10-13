@@ -85,7 +85,10 @@ type thread struct {
 // gateway any more: it was deleted outside pi-chat (pilish, another client, the
 // operator). The thread keeps its key and starts a new session when the user
 // asks again (DESIGN.md §4 invariant 3).
-var errSessionGone = errors.New("the session is gone")
+var (
+	errSessionGone = errors.New("the session is gone")
+	errNoSession   = errors.New("this thread has no session")
+)
 
 // isGone reports whether the gateway answered `unknown_session`.
 
@@ -172,27 +175,118 @@ func (th *thread) finishTurn(st *turnState) {
 	th.turnMu.Unlock()
 }
 
-// abort stops the turn running in this thread, reporting whether there was one
-// to stop. The platform's stop control is also how a stale loading indicator
-// gets cleared, and the caller has to tell those two cases apart.
-//
-// It deliberately does not take turnMu: a turn holds that lock for its whole
-// life, so waiting for it would mean stopping pi only after pi had finished.
-func (th *thread) abort(ctx context.Context) bool {
-	if !th.busy() {
-		return false
+// turnAborter is the gateway surface used to determine whether a session-wide
+// turn is running and, if so, abort it without touching the daemon's queue.
+type turnAborter interface {
+	TurnRunning() bool
+	GetState(context.Context) (protocol.PiState, error)
+	Abort(context.Context) (*gwclient.Response, error)
+}
+
+// abortGatewayTurn checks the gateway's current turn state, not only local bot
+// state: another client may have started the turn, or this client may have
+// attached after its gw_turn{running} event. Checking state also avoids
+// canceling a local turn that has already settled but is still rendering.
+func abortGatewayTurn(ctx context.Context, client turnAborter) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+	defer cancel()
+	if !client.TurnRunning() {
+		state, err := client.GetState(ctx)
+		if err != nil {
+			return false, err
+		}
+		if !state.IsStreaming {
+			return false, nil
+		}
+	}
+	if _, err := client.Abort(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// abort stops a thread's current turn, including a turn owned by another
+// gateway client. It does not wait for a local turn's turnMu: waiting would mean
+// aborting only after pi had finished. The daemon's abort command is
+// session-wide and leaves queued prompts intact.
+func (th *thread) abort(ctx context.Context) (bool, error) {
+	if cur := th.cur.Load(); cur != nil {
+		return th.abortLocal(ctx, cur)
+	}
+	if !th.turnMu.TryLock() {
+		// runTurn publishes its reservation while holding turnMu. Check again
+		// to cover the small handoff window without waiting behind the turn.
+		if cur := th.cur.Load(); cur != nil {
+			return th.abortLocal(ctx, cur)
+		}
+		return false, nil
+	}
+	defer th.turnMu.Unlock()
+	return th.abortExternal(ctx)
+}
+
+func (th *thread) abortLocal(ctx context.Context, cur *turnState) (bool, error) {
+	localPrompt := cur.promptReservation
+	promptIssued := localPrompt && cur.renderable.Load()
+	if localPrompt && !promptIssued && cur.cancel != nil {
+		// Before submission, cancellation prevents the turn from reaching pi.
+		cur.cancel()
 	}
 	client := th.live()
-	if client == nil {
-		return false
+	if client == nil || !th.bound(client) {
+		if localPrompt && !promptIssued && th.snapshot().SessionPath == "" {
+			return true, nil
+		}
+		stopped, err := th.abortExternal(ctx)
+		if err != nil {
+			return false, err
+		}
+		if stopped && localPrompt && cur.cancel != nil {
+			cur.cancel()
+		}
+		return stopped || (localPrompt && !promptIssued), nil
+	}
+	stopped, err := abortGatewayTurn(ctx, client)
+	if err != nil {
+		return false, err
+	}
+	if stopped && localPrompt && cur.cancel != nil {
+		// Stop local rendering only after the gateway confirms a live turn; if
+		// it already settled, leave the final answer path alone.
+		cur.cancel()
+	}
+	return stopped || (localPrompt && !promptIssued), nil
+}
+
+func (th *thread) abortExternal(ctx context.Context) (bool, error) {
+	path := th.snapshot().SessionPath
+	if path == "" {
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
 	defer cancel()
-	if _, err := client.Abort(ctx); err != nil {
-		th.log.Warn("cannot stop the turn", "error", err)
-		return false
+	rows, err := th.b.gw.Sessions(ctx)
+	if err != nil {
+		return false, fmt.Errorf("read the gateway session catalog: %w", err)
 	}
-	return true
+	live := false
+	for _, row := range rows {
+		if row.Path == path {
+			live = row.Live
+			break
+		}
+	}
+	if !live {
+		return false, nil
+	}
+	client, err := th.attachExisting(ctx)
+	if err != nil {
+		return false, fmt.Errorf("attach to the session: %w", err)
+	}
+	if !th.bound(client) {
+		return false, fmt.Errorf("the thread connection is not attached to its session")
+	}
+	return abortGatewayTurn(ctx, client)
 }
 
 // bound reports whether a connection is still attached to the session this
@@ -209,6 +303,11 @@ func (th *thread) bound(client *gwclient.Client) bool {
 func isGone(err error) bool {
 	var response *gwclient.ResponseError
 	return errors.As(err, &response) && response.Code == protocol.CodeUnknownSession
+}
+
+func isSessionAttached(err error) bool {
+	var response *gwclient.ResponseError
+	return errors.As(err, &response) && response.Code == protocol.CodeSessionAttached
 }
 
 // forgetSession records that the thread's session is gone and releases the
@@ -286,8 +385,26 @@ func (th *thread) revokeDeletedSessionBinding(ctx context.Context, path string) 
 // would let the next prompt create a second session — the exact defect §3
 // documents.
 func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, error) {
+	return th.bind(ctx, prompt, true)
+}
+
+// attachExisting binds to this thread's recorded session without creating one.
+// Commands such as /model may wake a cold session, but must never provision a
+// session merely to answer themselves.
+func (th *thread) attachExisting(ctx context.Context) (*gwclient.Client, error) {
+	return th.bind(ctx, "", false)
+}
+
+// bind ensures the thread's session is attached. The caller selects whether a
+// missing session may be created; this distinction keeps control commands from
+// turning an empty thread into a new session.
+func (th *thread) bind(ctx context.Context, prompt string, create bool) (*gwclient.Client, error) {
 	th.connMu.Lock()
 	defer th.connMu.Unlock()
+
+	if !create && th.snapshot().SessionPath == "" {
+		return nil, errNoSession
+	}
 
 	if th.client != nil {
 		switch {
@@ -304,6 +421,9 @@ func (th *thread) ensure(ctx context.Context, prompt string) (*gwclient.Client, 
 	}
 
 	if th.snapshot().SessionPath == "" {
+		if !create {
+			return nil, errNoSession
+		}
 		if err := th.create(ctx, prompt); err != nil {
 			return nil, err
 		}

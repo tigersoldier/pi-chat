@@ -22,6 +22,9 @@ const gatewayTimeout = 10 * time.Second
 // that gave up early would report a failure for work still being done.
 const deleteTimeout = 60 * time.Second
 
+// stopTimeout bounds a graceful stop, including the gateway's stop grace.
+const stopTimeout = 30 * time.Second
+
 // gateway is the read-only view of pi-gatewayd the core needs.
 //
 // It is an interface for two reasons: the core can be tested without a running
@@ -41,6 +44,9 @@ type gateway interface {
 // command, so a pooled admin connection would stay attached to every session it
 // ever touched and keep them all from being evicted (DESIGN.md §8, §10).
 type lifecycle interface {
+	// StopSession gracefully stops pi without forcing it, and preserves the
+	// session file. Attached clients or a running turn make it fail safely.
+	StopSession(ctx context.Context, path string) error
 	// DeleteSession stops the session's pi process and removes its file. A
 	// session the gateway no longer knows answers `unknown_session`, which the
 	// caller reads as "already gone" rather than as a failure.
@@ -93,6 +99,22 @@ func (c *connector) DeleteSession(ctx context.Context, path string) error {
 	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
 	_, err = client.DeleteSession(ctx, path, false)
+	return err
+}
+
+// StopSession stops pi through the admin connection without forcing an
+// attached client or active turn to detach. The thread connection is released
+// by the caller before this operation so it does not block its own stop.
+func (c *connector) StopSession(ctx context.Context, path string) error {
+	client, err := c.dial(ctx, c.cfg.Gateway.AdminTokenFile, "stop", stopTimeout)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, stopTimeout)
+	defer cancel()
+	_, err = client.StopSession(ctx, path, false)
 	return err
 }
 

@@ -4,10 +4,10 @@ Reference file for resuming work after a context reset. Design and rationale liv
 [`DESIGN.md`](./DESIGN.md); this file is the operational plan, the environment facts, and
 the current position. **Update the status block and checkboxes as work lands.**
 
-Last updated: 2026-10-11 · feature worktree `/home/pi/work/2026-10-11-create-a-clean-worktree-for-pi-chat`
-(branch `feat/chat-tools`; module `github.com/tigersoldier/pi-chat`). M0–M4.7 are
-implemented; this worktree adds opt-in read-only chat tools, with live Slack validation
-still pending.
+Last updated: 2026-10-12 · feature worktree `/home/pi/work/2026-10-12-start-pi-chat-phase-2`
+(branch `feat/phase-2-control-commands`, based on `fix/pi-chat-message-response-behavior`;
+module `github.com/tigersoldier/pi-chat`). M0–M4.7 are implemented; this worktree begins M5
+by implementing `/abort`, `/model`, and `/stop`. Live chat-tools validation remains pending.
 
 ---
 
@@ -21,6 +21,7 @@ still pending.
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
 | M3 — phase-0 vertical slice | **Done and verified end-to-end** on 2026-09-27: a mention in a Slack thread streamed a real pi answer back into it (see M3 below) |
 | M4 — phase-1 MVP | **Done and verified live** on 2026-09-28: commands, allowlist refusals, SQLite thread state, provisioned project directories, cold/resume, startup GC (see M4 below) |
+| M5 — phase 2 | **In progress.** `/abort`, `/model`, and `/stop` are implemented in this worktree; approvals, eviction/queueing, and stream fallback hardening remain |
 | Chat tools v1 | **Implemented, Go/race-tested, and loaded by the installed Pi RPC runtime; live Slack validation pending.** Opt-in extension, private UDS broker, durable session bindings, bounded read-only Slack tools |
 | Code | `internal/config`, `internal/store` (SQLite), `internal/workspace` (provisioning + git cleanup), `internal/bot` (core), `internal/slack` (adapter), `internal/chattools` (broker/extension), `cmd/pi-chatd`; tests in each package |
 | `pi-chatd` | Existing systemd user service is recorded as enabled at boot; this feature worktree has not been installed or live-tested |
@@ -28,10 +29,11 @@ still pending.
 | GitHub repo rename | **Not done** — browser action; local `origin` still says `pi-gchat`, which keeps working through GitHub's redirect |
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
-**Current position: M0–M4.7 are complete. This worktree implements opt-in, read-only
-chat-tools v1 (unit tests pass; live Slack and restart verification are still pending).
-Remaining phase-2 work is `/abort`, `/model`, interactive approvals, warm-session eviction
-and queueing; `/delete` is already implemented.**
+**Current position: M0–M4.7 are complete. Chat-tools v1 is implemented and unit-tested;
+live Slack and restart verification remain pending. M5 is underway: this worktree adds
+`/abort`, `/model`, and `/stop` (all non-forcing); remaining phase-2 work is interactive
+approvals, warm-session eviction and queueing, and streaming fallback hardening. `/delete`
+is already implemented.**
 
 ---
 
@@ -547,7 +549,12 @@ once, not per turn.
       writes no row at all), and an adopted session's directory. The write half of the
       gateway is its own `lifecycle` interface with its own admin dial, and `/pi status`
       now counts the states it names instead of counting a deleted row as cold.
-- [ ] `@pi /abort`, `@pi /model`, `@pi /stop`
+- [x] `@pi /abort`, `@pi /model [provider/model]`, `@pi /stop`: abort preserves the
+      gateway queue; model listing/switching binds only an existing session and refuses
+      during a turn; stop releases pi-chat's own binding then calls admin
+      `StopSession(force:false)`, keeping the session file/worktree and refusing busy/shared
+      sessions. Unit tests cover command routing, no-session behavior, stop state and exact
+      configured model selection; deployment acceptance remains pending.
 - [ ] Interactive approvals: buttons + modal via `trigger_id`; `pending_ui` → `RespondUI`
 - [ ] Status `suspended` while a turn waits for an answer; `closed` on delete; titles via
       `agents.sessions.rename`
@@ -582,7 +589,7 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 
 | Thing | Value |
 | --- | --- |
-| Repo | Feature worktree `/home/pi/work/2026-10-11-create-a-clean-worktree-for-pi-chat`, branch `feat/chat-tools`; upstream repo remains `pi-gchat` |
+| Repo | Feature worktree `/home/pi/work/2026-10-12-start-pi-chat-phase-2`, branch `feat/phase-2-control-commands` (based on `fix/pi-chat-message-response-behavior`); upstream repo remains `pi-gchat` |
 | Module | `github.com/tigersoldier/pi-chat`, Go 1.26.4 |
 | Design | `DESIGN.md` (14 sections + decision log §15) |
 | `pi` binary | `~/.local/bin/pi` |
@@ -645,12 +652,14 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 ## Next action
 
-1. Local validation is complete: `go test ./...`, `go test -race ./...`, and `go vet ./...`
-   pass; the embedded TypeScript extension loads in the installed Pi RPC runtime.
-2. In the deployment environment, enable `[chat_tools]`, install/build the pinned
-   pi-gateway revision, and verify a new session exposes the tools before its first prompt.
-3. Exercise bounded Slack reads, missing scopes, cancellation, cold resume, daemon
-   restarts, retired-session resume, and deletion/revocation. Live acceptance remains
-   outstanding.
+1. Local validation passes: `go test ./...`, `go test -race ./...`, and `go vet ./...`.
+   This worktree implements `/abort`, `/model [provider/model]`, and a non-forcing `/stop`.
+2. Continue M5 with interactive approvals: route blocking UI dialogs to the owning turn,
+   persist them in `pending_ui`, and answer buttons/modals through `RespondUI`; then take on
+   warm-session eviction/queueing and stream fallback hardening.
+3. In the deployment environment, enable `[chat_tools]`, install/build the pinned
+   pi-gateway revision, and verify bounded Slack reads, missing scopes, cancellation, cold
+   resume, daemon restarts, retired-session resume, and deletion/revocation. Live acceptance
+   remains outstanding.
 4. Whenever you like, rename the GitHub repo to `pi-chat`; the upstream stop-rebind ask
    is unchanged and the spawn-sidecar issue remains filed.

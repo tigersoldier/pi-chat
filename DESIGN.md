@@ -460,8 +460,8 @@ What reaches a session, and what does not:
 | `@pi /new [<text>]` | thread | retire this thread's session and start a fresh one; `<text>`, when given, is its first prompt. The old session stays resumable with `@pi /resume` |
 | `@pi /abort` | thread | `Abort`; queued prompts survive by design |
 | `@pi /delete` | thread | confirm → `DeleteSession` → worktree/branch cleanup → row deleted |
-| `@pi /model` | thread | `SetModel` / `GetAvailableModels` |
-| `@pi /stop` | thread | manual `StopSession` (cap debugging) |
+| `@pi /model [provider/model]` | thread | no argument lists configured models; an exact provider/model switches this session via `SetModel` |
+| `@pi /stop` | thread | close pi-chat's binding, then admin `StopSession(force:false)`; preserves the session file and refuses busy/shared sessions |
 | `@pi /compact`, `@pi /skill:<name>`, `@pi /<template>` | thread | forwarded to pi |
 | `@pi <text>` | thread | prompt |
 

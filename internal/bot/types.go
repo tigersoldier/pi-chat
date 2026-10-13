@@ -324,7 +324,10 @@ type Notice struct {
 	// Update replaces the message with this timestamp instead of posting a new
 	// one. It is an adapter-owned handle, like ReplyTo.
 	Update string
-	Text   string
+	// ReplaceOriginal asks an interaction response URL to replace its source
+	// message even when the platform omitted that message's timestamp.
+	ReplaceOriginal bool
+	Text            string
 	// Buttons, when present, are the choices attached to the text.
 	Buttons []Button
 }
