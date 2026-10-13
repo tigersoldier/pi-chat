@@ -491,23 +491,27 @@ already warm: a help request must not dial, create or wake a session to answer i
 ## 6. Rendering
 
 **Native Slack streaming is the primary path**; a patched placeholder is the documented
-fallback. Lifecycle status can show `processing` while the agent works, but the reply
-message is created only when the first visible text arrives. Thinking and tool-call
-arguments therefore do not leave an empty response in the conversation; a turn with no
-streamed deltas posts its final answer directly when it is ready.
+fallback. Lifecycle status can show `processing` while the agent works. A reply stream
+starts on the first visible text or first tool task update: tool-call arguments and private
+reasoning do not become response text, while a task card is meaningful progress rather
+than an empty reply. A turn with no streamed deltas posts its final answer directly when
+it is ready.
 
-- `chat.startStream` on the first visible text delta; `chat.appendStream` with
+- `chat.startStream` uses timeline task display; `chat.appendStream` sends `chunks`:
   - `markdown_text` chunks for assistant text (standard markdown passes through — **no
     mrkdwn conversion table**),
   - `task_update` chunks for `tool_execution_start`/`_end` (`in_progress` →
-    `complete`/`error`), so tool calls render as a real timeline;
+    `complete`/`error`), so tool calls render as a real timeline. Only the tool name is
+    exposed; arguments and output are not sent to Slack.
 - `chat.stopStream` finalizes the *same* message with any footer blocks.
 
 Constraints and behaviours:
 
-- The first visible text starts the reply immediately; later appends are coalesced on
-  `flush_ms`, never per token (the daemon already coalesces at 50 ms / 8 KB).
-- `cannot_provide_both_markdown_text_and_chunks` per request — compose chunks.
+- The first visible text starts the reply immediately when no task arrived first; later
+  appends are coalesced on `flush_ms`, never per token (the daemon already coalesces at
+  50 ms / 8 KB).
+- Streaming uses chunk mode consistently: text and task updates are `chunks`, not a mix
+  of `markdown_text` and `chunks` request parameters.
 - Streaming to a channel requires `recipient_user_id` + `recipient_team_id`; thread
   replies use `thread_ts`.
 - **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, degrade to

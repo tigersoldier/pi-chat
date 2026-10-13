@@ -315,32 +315,23 @@ type renderer struct {
 	recipientTeam string
 	wantStream    bool
 
-	mu        sync.Mutex
-	ts        string
-	streaming bool
-	text      strings.Builder
+	mu              sync.Mutex
+	ts              string
+	streaming       bool
+	streamAttempted bool
+	text            strings.Builder
 }
 
 func (r *renderer) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.wantStream {
-		// Slack documents the recipient as required "when streaming to
-		// channels", and pi-chat always streams into a thread. Send it when we
-		// have it, and retry without it rather than giving up on streaming over
-		// a field Slack may not want here. The refusal is remembered so an
-		// install that rejects it pays for the discovery only once.
-		withRecipient := r.recipientUser != "" && !r.platform.recipientRefused.Load()
-		recipientUser, recipientTeam := r.recipientFields(withRecipient)
-		ts, err := r.api.StartStream(ctx, r.channel, r.threadTS, recipientUser, recipientTeam)
-		if err != nil && withRecipient {
-			r.log.Warn("streaming with a recipient was refused; retrying without one", "error", err)
-			ts, err = r.api.StartStream(ctx, r.channel, r.threadTS, "", "")
-			if err == nil {
-				r.platform.recipientRefused.Store(true)
-			}
-		}
+	if r.ts != "" {
+		return nil // A task update may already have opened the stream.
+	}
+	if r.wantStream && !r.streamAttempted {
+		r.streamAttempted = true
+		ts, err := r.startStream(ctx, nil)
 		if err == nil {
 			r.ts, r.streaming = ts, true
 			return nil
@@ -353,6 +344,82 @@ func (r *renderer) Start(ctx context.Context) error {
 	}
 	r.ts = ts
 	return nil
+}
+
+func (r *renderer) startStream(ctx context.Context, chunks []streamPayloadChunk) (string, error) {
+	// Slack documents the recipient as required "when streaming to channels",
+	// and pi-chat always streams into a thread. Send it when we have it, and
+	// retry without it rather than giving up over a field Slack may not want.
+	withRecipient := r.recipientUser != "" && !r.platform.recipientRefused.Load()
+	recipientUser, recipientTeam := r.recipientFields(withRecipient)
+	ts, err := r.api.StartStream(ctx, r.channel, r.threadTS, recipientUser, recipientTeam, chunks)
+	if err != nil && withRecipient {
+		r.log.Warn("streaming with a recipient was refused; retrying without one", "error", err)
+		ts, err = r.api.StartStream(ctx, r.channel, r.threadTS, "", "", chunks)
+		if err == nil {
+			r.platform.recipientRefused.Store(true)
+		}
+	}
+	return ts, err
+}
+
+// UpdateTasks sends structured progress through Slack's native task timeline.
+// A task may start the stream before the agent has produced visible text; the
+// task card itself is meaningful progress, so this does not create an empty
+// reply. Batching updates keeps fast tool activity from generating an API call
+// per event. If streaming is disabled or refused, task updates are best-effort
+// and the ordinary text fallback remains unchanged.
+func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) error {
+	if !r.wantStream || len(updates) == 0 {
+		return nil
+	}
+	chunks := make([]streamPayloadChunk, 0, len(updates))
+	for _, update := range updates {
+		chunk, err := taskUpdateChunk(update)
+		if err != nil {
+			return err
+		}
+		chunks = append(chunks, chunk)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ts == "" {
+		if r.streamAttempted {
+			return nil
+		}
+		r.streamAttempted = true
+		ts, err := r.startStream(ctx, chunks)
+		if err != nil {
+			return fmt.Errorf("start task stream: %w", err)
+		}
+		r.ts, r.streaming = ts, true
+		return nil
+	}
+	if !r.streaming {
+		return nil
+	}
+	if err := r.api.AppendStream(ctx, r.channel, r.ts, chunks); err != nil {
+		r.streaming = false
+		return fmt.Errorf("append task updates: %w", err)
+	}
+	return nil
+}
+
+func taskUpdateChunk(update bot.TaskProgress) (streamPayloadChunk, error) {
+	if update.ID == "" || update.Title == "" {
+		return streamPayloadChunk{}, errors.New("task update requires an ID and title")
+	}
+	switch update.Status {
+	case bot.TaskInProgress, bot.TaskComplete, bot.TaskError:
+	default:
+		return streamPayloadChunk{}, fmt.Errorf("unsupported task status %q", update.Status)
+	}
+	return streamPayloadChunk{Type: "task_update",
+		ID:      update.ID,
+		Title:   update.Title,
+		Status:  string(update.Status),
+		Details: update.Details}, nil
 }
 
 // Progress names the message this renderer is writing into, so the core can
@@ -504,7 +571,8 @@ func failureText(partial string, cause error) string {
 // cannot fail as a whole.
 func (r *renderer) appendStream(ctx context.Context, text string) error {
 	for _, piece := range chunk(text, streamChunk) {
-		if err := r.api.AppendStream(ctx, r.channel, r.ts, piece); err != nil {
+		chunk := streamPayloadChunk{Type: "markdown_text", Text: piece}
+		if err := r.api.AppendStream(ctx, r.channel, r.ts, []streamPayloadChunk{chunk}); err != nil {
 			return err
 		}
 	}

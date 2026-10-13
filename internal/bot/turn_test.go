@@ -32,6 +32,20 @@ func textDelta(t *testing.T, s string) gwclient.Event {
 	return gwclient.Event{Type: "message_update", Raw: []byte(raw)}
 }
 
+func toolEvent(t *testing.T, typ, callID, name string, isError bool) gwclient.Event {
+	t.Helper()
+	raw, err := json.Marshal(struct {
+		Type       string `json:"type"`
+		ToolCallID string `json:"toolCallId"`
+		ToolName   string `json:"toolName"`
+		IsError    bool   `json:"isError,omitempty"`
+	}{Type: typ, ToolCallID: callID, ToolName: name, IsError: isError})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gwclient.Event{Type: typ, Raw: raw}
+}
+
 func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
@@ -50,6 +64,32 @@ func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 	}
 	if !st.sawWork() {
 		t.Fatal("a text delta should count as the turn having started")
+	}
+}
+
+func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	start := toolEvent(t, "tool_execution_start", "call-1", "bash", false)
+	start.Raw = []byte(`{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"do-not-share"}}`)
+	st.feed(start, log)
+	end := toolEvent(t, "tool_execution_end", "call-1", "bash", true)
+	end.Raw = []byte(`{"type":"tool_execution_end","toolCallId":"call-1","toolName":"bash","isError":true,"result":{"secret":"do-not-share"}}`)
+	st.feed(end, log)
+
+	updates := st.takeTaskUpdates()
+	if len(updates) != 2 {
+		t.Fatalf("task updates = %+v, want start and end", updates)
+	}
+	if updates[0].ID != "tool-call-1" || updates[0].Title != "Running a command" || updates[0].Status != TaskInProgress {
+		t.Fatalf("start update = %+v", updates[0])
+	}
+	if updates[1].ID != updates[0].ID || updates[1].Status != TaskError {
+		t.Fatalf("end update = %+v, want matching error task", updates[1])
+	}
+	if strings.Contains(updates[0].Title+updates[1].Title, "do-not-share") {
+		t.Fatal("tool arguments or output leaked into the progress title")
 	}
 }
 
@@ -344,6 +384,7 @@ type recordingRenderer struct {
 	starts   int
 	startErr error
 	deltas   []string
+	tasks    []TaskProgress
 	finals   []string
 	failure  string
 	signal   chan struct{} // if set, receives a value on every Delta
@@ -355,6 +396,13 @@ func (r *recordingRenderer) Start(context.Context) error {
 	err := r.startErr
 	r.mu.Unlock()
 	return err
+}
+
+func (r *recordingRenderer) UpdateTasks(_ context.Context, tasks []TaskProgress) error {
+	r.mu.Lock()
+	r.tasks = append(r.tasks, tasks...)
+	r.mu.Unlock()
+	return nil
 }
 
 func (r *recordingRenderer) Delta(_ context.Context, text string) error {
@@ -396,6 +444,12 @@ func (r *recordingRenderer) rendered() string {
 	return strings.Join(r.deltas, "")
 }
 
+func (r *recordingRenderer) taskProgress() []TaskProgress {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]TaskProgress(nil), r.tasks...)
+}
+
 func (r *recordingRenderer) startCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -416,6 +470,56 @@ func TestFlushRetainsTextWhenReplyStartFails(t *testing.T) {
 
 	if got := r.rendered(); got != "partial answer" {
 		t.Fatalf("buffered text = %q, want partial answer available to Fail", got)
+	}
+}
+
+func TestObservedTurnRendersTaskProgressWithoutAssistantText(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	b.lifetime = context.Background()
+	th := testThread(t, b, st)
+	r := &recordingRenderer{}
+	platform.renderer = r
+	turn := newTurnState()
+	turn.feed(toolEvent(t, "tool_execution_start", "call-1", "read", false), discardLogger())
+	turn.feed(toolEvent(t, "tool_execution_end", "call-1", "read", false), discardLogger())
+	turn.feed(gwclient.Event{Type: "agent_settled"}, discardLogger())
+
+	th.renderObservedTurn(turn, nil)
+
+	if got := platform.startedTurns(); got != 1 {
+		t.Fatalf("renderer starts = %d, want a task-only reply", got)
+	}
+	if got := r.taskProgress(); len(got) != 2 || got[0].Status != TaskInProgress || got[1].Status != TaskComplete {
+		t.Fatalf("task updates = %+v, want start and completion", got)
+	}
+	if got := r.startCount(); got != 0 {
+		t.Fatalf("empty text reply started %d times", got)
+	}
+	if got := r.finalAnswers(); len(got) != 1 || got[0] != "" {
+		t.Fatalf("task-only stream finalization = %q, want an empty final answer", got)
+	}
+}
+
+func TestFlushForwardsTaskProgressBeforeAnyAssistantText(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Render.FlushMS = 60000
+	b := &Bot{cfg: cfg, log: discardLogger()}
+	th := &thread{key: "test", b: b, log: b.log}
+	r := &recordingRenderer{}
+	st := newTurnState()
+
+	stop := th.flush(context.Background(), st, r)
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "read", false), discardLogger())
+	waitFor(t, "task progress", func() bool { return len(r.taskProgress()) == 1 })
+	if r.startCount() != 0 {
+		t.Fatalf("task progress started an empty text reply %d times", r.startCount())
+	}
+
+	st.feed(textDelta(t, "answer"), discardLogger())
+	waitFor(t, "assistant text", func() bool { return r.rendered() == "answer" })
+	stop()
+	if got := r.taskProgress()[0]; got.Title != "Reading files" || got.Status != TaskInProgress {
+		t.Fatalf("reported task = %+v", got)
 	}
 }
 
