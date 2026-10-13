@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -49,6 +50,56 @@ func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 	}
 	if !st.sawWork() {
 		t.Fatal("a text delta should count as the turn having started")
+	}
+}
+
+func TestTurnStateCanRecoverTheFinalTextAfterReconnect(t *testing.T) {
+	st := newTurnState()
+	st.append("partial")
+	if got := st.takePending(); got != "partial" {
+		t.Fatalf("pending text = %q, want partial", got)
+	}
+
+	st.replace("partial answer")
+	if got := st.text(); got != "partial answer" {
+		t.Fatalf("full text = %q, want partial answer", got)
+	}
+	if got := st.takePending(); got != " answer" {
+		t.Fatalf("pending text = %q, want only the suffix not yet rendered", got)
+	}
+
+	st = newTurnState()
+	st.append("old partial")
+	st.takePending()
+	st.replace("corrected answer")
+	if got := st.takePending(); got != "" {
+		t.Fatalf("pending text = %q, want no duplicate for a divergent correction", got)
+	}
+}
+
+func TestReconcileObservedTextRecoversMissedDeltas(t *testing.T) {
+	before := sha256.Sum256([]byte("previous answer"))
+
+	st := newTurnState()
+	if !reconcileObservedText(st, "completed while disconnected", before, true) {
+		t.Fatal("a changed final answer should be recovered even when no deltas arrived")
+	}
+	if got := st.text(); got != "completed while disconnected" {
+		t.Fatalf("recovered text = %q", got)
+	}
+
+	st = newTurnState()
+	st.append("partial")
+	if !reconcileObservedText(st, "partial plus missed text", before, true) {
+		t.Fatal("the authoritative final answer should replace a partial stream")
+	}
+	if got := st.text(); got != "partial plus missed text" {
+		t.Fatalf("reconciled text = %q", got)
+	}
+
+	st = newTurnState()
+	if reconcileObservedText(st, "previous answer", before, true) {
+		t.Fatal("a textless wake should not replay the previous answer")
 	}
 }
 
@@ -320,13 +371,23 @@ func (r *recordingRenderer) Delta(_ context.Context, text string) error {
 }
 
 func (r *recordingRenderer) Finish(_ context.Context, final string) error {
+	r.mu.Lock()
 	r.finals = append(r.finals, final)
+	r.mu.Unlock()
 	return nil
 }
 
 func (r *recordingRenderer) Fail(_ context.Context, cause error) error {
+	r.mu.Lock()
 	r.failure = cause.Error()
+	r.mu.Unlock()
 	return nil
+}
+
+func (r *recordingRenderer) finalAnswers() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.finals...)
 }
 
 func (r *recordingRenderer) rendered() string {

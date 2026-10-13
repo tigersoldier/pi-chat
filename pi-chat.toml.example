@@ -72,7 +72,7 @@ db_path       = "~/.local/state/pi-chat/pi-chat.db"
 
 [concurrency]
 max_warm_sessions         = 8     # bound connections, i.e. warm pi processes
-thread_idle_close_minutes = 10    # close a thread's connection after this long idle
+thread_idle_close_minutes = 60    # close a thread's connection after this long idle
 admission_wait_seconds    = 120   # how long a message may wait for a free slot
 eviction                  = "evict-then-queue"  # evict idle LRU → queue → refuse
 

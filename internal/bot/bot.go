@@ -36,18 +36,22 @@ const (
 // Bot is the core: one instance per process, because Socket Mode distributes
 // deliveries across connections (DESIGN.md §12).
 type Bot struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	plat    Platform
-	store   *store.Store
-	work    *workspace.Provisioner
-	gw      gateway
-	life    lifecycle
-	version string
+	cfg      *config.Config
+	log      *slog.Logger
+	plat     Platform
+	lifetime context.Context
+	cancel   context.CancelFunc
+	store    *store.Store
+	work     *workspace.Provisioner
+	gw       gateway
+	life     lifecycle
+	version  string
 
-	mu      sync.Mutex
-	threads map[string]*thread
-	closed  bool
+	mu             sync.Mutex
+	threads        map[string]*thread
+	coldPollAfter  map[string]time.Time
+	coldPollCursor string
+	closed         bool
 }
 
 // New builds a Bot. The caller keeps ownership of cfg, log, plat and st, and
@@ -56,20 +60,24 @@ func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, v
 	// One connector serves both halves of the gateway: reading the catalog and
 	// changing sessions differ in the token they dial with, not in what they are.
 	conn := &connector{cfg: cfg}
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &Bot{
-		cfg:     cfg,
-		log:     log,
-		plat:    plat,
-		store:   st,
-		version: version,
+		cfg:      cfg,
+		log:      log,
+		plat:     plat,
+		lifetime: lifetime,
+		cancel:   cancel,
+		store:    st,
+		version:  version,
 		work: workspace.New(workspace.Config{
 			ProjectsRoot:   cfg.Paths.ProjectsRoot,
 			ReposRoot:      cfg.Paths.ReposRoot,
 			InjectedPrompt: cfg.Behavior.InjectedPrompt,
 		}, log),
-		gw:      conn,
-		life:    conn,
-		threads: make(map[string]*thread),
+		gw:            conn,
+		life:          conn,
+		threads:       make(map[string]*thread),
+		coldPollAfter: make(map[string]time.Time),
 	}
 }
 
@@ -289,10 +297,10 @@ func (b *Bot) suggestions() []Suggestion {
 	return out
 }
 
-// Run performs the periodic maintenance the daemon needs, until ctx ends:
-// checking responses left by shutdown, closing idle connections and pruning
-// the dedupe table. On cancellation it gives warm sessions a shutdown notice
-// before releasing their gateway connections.
+// Run performs periodic maintenance until ctx ends: it checks responses left by
+// shutdown, closes idle thread connections, polls a bounded set of cold sessions
+// for new assistant entries, and prunes the dedupe table. On cancellation it
+// sends shutdown notices before releasing gateway connections.
 //
 // It blocks, and it is the caller's to run beside the socket, rather than a
 // goroutine started at construction: a service that spawns work in a
@@ -314,6 +322,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		case <-sweep.C:
 			b.CheckShutdownResponses(ctx)
 			b.closeIdle(ctx)
+			b.pollColdSessions(ctx)
 		case <-prune.C:
 			b.pruneEvents(ctx)
 		}
@@ -334,22 +343,30 @@ func (b *Bot) Close() {
 		threads = append(threads, th)
 	}
 	b.mu.Unlock()
+	if b.cancel != nil {
+		b.cancel()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, th := range threads {
 		// A turn in flight keeps its connection; the process is going away and
 		// the answer is in pi's session file either way.
-		if th.turnMu.TryLock() {
-			th.close(ctx)
-			th.turnMu.Unlock()
+		if th.busy() || !th.turnMu.TryLock() {
+			continue
 		}
+		if th.busy() {
+			th.turnMu.Unlock()
+			continue
+		}
+		th.close(ctx)
+		th.turnMu.Unlock()
 	}
 }
 
-// closeIdle closes the connection of every thread that has been idle for
-// longer than the configured window, and saves the cursor of the rest so a
-// restart resumes from the right place.
+// closeIdle closes connections that have been idle longer than the configured
+// window, while leaving active turns attached. It saves the cursor of the rest
+// and schedules closed threads for bounded cold polling.
 //
 // The session is never stopped: closing a connection is instant and cheap to
 // undo, while stopping pi would throw away the process's warm state and force
@@ -364,9 +381,14 @@ func (b *Bot) closeIdle(ctx context.Context) {
 		if row.State != store.StateWarm {
 			continue
 		}
-		// TryLock rather than Lock: a running turn must not be interrupted by
-		// maintenance, and waiting for it would stall the whole sweep.
-		if !th.turnMu.TryLock() {
+		// An observed turn reserves cur before its worker can take turnMu, so
+		// check busy on both sides of TryLock as well as relying on the lock for
+		// prompted turns.
+		if th.busy() || !th.turnMu.TryLock() {
+			continue
+		}
+		if th.busy() {
+			th.turnMu.Unlock()
 			continue
 		}
 		client := th.live()
@@ -378,7 +400,12 @@ func (b *Bot) closeIdle(ctx context.Context) {
 		}
 		if client != nil {
 			if now.Sub(row.LastActive) >= window {
+				if th.busy() {
+					th.turnMu.Unlock()
+					continue
+				}
 				th.close(ctx)
+				b.scheduleColdPoll(row, now, window)
 				closed++
 			} else {
 				th.saveCursor(ctx, client)
@@ -387,6 +414,7 @@ func (b *Bot) closeIdle(ctx context.Context) {
 			// The connection is gone but the row still says warm: the process
 			// restarted, or the connection died without a turn noticing.
 			th.update(func(row *store.ThreadRow) { row.State = store.StateCold })
+			b.scheduleColdPoll(row, now, window)
 		}
 		th.turnMu.Unlock()
 	}

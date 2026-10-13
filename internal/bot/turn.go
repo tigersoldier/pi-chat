@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,8 +25,48 @@ const (
 
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
-	th.turnMu.Lock()
-	defer th.turnMu.Unlock()
+	var st *turnState
+	held := false
+	waited := false
+	for {
+		if !th.turnMu.TryLock() {
+			waited = true
+			th.turnMu.Lock()
+		}
+		held = true
+		active := th.cur.Load()
+		if active == nil {
+			st = newPromptTurnState()
+			if th.cur.CompareAndSwap(nil, st) {
+				break
+			}
+			active = th.cur.Load()
+		}
+		th.turnMu.Unlock()
+		held = false
+
+		if active == nil {
+			continue
+		}
+		waited = true
+		select {
+		case <-active.finishedCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() {
+		th.cur.CompareAndSwap(st, nil)
+		st.finish()
+		if held {
+			th.turnMu.Unlock()
+		}
+	}()
+	if waited {
+		// startTurn raised the indicator before waiting for this lock. An
+		// observed turn may have lowered it while this request was queued.
+		th.b.setStatus(ctx, th, StatusBusy)
+	}
 
 	client, err := th.ensure(ctx, m.Text)
 	if err != nil {
@@ -39,11 +80,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	before, err := client.GetLastAssistantText(ctx)
 	if err != nil {
 		th.log.Debug("cannot read the previous answer", "error", err)
+	} else {
+		th.rememberAssistant(before)
 	}
-
-	st := newTurnState()
-	th.cur.Store(st)
-	defer th.cur.Store(nil)
 
 	stopFlush := th.flush(ctx, st, r)
 	defer stopFlush()
@@ -67,9 +106,45 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// it in front of the first prompt of the conversation (DESIGN.md §4).
 	instruction := th.neededInstruction(ctx)
 
-	// Only now do the session's events belong to this turn, and only now may the
-	// flusher render them.
-	st.prompted.Store(true)
+	// A live agent_start during preparation temporarily replaces this prompt
+	// reservation. Yield the lock so its observed reply can render first, then
+	// restore this reservation before sending the prompt.
+	for {
+		st.renderable.Store(true)
+		active := th.cur.Load()
+		if active == nil {
+			if th.cur.CompareAndSwap(nil, st) {
+				break
+			}
+			continue
+		}
+		if active == st {
+			break
+		}
+		st.renderable.Store(false)
+		waited = true
+		held = false
+		th.turnMu.Unlock()
+		select {
+		case <-active.finishedCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		th.turnMu.Lock()
+		held = true
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		th.b.setStatus(ctx, th, StatusBusy)
+		client, err = th.ensure(ctx, m.Text)
+		if err != nil {
+			return err
+		}
+		if latest, readErr := client.GetLastAssistantText(ctx); readErr == nil {
+			before = latest
+			th.rememberAssistant(before)
+		}
+	}
 	prompt := prepared.text
 	if instruction != "" {
 		prompt = instruction + "\n\n" + prompt
@@ -106,16 +181,19 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.forgetSessionForPath(ctx, sessionPath)
 		return fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
 	}
-	th.saveCursor(ctx, client)
+	th.saveCursorAfterActivity(ctx, client)
 
 	final, err := client.GetLastAssistantText(ctx)
 	if err != nil {
 		th.log.Warn("cannot read the answer", "error", err)
 	}
 	// GetLastAssistantText returns just the last assistant message. Preserve
-	// any earlier visible messages from this turn, separated as paragraphs,
-	// while letting the authoritative final text correct the last one.
+	// earlier visible messages and fall back to streamed text if reading back
+	// failed, while letting the authoritative final text correct the last one.
 	final = st.authoritativeText(final)
+	if final != "" {
+		th.rememberAssistant(final)
+	}
 	if final == "" || (final == before && !st.sawWork()) {
 		return errors.New("the agent produced no answer")
 	}
@@ -130,6 +208,249 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	return nil
 }
 
+// renderObservedTurn renders a turn the session started without a Slack
+// prompt. It waits for actual assistant text before creating a Slack reply, so
+// synthetic or textless wakes never become empty Slack replies.
+func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
+	th.turnMu.Lock()
+	defer th.finishTurn(st)
+	sessionPath := th.snapshot().SessionPath
+	defer func() {
+		if st.sessionDeleted() {
+			th.forgetSessionForPath(context.Background(), sessionPath)
+		}
+	}()
+
+	ctx := th.b.lifetime
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
+	th.touch()
+	th.b.setStatus(ctx, th, StatusBusy)
+	defer th.b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
+
+	if client == nil {
+		client = th.live()
+	}
+	before, haveBefore := th.assistantBaseline()
+	if client != nil && !haveBefore {
+		text, err := client.GetLastAssistantText(ctx)
+		haveBefore = err == nil
+		if err != nil {
+			th.log.Debug("cannot read the previous answer before an asynchronous turn", "error", err)
+		} else {
+			before = sha256.Sum256([]byte(text))
+			th.rememberAssistant(text)
+		}
+	}
+	var disconnected <-chan struct{}
+	setClient := func(c *gwclient.Client) {
+		client = c
+		if c == nil {
+			disconnected = nil
+			return
+		}
+		disconnected = c.Done()
+	}
+	setClient(client)
+	reconnect := func() error {
+		c, err := th.reconnectObservedTurn(ctx, st, before, haveBefore)
+		if err == nil {
+			setClient(c)
+		}
+		return err
+	}
+	reconcile := func() {
+		if client == nil || st.sessionDeleted() {
+			return
+		}
+		final, err := client.GetLastAssistantText(ctx)
+		if err != nil {
+			th.log.Debug("cannot reconcile the completed asynchronous answer", "error", err)
+			return
+		}
+		if reconcileObservedText(st, final, before, haveBefore) {
+			th.rememberAssistant(final)
+		}
+	}
+	isDone := func() bool {
+		select {
+		case <-st.doneCh:
+			return true
+		default:
+			return false
+		}
+	}
+
+	// A native completion can wake the parent without it producing a reply.
+	// Don't create an empty placeholder (or show the synthetic wake message).
+	for st.text() == "" {
+		select {
+		case <-st.textCh:
+		case <-st.doneCh:
+			if st.text() == "" {
+				reconcile()
+				if st.text() == "" {
+					if client != nil && !st.sessionDeleted() {
+						th.saveCursorAfterActivity(ctx, client)
+					}
+					return
+				}
+			}
+		case <-disconnected:
+			if err := reconnect(); err != nil {
+				if isDone() {
+					reconcile()
+					if st.text() != "" {
+						continue
+					}
+				}
+				th.log.Warn("cannot reconnect before an asynchronous reply", "error", err)
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	m := Message{Thread: th.t, Workspace: th.t.Workspace}
+	r, err := th.b.plat.StartTurn(ctx, m)
+	if err != nil {
+		th.log.Error("cannot start the asynchronous reply", "error", err)
+		return
+	}
+	stopFlush := th.flush(ctx, st, r)
+	defer stopFlush()
+
+	var waitErr error
+waitForCompletion:
+	for !isDone() {
+		select {
+		case <-st.doneCh:
+		case <-disconnected:
+			if err := reconnect(); err != nil {
+				if !isDone() {
+					waitErr = err
+				}
+				break waitForCompletion
+			}
+		case <-ctx.Done():
+			if !isDone() {
+				waitErr = ctx.Err()
+			}
+			break waitForCompletion
+		}
+	}
+	if st.sessionDeleted() && waitErr == nil {
+		waitErr = fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
+	}
+	stopFlush()
+	if waitErr == nil {
+		reconcile()
+	}
+
+	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	if waitErr != nil {
+		if err := r.Fail(terminalCtx, waitErr); err != nil {
+			th.log.Error("cannot report the asynchronous reply failure", "error", err)
+		}
+	} else if final := st.text(); final != "" {
+		th.rememberAssistant(final)
+		if err := r.Finish(terminalCtx, final); err != nil {
+			th.log.Error("cannot finish the asynchronous reply", "error", err)
+		}
+	}
+	if waitErr == nil && client != nil && !st.sessionDeleted() {
+		th.saveCursorAfterActivity(ctx, client)
+	}
+	th.touch()
+}
+
+// reconnectObservedTurn reattaches after a connection drop while an observed
+// turn is still reserved. GetState restores the gateway's running/settled bit;
+// if the turn finished in the gap, the last assistant text recovers its answer.
+func (th *thread) reconnectObservedTurn(ctx context.Context, st *turnState, before [32]byte, haveBefore bool) (*gwclient.Client, error) {
+	backoff := 250 * time.Millisecond
+	firstAttempt := true
+	for {
+		row := th.snapshot()
+		if row.SessionPath == "" || st.sessionDeleted() {
+			return nil, fmt.Errorf("%w: the thread no longer owns the observed session", errSessionGone)
+		}
+		client, err := th.ensure(ctx, "")
+		if err == nil {
+			_, err = client.GetState(ctx)
+		}
+		if err == nil && !client.TurnRunning() {
+			final, readErr := client.GetLastAssistantText(ctx)
+			if readErr != nil {
+				err = fmt.Errorf("read the asynchronous answer after reconnect: %w", readErr)
+			} else {
+				reconciled := reconcileObservedText(st, final, before, haveBefore)
+				if !reconciled {
+					page, entriesErr := client.GetEntries(ctx, row.LeafID)
+					if entriesErr != nil {
+						th.log.Debug("cannot inspect assistant entries after reconnect", "error", entriesErr)
+					} else if row.LeafID != "" {
+						reconciled = reconcileObservedEntries(
+							st, final, row.LeafID, page.LeafID, page.Entries)
+					} else if recovered, ok := latestAssistantTextAfter(
+						page.Entries, row.LastActive.Add(time.Second)); ok {
+						if final == "" {
+							final = recovered
+						}
+						st.replace(final)
+						reconciled = true
+					}
+				}
+				if reconciled {
+					if final == "" {
+						final = st.text()
+					}
+					th.rememberAssistant(final)
+				}
+				st.markDone()
+				return client, nil
+			}
+		}
+		if err == nil {
+			return client, nil
+		}
+		if errors.Is(err, errSessionGone) || ctx.Err() != nil {
+			return nil, err
+		}
+		if firstAttempt {
+			th.log.Warn("gateway disconnected during an asynchronous turn; reconnecting", "error", err)
+			firstAttempt = false
+		} else {
+			th.log.Debug("asynchronous turn reconnect is still failing", "error", err)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		}
+		backoff = min(backoff*2, 5*time.Second)
+	}
+}
+
+// reconcileObservedText replaces missing or partial streamed deltas with the
+// authoritative final answer, while leaving textless wakes empty.
+func reconcileObservedText(st *turnState, final string, before [32]byte, haveBefore bool) bool {
+	if final == "" {
+		return false
+	}
+	current := st.text()
+	if current == "" && (!haveBefore || sha256.Sum256([]byte(final)) == before) {
+		return false
+	}
+	st.replace(final)
+	return true
+}
+
 // turnState accumulates what the gateway reports about one turn.
 //
 // It is written by the connection's OnEvent callback, which runs on the read
@@ -141,26 +462,32 @@ type turnState struct {
 	pending        strings.Builder // text not yet rendered
 	messages       []string        // completed assistant messages with visible text
 	currentMessage strings.Builder // visible text in the current assistant message
+	shown          strings.Builder // text already handed to a renderer
 	work           bool
+	// promptReservation distinguishes a queued Slack prompt from an unsolicited
+	// turn so an early agent_start can be reserved and rendered separately.
+	promptReservation bool
 
 	// firstTextCh wakes the renderer as soon as user-visible text arrives, so
 	// it can create a reply without showing an empty message during thinking.
 	firstTextCh   chan struct{}
 	firstTextOnce sync.Once
 
-	// prompted is set once this turn has issued its prompt. Until then the
-	// stream belongs to something else: a resumed connection replays from the
-	// saved cursor, and a long replay can still be arriving while the turn is
-	// being set up. Rendering those frames would show a previous answer as this
-	// turn's work.
-	prompted atomic.Bool
+	// renderable marks the point where this reservation may accept session
+	// output. A live agent_start can claim it during prompt preparation; other
+	// pre-start frames are not safely attributable to this reply.
+	renderable atomic.Bool
 	// deleted records that the session was deleted under this turn.
 	deleted atomic.Bool
 
-	workOnce sync.Once
-	doneOnce sync.Once
-	workCh   chan struct{} // closed on the first sign of a running turn
-	doneCh   chan struct{} // closed on a terminal event
+	workOnce   sync.Once
+	doneOnce   sync.Once
+	textOnce   sync.Once
+	finishOnce sync.Once
+	workCh     chan struct{} // closed on the first sign of a running turn
+	doneCh     chan struct{} // closed on a terminal event
+	textCh     chan struct{} // closed on the first assistant text delta
+	finishedCh chan struct{} // closed after this turn's renderer is finished
 }
 
 func newTurnState() *turnState {
@@ -168,6 +495,8 @@ func newTurnState() *turnState {
 		firstTextCh: make(chan struct{}),
 		workCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
+		textCh:      make(chan struct{}),
+		finishedCh:  make(chan struct{}),
 	}
 }
 
@@ -281,6 +610,30 @@ func (s *turnState) append(delta string) {
 	s.currentMessage.WriteString(delta)
 	s.mu.Unlock()
 	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
+	s.textOnce.Do(func() { close(s.textCh) })
+}
+
+func (s *turnState) replace(text string) {
+	if text == "" {
+		return
+	}
+	s.mu.Lock()
+	combined := text
+	if len(s.messages) > 0 {
+		combined = strings.Join(s.messages, assistantMessageSeparator) + assistantMessageSeparator + text
+	}
+	s.pending.Reset()
+	// Delta is append-only: send only an unseen suffix. A divergent final is
+	// corrected by Renderer.Finish instead of duplicating already-shown text.
+	shown := s.shown.String()
+	if strings.HasPrefix(combined, shown) {
+		s.pending.WriteString(combined[len(shown):])
+	}
+	s.currentMessage.Reset()
+	s.currentMessage.WriteString(text)
+	s.mu.Unlock()
+	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
+	s.textOnce.Do(func() { close(s.textCh) })
 }
 
 func (s *turnState) markWork() {
@@ -294,8 +647,27 @@ func (s *turnState) markDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
+func (s *turnState) finish() {
+	s.finishOnce.Do(func() { close(s.finishedCh) })
+}
+
 // sessionDeleted reports that the session was deleted while this turn ran.
 func (s *turnState) sessionDeleted() bool { return s.deleted.Load() }
+
+func newPromptTurnState() *turnState {
+	st := newTurnState()
+	st.promptReservation = true
+	return st
+}
+
+func (s *turnState) done() bool {
+	select {
+	case <-s.doneCh:
+		return true
+	default:
+		return false
+	}
+}
 
 func (s *turnState) sawWork() bool {
 	s.mu.Lock()
@@ -353,6 +725,7 @@ func (s *turnState) takePending() string {
 	defer s.mu.Unlock()
 	out := s.pending.String()
 	s.pending.Reset()
+	s.shown.WriteString(out)
 	return out
 }
 
@@ -400,13 +773,26 @@ func stripANSI(s string) string {
 // onEvent routes one gateway event to the turn it belongs to. It runs on the
 // connection's read goroutine.
 func (th *thread) onEvent(ev gwclient.Event) {
-	th.onSessionEvent("", ev)
+	th.onEventWithClient(ev, nil, th.sessionEpoch.Load())
+}
+
+// onEventWithClient also hands the connection to an observed-turn renderer so
+// it can stop waiting if the gateway connection dies.
+func (th *thread) onEventWithClient(ev gwclient.Event, client *gwclient.Client, epoch uint64) {
+	th.onSessionEventWithClient("", ev, client, epoch)
 }
 
 // onSessionEvent ignores frames from a connection whose session identity is no
 // longer the thread's. A late deletion revokes only the old path's binding; it
 // must not complete a turn or clear the successor's row.
 func (th *thread) onSessionEvent(sessionPath string, ev gwclient.Event) {
+	th.onSessionEventWithClient(sessionPath, ev, nil, th.sessionEpoch.Load())
+}
+
+// onSessionEventWithClient keeps both the session identity and connection
+// generation attached to each callback, while passing the client to any
+// observed-turn renderer started from that callback.
+func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event, client *gwclient.Client, epoch uint64) {
 	if sessionPath != "" && th.snapshot().SessionPath != sessionPath {
 		if ev.Type == "gw_session_state" {
 			if state, err := ev.SessionState(); err == nil && state.State == protocol.SessionStateDeleted {
@@ -417,6 +803,9 @@ func (th *thread) onSessionEvent(sessionPath string, ev gwclient.Event) {
 			"type", ev.Type, "session", sessionPath)
 		return
 	}
+	if epoch != th.sessionEpoch.Load() || th.sessionChanging.Load() {
+		return
+	}
 	// A compaction is not a turn's output, and its consequence outlives the turn
 	// it happened in: it replaces the conversation with a summary, which is where
 	// an adopted session's instruction lives. It is applied to the thread rather
@@ -424,8 +813,45 @@ func (th *thread) onSessionEvent(sessionPath string, ev gwclient.Event) {
 	if ev.Type == "compaction_end" && compactionSucceeded(ev) {
 		th.instructionDiscarded()
 	}
-
-	cur := th.cur.Load()
+	var cur *turnState
+	for {
+		cur = th.cur.Load()
+		if ev.Type != "agent_start" || (cur != nil && !cur.done() && !(cur.promptReservation && !cur.renderable.Load())) {
+			break
+		}
+		if cur != nil && cur.sessionDeleted() {
+			return
+		}
+		previous := cur
+		st := newTurnState()
+		st.renderable.Store(true)
+		if !th.cur.CompareAndSwap(previous, st) {
+			continue
+		}
+		// The prompt can cross into its submitted phase while this callback is
+		// replacing the preparation reservation. If it did, restore that state
+		// and let the prompt own this agent_start.
+		if previous != nil && !previous.done() && previous.promptReservation && previous.renderable.Load() {
+			if th.cur.CompareAndSwap(st, previous) {
+				cur = previous
+				break
+			}
+			continue
+		}
+		if epoch != th.sessionEpoch.Load() || th.sessionChanging.Load() {
+			th.cur.CompareAndSwap(st, nil)
+			st.finish()
+			return
+		}
+		cur = st
+		th.log.Info("the session started a turn without a Slack prompt; capturing its reply")
+		go th.renderObservedTurn(st, client)
+		break
+	}
+	if epoch != th.sessionEpoch.Load() || th.sessionChanging.Load() {
+		return
+	}
+	cur = th.cur.Load()
 	if ev.Type == "gw_session_state" {
 		if state, err := ev.SessionState(); err == nil && state.State == protocol.SessionStateDeleted {
 			if cur != nil {
@@ -443,16 +869,12 @@ func (th *thread) onSessionEvent(sessionPath string, ev gwclient.Event) {
 		}
 	}
 	if cur == nil {
-		// Nothing is being rendered: between turns, or a turn that already
-		// finished. A resumed connection replays here, and replay is
-		// deliberately dropped — the thread shows live turns, not history.
+		// Text and lifecycle events alone do not establish an unsolicited
+		// response; agent_start above is the boundary for a live wake.
 		th.log.Debug("gateway event outside a turn", "type", ev.Type)
 		return
 	}
-	if !cur.prompted.Load() {
-		// The turn exists but has not prompted yet, so the stream still belongs
-		// to a previous turn — a long replay can outlast the dial. Rendering it
-		// would present an old answer as this turn's work.
+	if !cur.renderable.Load() {
 		th.log.Debug("gateway event before the prompt; dropping it", "type", ev.Type)
 		return
 	}
