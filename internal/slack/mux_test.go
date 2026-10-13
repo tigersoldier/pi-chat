@@ -48,6 +48,7 @@ type capablePlatform struct {
 	fakePlatform
 	acks       []bool
 	completed  []bot.Message
+	failed     []bot.Message
 	imageReads []string
 }
 
@@ -58,6 +59,11 @@ func (c *capablePlatform) AcknowledgeRequest(_ context.Context, _ bot.Message, a
 
 func (c *capablePlatform) CompleteRequest(_ context.Context, m bot.Message) error {
 	c.completed = append(c.completed, m)
+	return nil
+}
+
+func (c *capablePlatform) FailRequest(_ context.Context, m bot.Message) error {
+	c.failed = append(c.failed, m)
 	return nil
 }
 
@@ -191,6 +197,15 @@ func TestMuxCapabilitiesFollowTheSurface(t *testing.T) {
 	}
 	if len(dm.completed) != 1 || dm.completed[0].TS != message.TS {
 		t.Errorf("completed messages = %+v, want the original request", dm.completed)
+	}
+	if err := mux.FailRequest(ctx, message); err != nil {
+		t.Fatalf("FailRequest on the capable surface: %v", err)
+	}
+	if len(dm.failed) != 1 || dm.failed[0].TS != message.TS {
+		t.Errorf("failed messages = %+v, want the original request", dm.failed)
+	}
+	if err := mux.FailRequest(ctx, bot.Message{Thread: bot.Thread{Channel: "C9"}}); err != nil {
+		t.Errorf("FailRequest on a surface without the capability must be a no-op, got: %v", err)
 	}
 	if err := mux.CompleteRequest(ctx, bot.Message{Thread: bot.Thread{Channel: "C9"}}); err != nil {
 		t.Errorf("CompleteRequest on a surface without the capability must be a no-op, got: %v", err)

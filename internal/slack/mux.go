@@ -89,6 +89,19 @@ func (m *MultiPlatform) CompleteRequest(ctx context.Context, msg bot.Message) er
 	return reporter.CompleteRequest(ctx, msg)
 }
 
+// FailRequest reacts to the original message through its owning surface.
+func (m *MultiPlatform) FailRequest(ctx context.Context, msg bot.Message) error {
+	platform, err := m.forChannel(msg.Thread.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.RequestFailureReporter)
+	if !ok {
+		return nil
+	}
+	return reporter.FailRequest(ctx, msg)
+}
+
 // OpenThread opens the thread on the surface that owns the channel it is
 // opened in.
 func (m *MultiPlatform) OpenThread(ctx context.Context, channel, text string) (bot.Thread, error) {

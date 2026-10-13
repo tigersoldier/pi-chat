@@ -27,9 +27,10 @@ import (
 // outliving the conversation that needed it; the prune keeps the dedupe table
 // proportional to a day of traffic rather than to the bot's uptime.
 const (
-	maintenanceInterval = 30 * time.Second
-	pruneInterval       = 6 * time.Hour
-	eventTTL            = 24 * time.Hour
+	maintenanceInterval    = 30 * time.Second
+	pruneInterval          = 6 * time.Hour
+	eventTTL               = 24 * time.Hour
+	requestReactionTimeout = 5 * time.Second
 )
 
 // Bot is the core: one instance per process, because Socket Mode distributes
@@ -593,6 +594,7 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 		r, err := b.plat.StartTurn(ctx, m)
 		if err != nil {
 			b.log.Error("cannot start the reply", "thread", th.key, "error", err)
+			b.failRequest(ctx, m)
 			return
 		}
 		// The status is the platform's loading indicator, and it is the only part
@@ -606,6 +608,7 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 			if ferr := r.Fail(ctx, err); ferr != nil {
 				b.log.Error("cannot report the failure", "thread", th.key, "error", ferr)
 			}
+			b.failRequest(ctx, m)
 		}
 	}()
 }
@@ -673,6 +676,20 @@ func (b *Bot) completeRequest(ctx context.Context, m Message) {
 	}
 	if err := reporter.CompleteRequest(ctx, m); err != nil {
 		b.log.Warn("cannot mark the request complete", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
+	}
+}
+
+// failRequest marks a failed prompt on its original message. It is best-effort
+// and gets its own short context because the turn context may already be canceled.
+func (b *Bot) failRequest(ctx context.Context, m Message) {
+	reporter, ok := b.plat.(RequestFailureReporter)
+	if !ok {
+		return
+	}
+	failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestReactionTimeout)
+	defer cancel()
+	if err := reporter.FailRequest(failCtx, m); err != nil {
+		b.log.Warn("cannot mark the request failed", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
 	}
 }
 

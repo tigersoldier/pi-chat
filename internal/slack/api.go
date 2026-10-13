@@ -328,6 +328,15 @@ func (a *API) AddReaction(ctx context.Context, channel, ts, name string) error {
 	}, nil)
 }
 
+// RemoveReaction removes a named emoji reaction from one message.
+func (a *API) RemoveReaction(ctx context.Context, channel, ts, name string) error {
+	return a.call(ctx, "reactions.remove", map[string]any{
+		"channel":   channel,
+		"timestamp": ts,
+		"name":      name,
+	}, nil)
+}
+
 // PostEphemeral posts text only the named user can see: refusals, hints and
 // command answers should not appear to everyone else in the channel. An empty
 // threadTS posts at the channel root.

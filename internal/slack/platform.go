@@ -183,9 +183,22 @@ func (p *Platform) AcknowledgeRequest(ctx context.Context, m bot.Message, allowe
 	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, reaction)
 }
 
-// CompleteRequest marks the original message after its turn succeeds.
+// CompleteRequest replaces the in-progress eyes reaction with a check mark.
 func (p *Platform) CompleteRequest(ctx context.Context, m bot.Message) error {
-	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, "white_check_mark")
+	return p.replaceRequestReaction(ctx, m, "white_check_mark")
+}
+
+// FailRequest replaces the in-progress eyes reaction with a warning reaction.
+func (p *Platform) FailRequest(ctx context.Context, m bot.Message) error {
+	return p.replaceRequestReaction(ctx, m, "warning")
+}
+
+// replaceRequestReaction moves an accepted request out of its in-progress state.
+func (p *Platform) replaceRequestReaction(ctx context.Context, m bot.Message, next string) error {
+	if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, "eyes"); err != nil && !IsCode(err, "no_reaction") {
+		return fmt.Errorf("remove the in-progress reaction: %w", err)
+	}
+	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, next)
 }
 
 // OpenThread posts a top-level message and returns the thread it starts: the

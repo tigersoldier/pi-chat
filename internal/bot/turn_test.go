@@ -428,6 +428,61 @@ func TestFlushRendersPendingText(t *testing.T) {
 	stop()
 }
 
+func TestCanceledTurnMarksOriginalRequestFailed(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	message := newTestMessage("failed-turn", "hello")
+
+	b.startTurn(ctx, th, message)
+	waitFor(t, "failed request reaction", func() bool { return len(platform.failedRequests()) == 1 })
+	if got := platform.failedRequests()[0].TS; got != message.TS {
+		t.Errorf("failed request timestamp = %q, want %q", got, message.TS)
+	}
+	if got := len(platform.completedRequests()); got != 0 {
+		t.Errorf("completed %d requests after the turn failed", got)
+	}
+	assertFailureReporterUsesLiveBoundedContext(t, platform)
+}
+
+func TestStartTurnErrorMarksOriginalRequestFailed(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	platform.startErr = errors.New("cannot start renderer")
+	th := testThread(t, b, st)
+	message := newTestMessage("start-failure", "hello")
+
+	b.startTurn(context.Background(), th, message)
+	waitFor(t, "failed request reaction", func() bool { return len(platform.failedRequests()) == 1 })
+	if got := platform.startedTurns(); got != 1 {
+		t.Errorf("StartTurn calls = %d, want 1", got)
+	}
+	if got := platform.failedRequests()[0].TS; got != message.TS {
+		t.Errorf("failed request timestamp = %q, want %q", got, message.TS)
+	}
+	if got := len(platform.completedRequests()); got != 0 {
+		t.Errorf("completed %d requests after StartTurn failed", got)
+	}
+	assertFailureReporterUsesLiveBoundedContext(t, platform)
+}
+
+func assertFailureReporterUsesLiveBoundedContext(t *testing.T, platform *fakePlatform) {
+	t.Helper()
+	reports := platform.requestFailureReports()
+	if len(reports) != 1 {
+		t.Fatalf("failure reports = %d, want 1", len(reports))
+	}
+	if reports[0].contextErr != nil {
+		t.Errorf("failure reporter context error = %v, want a live context", reports[0].contextErr)
+	}
+	if !reports[0].hasDeadline {
+		t.Fatal("failure reporter context has no deadline")
+	}
+	if remaining := time.Until(reports[0].deadline); remaining <= 0 || remaining > requestReactionTimeout {
+		t.Errorf("failure reporter deadline has %v remaining, want >0 and <=%v", remaining, requestReactionTimeout)
+	}
+}
+
 func TestRunTurnSetupFailureDoesNotCompleteRequest(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := testThread(t, b, st)
