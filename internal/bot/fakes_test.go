@@ -29,6 +29,13 @@ type requestAck struct {
 	allowed bool
 }
 
+type requestFailureRecord struct {
+	message     Message
+	contextErr  error
+	deadline    time.Time
+	hasDeadline bool
+}
+
 // fakePlatform records what the core asks a platform to do.
 type fakePlatform struct {
 	mu        sync.Mutex
@@ -36,10 +43,11 @@ type fakePlatform struct {
 	notices   []Notice
 	acks      []requestAck
 	completed []Message
-	failed    []Message
+	failed    []requestFailureRecord
 	opened    []string // the text of each thread the core asked for
 	thread    Thread   // what OpenThread returns; zero means a stand-in
 	renderer  *recordingRenderer
+	startErr  error
 	statuses  []Status // lifecycle states, in the order the core asked for them
 
 	prompts        []Suggestion
@@ -74,6 +82,9 @@ func (p *fakePlatform) StartTurn(_ context.Context, m Message) (Renderer, error)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.turns = append(p.turns, m)
+	if p.startErr != nil {
+		return nil, p.startErr
+	}
 	if p.renderer == nil {
 		p.renderer = &recordingRenderer{}
 	}
@@ -101,10 +112,16 @@ func (p *fakePlatform) CompleteRequest(_ context.Context, m Message) error {
 	return nil
 }
 
-func (p *fakePlatform) FailRequest(_ context.Context, m Message) error {
+func (p *fakePlatform) FailRequest(ctx context.Context, m Message) error {
+	deadline, hasDeadline := ctx.Deadline()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.failed = append(p.failed, m)
+	p.failed = append(p.failed, requestFailureRecord{
+		message:     m,
+		contextErr:  ctx.Err(),
+		deadline:    deadline,
+		hasDeadline: hasDeadline,
+	})
 	return nil
 }
 
@@ -194,7 +211,17 @@ func (p *fakePlatform) completedRequests() []Message {
 func (p *fakePlatform) failedRequests() []Message {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]Message(nil), p.failed...)
+	messages := make([]Message, len(p.failed))
+	for i, report := range p.failed {
+		messages[i] = report.message
+	}
+	return messages
+}
+
+func (p *fakePlatform) requestFailureReports() []requestFailureRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]requestFailureRecord(nil), p.failed...)
 }
 
 // openedThreads returns the texts of the threads the core asked to open.
