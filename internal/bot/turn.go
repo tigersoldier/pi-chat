@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/tigersoldier/pi-gateway/gwclient"
 	"github.com/tigersoldier/pi-gateway/protocol"
@@ -21,6 +22,14 @@ import (
 const (
 	startGrace                = 15 * time.Second
 	assistantMessageSeparator = "\n\n"
+	progressMarkerOpen        = "[[slack-progress:"
+	progressMarkerClose       = "]]"
+	maxProgressTitleRunes     = 80
+	maxPendingProgressTitles  = 64
+	maxSeenToolCallIDs        = 64
+	maxToolCallIDBytes        = 256
+	maxToolNameBytes          = 256
+	turnProgressTaskID        = "turn-progress"
 )
 
 // runTurn prompts the thread's session and renders the answer.
@@ -91,6 +100,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 
 	stopFlush := th.flush(ctx, st, r)
 	defer func() {
+		_ = st.waitAbortResolution(context.Background())
 		st.finishOpenTasks()
 		stopFlush()
 	}()
@@ -181,6 +191,11 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		}
 		return fmt.Errorf("wait for the turn: %w", err)
 	}
+	// A concurrent `/abort` can race with settlement. Wait for its gateway
+	// outcome before finalizing the Slack task or stopping the renderer.
+	if err := st.waitAbortResolution(context.Background()); err != nil {
+		return fmt.Errorf("wait for an in-flight abort: %w", err)
+	}
 
 	// The turn is over, wherever it ended: remember how far this connection
 	// got, so reopening the thread resumes here instead of replaying it. A
@@ -270,7 +285,7 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 		return err
 	}
 	reconcile := func() {
-		if client == nil || st.sessionDeleted() {
+		if client == nil || st.sessionDeleted() || th.cur.Load() != st {
 			return
 		}
 		final, err := client.GetLastAssistantText(ctx)
@@ -331,6 +346,7 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	}
 	stopFlush := th.flush(ctx, st, r)
 	defer func() {
+		_ = st.waitAbortResolution(context.Background())
 		st.finishOpenTasks()
 		stopFlush()
 	}()
@@ -360,6 +376,7 @@ waitForCompletion:
 	if st.sessionDeleted() && waitErr == nil {
 		waitErr = fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
 	}
+	_ = st.waitAbortResolution(context.Background())
 	st.finishOpenTasks()
 	stopFlush()
 	if waitErr == nil {
@@ -402,11 +419,17 @@ func (th *thread) reconnectObservedTurn(ctx context.Context, st *turnState, befo
 		if err == nil {
 			_, err = client.GetState(ctx)
 		}
+		if err == nil && th.cur.Load() != st {
+			return client, nil
+		}
 		if err == nil && !client.TurnRunning() {
 			final, readErr := client.GetLastAssistantText(ctx)
 			if readErr != nil {
 				err = fmt.Errorf("read the asynchronous answer after reconnect: %w", readErr)
 			} else {
+				if th.cur.Load() != st {
+					return client, nil
+				}
 				reconciled := reconcileObservedText(st, final, before, haveBefore)
 				if !reconciled {
 					page, entriesErr := client.GetEntries(ctx, row.LeafID)
@@ -475,15 +498,33 @@ func reconcileObservedText(st *turnState, final string, before [32]byte, haveBef
 //
 // It is written by the connection's OnEvent callback, which runs on the read
 // goroutine and therefore must not block or call back into the gateway
-// (DESIGN.md §4). Everything it does is a buffer append or a channel signal;
-// the rendering side reads the buffers from other goroutines.
+// (DESIGN.md §4). It performs in-memory parsing and bookkeeping, buffer appends,
+// and non-blocking channel signals; the rendering side reads from other goroutines.
 type turnState struct {
-	cancel         context.CancelFunc
-	mu             sync.Mutex
-	pending        strings.Builder // text not yet rendered
-	pendingTasks   []TaskProgress  // task updates not yet rendered
-	activeTasks    map[string]TaskProgress
-	activeTaskIDs  []string
+	cancel                context.CancelFunc
+	mu                    sync.Mutex
+	pending               strings.Builder // text not yet rendered
+	pendingTasks          []TaskProgress  // task updates not yet rendered
+	activeTasks           map[string]TaskProgress
+	seenToolCalls         map[string]struct{}
+	seenToolCallIDs       []string
+	lastEventSeq          uint64
+	progressStartedSent   bool
+	terminal              bool
+	eventDone             bool // terminal event observed, independent of renderer release
+	settled               bool
+	progressFinalized     bool
+	pendingTerminalStatus TaskProgressStatus
+	abortPending          int
+	donePending           bool
+	aborted               bool
+
+	progressRemainder       string
+	progressCapture         strings.Builder
+	capturingProgress       bool
+	discardingProgressClose bool
+	pendingProgress         []string
+
 	messages       []string        // completed assistant messages with visible text
 	currentMessage strings.Builder // visible text in the current assistant message
 	shown          strings.Builder // text already handed to a renderer
@@ -504,32 +545,63 @@ type turnState struct {
 	// deleted records that the session was deleted under this turn.
 	deleted atomic.Bool
 
-	workOnce   sync.Once
-	doneOnce   sync.Once
-	textOnce   sync.Once
-	finishOnce sync.Once
-	workCh     chan struct{} // closed on the first sign of a running turn
-	doneCh     chan struct{} // closed on a terminal event
-	textCh     chan struct{} // closed on the first assistant text delta
-	finishedCh chan struct{} // closed after this turn's renderer is finished
-	taskCh     chan struct{} // wakes the renderer when a task update arrives
+	workOnce        sync.Once
+	doneOnce        sync.Once
+	textOnce        sync.Once
+	finishOnce      sync.Once
+	workCh          chan struct{} // closed on the first sign of a running turn
+	doneCh          chan struct{} // renderer wait; may close after abort resolution
+	textCh          chan struct{} // closed on the first assistant text delta
+	finishedCh      chan struct{} // closed after this turn's renderer is finished
+	taskCh          chan struct{} // wakes the renderer when a task update arrives
+	abortResolvedCh chan struct{} // wakes turn cleanup after abort RPCs resolve
 }
 
 func newTurnState() *turnState {
 	return &turnState{
-		activeTasks: make(map[string]TaskProgress),
-		firstTextCh: make(chan struct{}),
-		workCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
-		textCh:      make(chan struct{}),
-		finishedCh:  make(chan struct{}),
-		taskCh:      make(chan struct{}, 1),
+		activeTasks:     make(map[string]TaskProgress),
+		seenToolCalls:   make(map[string]struct{}),
+		firstTextCh:     make(chan struct{}),
+		workCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
+		textCh:          make(chan struct{}),
+		finishedCh:      make(chan struct{}),
+		taskCh:          make(chan struct{}, 1),
+		abortResolvedCh: make(chan struct{}, 1),
 	}
 }
 
 // feed records one gateway event. Unknown event types are ignored on purpose:
 // the gateway forwards everything pi emits, and this build renders text.
+func (s *turnState) hasSeenEvent(seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return seq <= s.lastEventSeq
+}
+
 func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
+	if ev.Type == "gw_snapshot" {
+		if snapshot, err := ev.Snapshot(); err == nil {
+			s.mu.Lock()
+			s.lastEventSeq = snapshot.HeadSeq
+			s.mu.Unlock()
+		}
+		return
+	}
+	// Resume replay carries the original sequence; never apply a frame twice.
+	if ev.Seq != 0 {
+		s.mu.Lock()
+		if ev.Seq <= s.lastEventSeq {
+			s.mu.Unlock()
+			return
+		}
+		s.lastEventSeq = ev.Seq
+		s.mu.Unlock()
+	}
+
 	switch ev.Type {
 	case "message_update":
 		// Streaming updates are delta-only on the wire: the assistant's text
@@ -542,7 +614,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 			} `json:"assistantMessageEvent"`
 		}
 		if err := ev.Unmarshal(&update); err == nil && update.AssistantMessageEvent.Type == "text_delta" {
-			s.append(update.AssistantMessageEvent.Delta)
+			s.appendAssistantDelta(update.AssistantMessageEvent.Delta)
 		}
 		s.markWork()
 
@@ -554,15 +626,13 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		s.markWork()
 
 	case "tool_execution_start":
-		s.recordToolTask(ev, TaskInProgress)
+		s.recordToolTask(ev)
 		s.markWork()
 
 	case "tool_execution_end":
-		s.recordToolTask(ev, TaskComplete)
 		s.markWork()
 
 	case "agent_settled":
-		s.finishOpenTasks()
 		// The only reliable end of work. message_end ends one message and
 		// turn_end ends one turn of the agent loop: a single prompt can produce
 		// several of each (a tool call, then the answer), so treating either as
@@ -578,7 +648,6 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		if turn.State == "running" {
 			s.markWork()
 		} else {
-			s.finishOpenTasks()
 			s.markDone()
 		}
 
@@ -589,7 +658,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 			// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
 			// because the read goroutine must not write to the database.
 			s.deleted.Store(true)
-			s.finishOpenTasks()
+			s.finishProgressTask(TaskError)
 			s.markDone()
 		}
 
@@ -627,48 +696,200 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	}
 }
 
-func (s *turnState) recordToolTask(ev gwclient.Event, status TaskProgressStatus) {
+func (s *turnState) recordToolTask(ev gwclient.Event) {
 	var tool struct {
 		ToolCallID string `json:"toolCallId"`
 		ToolName   string `json:"toolName"`
-		IsError    bool   `json:"isError"`
 	}
 	if err := ev.Unmarshal(&tool); err != nil {
 		return
 	}
-	id := strings.TrimSpace(tool.ToolCallID)
-	name := strings.TrimSpace(stripANSI(tool.ToolName))
-	if id == "" || name == "" {
+	if len(tool.ToolCallID) > maxToolCallIDBytes || len(tool.ToolName) > maxToolNameBytes {
 		return
 	}
-	if ev.Type == "tool_execution_end" && tool.IsError {
-		status = TaskError
-	}
-	title := taskTitle(name)
-	update := TaskProgress{
-		ID:     "tool-" + id,
-		Title:  title,
-		Status: status,
+	callID := strings.TrimSpace(tool.ToolCallID)
+	name := strings.TrimSpace(stripANSI(tool.ToolName))
+	if callID == "" || name == "" {
+		return
 	}
 
 	s.mu.Lock()
-	if status == TaskInProgress {
-		if _, exists := s.activeTasks[update.ID]; !exists {
-			s.activeTaskIDs = append(s.activeTaskIDs, update.ID)
-		}
-		s.activeTasks[update.ID] = update
-	} else {
-		delete(s.activeTasks, update.ID)
-		for i, activeID := range s.activeTaskIDs {
-			if activeID == update.ID {
-				s.activeTaskIDs = append(s.activeTaskIDs[:i], s.activeTaskIDs[i+1:]...)
-				break
-			}
+	if s.terminal {
+		s.mu.Unlock()
+		return
+	}
+	if _, duplicate := s.seenToolCalls[callID]; duplicate {
+		s.mu.Unlock()
+		return
+	}
+	if len(s.seenToolCallIDs) == maxSeenToolCallIDs {
+		delete(s.seenToolCalls, s.seenToolCallIDs[0])
+		copy(s.seenToolCallIDs, s.seenToolCallIDs[1:])
+		s.seenToolCallIDs = s.seenToolCallIDs[:len(s.seenToolCallIDs)-1]
+	}
+	s.seenToolCalls[callID] = struct{}{}
+	s.seenToolCallIDs = append(s.seenToolCallIDs, callID)
+	title := safeToolTitle(name)
+	if len(s.pendingProgress) > 0 {
+		title = s.pendingProgress[0]
+		copy(s.pendingProgress, s.pendingProgress[1:])
+		s.pendingProgress[len(s.pendingProgress)-1] = ""
+		s.pendingProgress = s.pendingProgress[:len(s.pendingProgress)-1]
+		if title == "" {
+			title = safeToolTitle(name)
 		}
 	}
-	s.pendingTasks = append(s.pendingTasks, update)
+	if containsCredentialLikeText(title) {
+		title = "Using a tool"
+	}
+	update := TaskProgress{ID: turnProgressTaskID, Title: title, Status: TaskInProgress}
+	s.activeTasks[turnProgressTaskID] = update
+	s.queueProgressUpdateLocked(update)
 	s.mu.Unlock()
 	s.signalTaskUpdate()
+}
+
+// queueProgressUpdateLocked preserves the first unsent in-progress update and
+// coalesces later title changes, while retaining a terminal update after it.
+// Callers hold s.mu; the queue is bounded to two items.
+func (s *turnState) queueProgressUpdateLocked(update TaskProgress) {
+	if update.Status == TaskInProgress {
+		if !s.progressStartedSent && len(s.pendingTasks) > 0 && s.pendingTasks[0].Status == TaskInProgress {
+			if len(s.pendingTasks) == 1 {
+				if s.pendingTasks[0].Title != update.Title {
+					s.pendingTasks = append(s.pendingTasks, update)
+				}
+			} else {
+				s.pendingTasks[1] = update
+			}
+			return
+		}
+		s.pendingTasks = []TaskProgress{update}
+		return
+	}
+
+	if !s.progressStartedSent && len(s.pendingTasks) > 0 && s.pendingTasks[0].Status == TaskInProgress {
+		if len(s.pendingTasks) == 1 {
+			s.pendingTasks = append(s.pendingTasks, update)
+		} else {
+			s.pendingTasks[1] = update
+		}
+		return
+	}
+	s.pendingTasks = []TaskProgress{update}
+}
+
+// finishProgressTask closes the single logical progress task for this reply.
+// Tool activity only changes its title; it is complete or failed with the turn.
+func (s *turnState) finishProgressTask(status TaskProgressStatus) {
+	s.mu.Lock()
+	if s.progressFinalized {
+		s.mu.Unlock()
+		return
+	}
+	s.terminal = true
+	if !s.settled {
+		s.settled = true
+		s.pendingTerminalStatus = status
+	} else if status == TaskError {
+		s.pendingTerminalStatus = TaskError
+	}
+	updated := s.finalizeProgressLocked()
+	s.mu.Unlock()
+	if updated {
+		s.signalTaskUpdate()
+	}
+}
+
+// finalizeProgressLocked publishes the saved terminal state once outstanding
+// abort requests have resolved. Callers hold s.mu.
+func (s *turnState) finalizeProgressLocked() bool {
+	if !s.settled || s.abortPending != 0 || s.progressFinalized {
+		return false
+	}
+	status := s.pendingTerminalStatus
+	if status == "" {
+		status = TaskComplete
+	}
+	if status == TaskComplete && s.aborted {
+		status = TaskError
+	}
+	s.progressFinalized = true
+	update, exists := s.activeTasks[turnProgressTaskID]
+	if exists {
+		update.Status = status
+		if status == TaskError {
+			update.Details = "The turn ended before it completed."
+		}
+		delete(s.activeTasks, turnProgressTaskID)
+		s.queueProgressUpdateLocked(update)
+	}
+	return exists
+}
+
+// beginAbort prevents a concurrent settle event from publishing completion
+// before the gateway confirms whether the abort took effect.
+func (s *turnState) beginAbort() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.progressFinalized {
+		return false
+	}
+	s.abortPending++
+	return true
+}
+
+func (s *turnState) resolveAbort(tracked, stopped bool) {
+	if !tracked {
+		return
+	}
+	s.mu.Lock()
+	if s.abortPending > 0 {
+		s.abortPending--
+	}
+	if stopped {
+		s.aborted = true
+	}
+	updated := s.finalizeProgressLocked()
+	closeDone := s.donePending && s.abortPending == 0
+	if closeDone {
+		s.donePending = false
+	}
+	s.mu.Unlock()
+	if updated {
+		s.signalTaskUpdate()
+	}
+	if closeDone {
+		s.closeDone()
+	}
+	select {
+	case s.abortResolvedCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *turnState) waitAbortResolution(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		pending := s.abortPending > 0
+		s.mu.Unlock()
+		if !pending {
+			return nil
+		}
+		select {
+		case <-s.abortResolvedCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func safeToolTitle(toolName string) string {
+	title := trimProgressTitle(taskTitle(toolName))
+	if title == "" {
+		return "Using a tool"
+	}
+	return title
 }
 
 func taskTitle(toolName string) string {
@@ -685,33 +906,208 @@ func taskTitle(toolName string) string {
 		return "Listing files"
 	default:
 		name := strings.Join(strings.Fields(toolName), " ")
-		if runes := []rune(name); len(runes) > 100 {
-			name = string(runes[:100]) + "…"
-		}
 		if name == "" {
 			return "Using a tool"
 		}
-		return "Using " + name
+		title := "Using " + name
+		if runes := []rune(title); len(runes) > maxProgressTitleRunes {
+			title = string(runes[:maxProgressTitleRunes-1]) + "…"
+		}
+		return title
 	}
+}
+
+func (s *turnState) appendAssistantDelta(delta string) {
+	if visible := s.consumeProgressDelta(delta); visible != "" {
+		s.append(visible)
+	}
+}
+
+// consumeProgressDelta removes the explicit public-status marker from reply
+// text and queues only a bounded short title for the next tool start. Thinking
+// deltas never reach this parser.
+func (s *turnState) consumeProgressDelta(delta string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	input := s.progressRemainder + delta
+	s.progressRemainder = ""
+	var visible strings.Builder
+	for input != "" {
+		if s.discardingProgressClose {
+			end := strings.Index(input, progressMarkerClose)
+			if end < 0 {
+				keep := progressMarkerPrefixSuffixLen(input, progressMarkerClose)
+				if keep > 0 {
+					s.progressRemainder = input[len(input)-keep:]
+				}
+				break
+			}
+			input = input[end+len(progressMarkerClose):]
+			s.discardingProgressClose = false
+			continue
+		}
+
+		if s.capturingProgress {
+			end := strings.Index(input, progressMarkerClose)
+			if end < 0 {
+				keep := progressMarkerPrefixSuffixLen(input, progressMarkerClose)
+				payload := input[:len(input)-keep]
+				captured := s.progressCapture.String()
+				if len([]rune(captured))+len([]rune(payload)) > maxProgressTitleRunes {
+					// An overlong status marker is invalid metadata. Drop its content
+					// through the closing delimiter without retaining it.
+					if keep > 0 {
+						s.progressRemainder = input[len(input)-keep:]
+					}
+					s.progressCapture.Reset()
+					s.capturingProgress = false
+					s.discardingProgressClose = true
+					break
+				}
+				s.progressCapture.WriteString(payload)
+				if keep > 0 {
+					s.progressRemainder = input[len(input)-keep:]
+				}
+				break
+			}
+
+			content := s.progressCapture.String() + input[:end]
+			if len([]rune(content)) <= maxProgressTitleRunes && len(s.pendingProgress) < maxPendingProgressTitles {
+				s.pendingProgress = append(s.pendingProgress, trimProgressTitle(content))
+			}
+			s.progressCapture.Reset()
+			s.capturingProgress = false
+			input = input[end+len(progressMarkerClose):]
+			continue
+		}
+
+		start := strings.Index(input, progressMarkerOpen)
+		if start >= 0 {
+			visible.WriteString(input[:start])
+			input = input[start+len(progressMarkerOpen):]
+			s.capturingProgress = true
+			continue
+		}
+
+		keep := progressMarkerPrefixSuffixLen(input, progressMarkerOpen)
+		visible.WriteString(input[:len(input)-keep])
+		if keep > 0 {
+			s.progressRemainder = input[len(input)-keep:]
+		}
+		break
+	}
+	return visible.String()
+}
+
+func progressMarkerPrefixSuffixLen(text, marker string) int {
+	max := min(len(text), len(marker)-1)
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(text, marker[:n]) {
+			return n
+		}
+	}
+	return 0
+}
+
+func trimProgressTitle(text string) string {
+	title := strings.Join(strings.Fields(text), " ")
+	if title == "" || containsCredentialLikeText(title) || strings.ContainsAny(title, "`$|;&=/\\{}[]") || strings.Contains(title, "--") {
+		return ""
+	}
+	if runes := []rune(title); len(runes) > maxProgressTitleRunes {
+		return string(runes[:maxProgressTitleRunes-1]) + "…"
+	}
+	return title
+}
+
+func containsCredentialLikeText(text string) bool {
+	lower := strings.ToLower(text)
+	for _, cue := range []string{
+		"password", "passwd", "secret", "token", "credential", "authorization", "bearer",
+		"api key", "api_key", "api-key", "access key", "access_key", "access-key",
+		"private key", "private_key",
+	} {
+		if strings.Contains(lower, cue) {
+			return true
+		}
+	}
+
+	for field := range strings.FieldsSeq(text) {
+		field = strings.Trim(field, `"'(),[]{}<>;`)
+		runes := []rune(field)
+		digits := false
+		for _, r := range runes {
+			digits = digits || unicode.IsDigit(r)
+		}
+		// Long opaque tokens are much more likely to be keys or IDs than useful
+		// action titles. Fall back instead of trying to redact them heuristically.
+		if len(runes) >= 16 || (len(runes) >= 12 && digits) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *turnState) flushProgressMarker() {
+	s.mu.Lock()
+	tail := s.progressRemainder
+	if s.capturingProgress {
+		content := s.progressCapture.String() + tail
+		if len([]rune(content)) <= maxProgressTitleRunes && !containsCredentialLikeText(content) {
+			tail = progressMarkerOpen + content
+		} else {
+			tail = ""
+		}
+	} else if s.discardingProgressClose {
+		tail = ""
+	}
+	s.progressRemainder = ""
+	s.progressCapture.Reset()
+	s.capturingProgress = false
+	s.discardingProgressClose = false
+	s.mu.Unlock()
+	if tail != "" {
+		s.append(tail)
+	}
+}
+
+func stripProgressMarkers(text string) string {
+	var visible strings.Builder
+	for text != "" {
+		start := strings.Index(text, progressMarkerOpen)
+		if start < 0 {
+			visible.WriteString(text)
+			break
+		}
+		visible.WriteString(text[:start])
+		contentStart := start + len(progressMarkerOpen)
+		end := strings.Index(text[contentStart:], progressMarkerClose)
+		if end < 0 {
+			content := text[contentStart:]
+			if len([]rune(content)) <= maxProgressTitleRunes && !containsCredentialLikeText(content) {
+				visible.WriteString(text[start:])
+			}
+			break
+		}
+		suffixStart := contentStart + end + len(progressMarkerClose)
+		text = text[suffixStart:]
+	}
+	return visible.String()
 }
 
 func (s *turnState) finishOpenTasks() {
 	s.mu.Lock()
-	updates := make([]TaskProgress, 0, len(s.activeTasks))
-	for _, id := range s.activeTaskIDs {
-		task, ok := s.activeTasks[id]
-		if !ok {
-			continue
-		}
-		task.Status = TaskError
-		task.Details = "The turn ended before this operation reported completion."
-		updates = append(updates, task)
+	if s.settled || s.progressFinalized {
+		s.mu.Unlock()
+		return
 	}
-	clear(s.activeTasks)
-	s.activeTaskIDs = nil
-	s.pendingTasks = append(s.pendingTasks, updates...)
+	s.terminal = true
+	s.settled = true
+	s.pendingTerminalStatus = TaskError
+	updated := s.finalizeProgressLocked()
 	s.mu.Unlock()
-	if len(updates) > 0 {
+	if updated {
 		s.signalTaskUpdate()
 	}
 }
@@ -726,12 +1122,21 @@ func (s *turnState) signalTaskUpdate() {
 func (s *turnState) takeTaskUpdates() []TaskProgress {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.pendingTasks) == 0 {
+		return nil
+	}
 	updates := append([]TaskProgress(nil), s.pendingTasks...)
+	for _, update := range updates {
+		if update.Status == TaskInProgress {
+			s.progressStartedSent = true
+		}
+	}
 	s.pendingTasks = nil
 	return updates
 }
 
 func (s *turnState) startMessage() {
+	s.flushProgressMarker()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.currentMessage.Len() > 0 {
@@ -756,10 +1161,17 @@ func (s *turnState) append(delta string) {
 }
 
 func (s *turnState) replace(text string) {
+	text = stripProgressMarkers(text)
+	s.mu.Lock()
+	s.progressRemainder = ""
+	s.progressCapture.Reset()
+	s.capturingProgress = false
+	s.discardingProgressClose = false
+	s.pendingProgress = nil
 	if text == "" {
+		s.mu.Unlock()
 		return
 	}
-	s.mu.Lock()
 	combined := text
 	if len(s.messages) > 0 {
 		combined = strings.Join(s.messages, assistantMessageSeparator) + assistantMessageSeparator + text
@@ -786,11 +1198,40 @@ func (s *turnState) markWork() {
 }
 
 func (s *turnState) markDone() {
+	s.mu.Lock()
+	s.eventDone = true
+	s.mu.Unlock()
+	s.finishProgressTask(TaskComplete)
+	s.flushProgressMarker()
+	s.mu.Lock()
+	s.pendingProgress = nil
+	clear(s.seenToolCalls)
+	s.seenToolCallIDs = nil
+	s.terminal = true
+	closeDone := s.abortPending == 0
+	if !closeDone {
+		s.donePending = true
+	}
+	s.mu.Unlock()
+	if closeDone {
+		s.closeDone()
+	}
+}
+
+func (s *turnState) closeDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
 func (s *turnState) finish() {
-	s.finishOnce.Do(func() { close(s.finishedCh) })
+	s.finishOnce.Do(func() {
+		s.mu.Lock()
+		s.terminal = true
+		clear(s.seenToolCalls)
+		s.seenToolCallIDs = nil
+		s.pendingProgress = nil
+		s.mu.Unlock()
+		close(s.finishedCh)
+	})
 }
 
 // sessionDeleted reports that the session was deleted while this turn ran.
@@ -803,12 +1244,9 @@ func newPromptTurnState() *turnState {
 }
 
 func (s *turnState) done() bool {
-	select {
-	case <-s.doneCh:
-		return true
-	default:
-		return false
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.eventDone
 }
 
 func (s *turnState) sawWork() bool {
@@ -831,6 +1269,7 @@ func (s *turnState) authoritativeText(final string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	final = stripProgressMarkers(final)
 	if final == "" {
 		return s.streamedText()
 	}
@@ -964,6 +1403,9 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 	var cur *turnState
 	for {
 		cur = th.cur.Load()
+		if ev.Type == "agent_start" && cur != nil && cur.hasSeenEvent(ev.Seq) {
+			return
+		}
 		if ev.Type != "agent_start" || (cur != nil && !cur.done() && !(cur.promptReservation && !cur.renderable.Load())) {
 			break
 		}

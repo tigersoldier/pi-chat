@@ -79,17 +79,512 @@ func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 	st.feed(end, log)
 
 	updates := st.takeTaskUpdates()
-	if len(updates) != 2 {
-		t.Fatalf("task updates = %+v, want start and end", updates)
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Running a command" || updates[0].Status != TaskInProgress {
+		t.Fatalf("in-progress task update = %+v", updates)
 	}
-	if updates[0].ID != "tool-call-1" || updates[0].Title != "Running a command" || updates[0].Status != TaskInProgress {
-		t.Fatalf("start update = %+v", updates[0])
-	}
-	if updates[1].ID != updates[0].ID || updates[1].Status != TaskError {
-		t.Fatalf("end update = %+v, want matching error task", updates[1])
-	}
-	if strings.Contains(updates[0].Title+updates[1].Title, "do-not-share") {
+	if strings.Contains(updates[0].Title, "do-not-share") {
 		t.Fatal("tool arguments or output leaked into the progress title")
+	}
+	if updates := st.takeTaskUpdates(); len(updates) != 0 {
+		t.Fatalf("tool completion should not create a second task: %+v", updates)
+	}
+
+	st.finishProgressTask(TaskComplete)
+	updates = st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Status != TaskComplete {
+		t.Fatalf("turn completion update = %+v", updates)
+	}
+}
+
+func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(textDelta(t, "Checking the service. [[slack-prog"), log)
+	st.feed(textDelta(t, "ress: Checking current service\nlogs]]"), log)
+	if got := st.takePending(); got != "Checking the service. " {
+		t.Fatalf("reply text = %q, want marker removed", got)
+	}
+
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].Title != "Checking current service logs" {
+		t.Fatalf("start updates = %+v, want concise public title", updates)
+	}
+	if got := st.text(); strings.Contains(got, progressMarkerOpen) {
+		t.Fatalf("progress marker leaked into reply text %q", got)
+	}
+	if got := st.authoritativeText("Finished. [[slack-progress: hidden status]]"); strings.Contains(got, "hidden status") {
+		t.Fatalf("authoritative answer leaked a progress marker: %q", got)
+	}
+
+	st.feed(toolEvent(t, "tool_execution_end", "call-1", "bash", false), log)
+	if updates := st.takeTaskUpdates(); len(updates) != 0 {
+		t.Fatalf("tool completion should not close the turn progress task: %+v", updates)
+	}
+	st.finishProgressTask(TaskComplete)
+	updates = st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Checking current service logs" || updates[0].Status != TaskComplete {
+		t.Fatalf("turn completion update = %+v", updates)
+	}
+}
+
+func TestProgressClosingDelimiterCanSplitAcrossDeltas(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(textDelta(t, "[[slack-progress: Checking service logs]"), log)
+	st.feed(textDelta(t, "]"), log)
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].Title != "Checking service logs" {
+		t.Fatalf("task updates = %+v, want parsed title across split delimiter", updates)
+	}
+	if got := st.text(); strings.Contains(got, progressMarkerOpen) {
+		t.Fatalf("status marker leaked into reply: %q", got)
+	}
+}
+
+func TestIncompleteProgressMarkerDoesNotSuppressFollowingReply(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(textDelta(t, "Status [[slack-progress: incomplete"), log)
+
+	// A new assistant message is a boundary: an unclosed marker must become
+	// ordinary reply text rather than capturing the next message indefinitely.
+	st.startMessage()
+	st.feed(textDelta(t, "Final answer"), log)
+	if got := st.text(); !strings.Contains(got, "incomplete") || !strings.Contains(got, "Final answer") {
+		t.Fatalf("reply lost text around an incomplete marker: %q", got)
+	}
+	if got := st.authoritativeText("Answer [[slack-progress: dangling"); !strings.Contains(got, "dangling") {
+		t.Fatalf("authoritative answer was truncated at incomplete marker: %q", got)
+	}
+}
+
+func TestReplaceClearsPartialProgressMarkerState(t *testing.T) {
+	st := newTurnState()
+	st.feed(textDelta(t, "Partial [[slack-prog"), discardLogger())
+	st.replace("Recovered answer")
+	st.markDone()
+
+	if got := st.text(); got != "Recovered answer" {
+		t.Fatalf("recovered text = %q, want no stale marker suffix", got)
+	}
+	if got := st.takePending(); got != "Recovered answer" {
+		t.Fatalf("recovered pending text = %q", got)
+	}
+}
+
+func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	titles := []string{"Check first task", "Check second task", "Check third task", "Check fourth task"}
+	for _, title := range titles {
+		st.feed(textDelta(t, "[[slack-progress: "+title+"]]"), log)
+	}
+	for i, title := range titles {
+		id := "call-" + string(rune('1'+i))
+		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
+		updates := st.takeTaskUpdates()
+		if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != title || updates[0].Status != TaskInProgress {
+			t.Fatalf("tool %d progress = %+v, want title %q on one stable task", i+1, updates, title)
+		}
+	}
+	if len(st.activeTasks) != 1 {
+		t.Fatalf("active tasks = %d, want one task for the entire turn", len(st.activeTasks))
+	}
+
+	st.finishProgressTask(TaskComplete)
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != titles[len(titles)-1] || updates[0].Status != TaskComplete {
+		t.Fatalf("turn completion = %+v", updates)
+	}
+}
+
+func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
+	recovered := newTurnState()
+	recovered.replace("Answer [[slack-progress: hidden status]] done")
+	if got := recovered.takePending(); strings.Contains(got, "hidden status") || strings.Contains(got, progressMarkerOpen) {
+		t.Fatalf("recovered text leaked a status marker: %q", got)
+	}
+
+	long := strings.Repeat("Check ", maxProgressTitleRunes)
+	if got := trimProgressTitle(long); len([]rune(got)) != maxProgressTitleRunes {
+		t.Fatalf("trimmed title rune length = %d, want %d", len([]rune(got)), maxProgressTitleRunes)
+	}
+	if got := trimProgressTitle("Checking logs --unit private.service"); got != "" {
+		t.Fatalf("command-like progress title = %q, want rejected", got)
+	}
+	for _, risky := range []string{
+		"Checking AKIAIOSFODNN7EXAMPLE",
+		"Using xoxb-123456789012-123456789012-123456789012",
+		"Checking 4111111111111111",
+		"Checking 123456789012",
+		"Reading password=example",
+	} {
+		if got := trimProgressTitle(risky); got != "" {
+			t.Errorf("credential-like progress title %q was accepted as %q", risky, got)
+		}
+	}
+	if got := safeToolTitle("read token abc123456789"); got != "Using a tool" {
+		t.Fatalf("unsafe tool-name fallback = %q, want generic title", got)
+	}
+
+	st := newTurnState()
+	st.feed(textDelta(t, "[[slack-progress: Checking AKIAIOSFODNN7EXAMPLE]]"), discardLogger())
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" {
+		t.Fatalf("unsafe marker did not fall back to generic title: %+v", got)
+	}
+}
+
+func TestFallbackProgressTitleIsBounded(t *testing.T) {
+	title := taskTitle(strings.Repeat("n", maxToolNameBytes))
+	if got := len([]rune(title)); got > maxProgressTitleRunes {
+		t.Fatalf("fallback title rune length = %d, want at most %d", got, maxProgressTitleRunes)
+	}
+}
+
+func TestMarkDoneFinalizesActiveProgressTask(t *testing.T) {
+	st := newTurnState()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+	st.markDone()
+	updates := st.takeTaskUpdates()
+	if len(updates) != 2 || updates[0].Status != TaskInProgress || updates[1].Status != TaskComplete {
+		t.Fatalf("markDone updates = %+v, want in-progress then completion", updates)
+	}
+}
+
+func TestProgressTerminalUpdateKeepsInitialStatusAndRejectsLateStarts(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	st.finishOpenTasks()
+	st.feed(toolEvent(t, "tool_execution_start", "call-2", "read", false), log)
+
+	updates := st.takeTaskUpdates()
+	if len(updates) != 2 || updates[0].Status != TaskInProgress || updates[1].Status != TaskError || updates[0].ID != turnProgressTaskID || updates[1].ID != turnProgressTaskID {
+		t.Fatalf("terminal updates = %+v, want in-progress then error on the same task", updates)
+	}
+	if len(st.activeTasks) != 0 || len(st.takeTaskUpdates()) != 0 {
+		t.Fatal("a late start reopened a terminal progress task")
+	}
+}
+
+func TestAbortResponseWinsSettlementRace(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Status != TaskInProgress {
+		t.Fatalf("initial progress = %+v", got)
+	}
+
+	tracked := st.beginAbort()
+	st.feed(gwclient.Event{Type: "agent_settled"}, log)
+	if !st.done() {
+		t.Fatal("settlement did not mark the turn boundary")
+	}
+	select {
+	case <-st.doneCh:
+		t.Fatal("renderer wait closed before the abort result arrived")
+	default:
+	}
+	if len(st.takeTaskUpdates()) != 0 {
+		t.Fatal("settlement published a terminal task before the abort result arrived")
+	}
+
+	st.resolveAbort(tracked, true)
+	if !st.done() {
+		t.Fatal("settled turn did not finish after abort resolution")
+	}
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Status != TaskError {
+		t.Fatalf("aborted turn update = %+v, want error after confirmed abort", got)
+	}
+}
+
+func TestAgentStartDuringAbortWaitCreatesNextTurn(t *testing.T) {
+	log := discardLogger()
+	lifetime, cancel := context.WithCancel(context.Background())
+	cancel()
+	th := &thread{b: &Bot{lifetime: lifetime, log: log}, log: log}
+	previous := newTurnState()
+	th.cur.Store(previous)
+	previous.feed(gwclient.Event{Type: "agent_start", Seq: 10}, log)
+	tracked := previous.beginAbort()
+	previous.feed(gwclient.Event{Type: "agent_settled", Seq: 11}, log)
+
+	// Hold the renderer lock so its goroutine cannot finish and release the new
+	// turn reservation before the callback's routing decision is inspected.
+	th.turnMu.Lock()
+	th.onSessionEventWithClient("", gwclient.Event{Type: "agent_start", Seq: 12}, nil, th.sessionEpoch.Load())
+	next := th.cur.Load()
+	if next == nil || next == previous {
+		th.turnMu.Unlock()
+		t.Fatal("agent_start during abort wait was not assigned a new turn")
+	}
+	th.turnMu.Unlock()
+	select {
+	case <-next.finishedCh:
+	case <-time.After(time.Second):
+		t.Fatal("test renderer did not release the next turn")
+	}
+	previous.resolveAbort(tracked, true)
+}
+
+func TestReplayedAgentStartDoesNotReplaceDoneTurn(t *testing.T) {
+	st := newTurnState()
+	st.feed(gwclient.Event{Type: "agent_start", Seq: 10}, discardLogger())
+	st.markDone()
+	th := &thread{log: discardLogger()}
+	th.cur.Store(st)
+
+	th.onSessionEventWithClient("", gwclient.Event{Type: "agent_start", Seq: 10}, nil, th.sessionEpoch.Load())
+	if th.cur.Load() != st {
+		t.Fatal("replayed agent_start replaced the completed turn before sequence deduplication")
+	}
+}
+
+func TestObservedCleanupWaitsForAbortBeforeFinalizingProgress(t *testing.T) {
+	st := newTurnState()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+	st.takeTaskUpdates()
+	tracked := st.beginAbort()
+	st.markDone()
+
+	cleanupStarted := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	go func() {
+		close(cleanupStarted)
+		_ = st.waitAbortResolution(context.Background())
+		st.finishOpenTasks()
+		close(cleanupDone)
+	}()
+	<-cleanupStarted
+	select {
+	case <-cleanupDone:
+		t.Fatal("observed cleanup passed an unresolved abort")
+	default:
+	}
+
+	st.resolveAbort(tracked, true)
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("observed cleanup did not resume after abort resolution")
+	}
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Status != TaskError {
+		t.Fatalf("final progress update = %+v, want an error before cleanup ends", got)
+	}
+}
+
+func TestFailedAbortLeavesSettledProgressComplete(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	st.takeTaskUpdates()
+
+	tracked := st.beginAbort()
+	st.feed(gwclient.Event{Type: "agent_settled"}, log)
+	st.resolveAbort(tracked, false)
+	if !st.done() {
+		t.Fatal("settled turn did not finish after failed abort")
+	}
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Status != TaskComplete {
+		t.Fatalf("non-aborted turn update = %+v, want complete", got)
+	}
+}
+
+func TestReplayedEventsDoNotDuplicateProgressMarkers(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	marker := textDelta(t, "[[slack-progress: First action]]")
+	marker.Seq = 10
+	start := toolEvent(t, "tool_execution_start", "call-1", "bash", false)
+	start.Seq = 11
+	st.feed(marker, log)
+	st.feed(start, log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "First action" {
+		t.Fatalf("first action = %+v", got)
+	}
+
+	marker.Seq = 10
+	start.Seq = 11
+	st.feed(marker, log)
+	st.feed(start, log)
+	if got := st.takeTaskUpdates(); len(got) != 0 || len(st.pendingProgress) != 0 {
+		t.Fatalf("replayed events produced updates or stale titles: updates=%+v queued=%v", got, st.pendingProgress)
+	}
+
+	nextMarker := textDelta(t, "[[slack-progress: Second action]]")
+	nextMarker.Seq = 12
+	nextStart := toolEvent(t, "tool_execution_start", "call-2", "bash", false)
+	nextStart.Seq = 13
+	st.feed(nextMarker, log)
+	st.feed(nextStart, log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Second action" {
+		t.Fatalf("second action = %+v, want no stale replayed title", got)
+	}
+}
+
+func TestGatewaySnapshotResetsSequenceWatermark(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	marker := textDelta(t, "[[slack-progress: Before restart]]")
+	marker.Seq = 100
+	start := toolEvent(t, "tool_execution_start", "old-call", "bash", false)
+	start.Seq = 101
+	st.feed(marker, log)
+	st.feed(start, log)
+	st.takeTaskUpdates()
+
+	st.feed(gwclient.Event{Type: "gw_snapshot", Raw: []byte(`{"type":"gw_snapshot","headSeq":5}`)}, log)
+	nextMarker := textDelta(t, "[[slack-progress: After restart]]")
+	nextMarker.Seq = 6
+	nextStart := toolEvent(t, "tool_execution_start", "new-call", "bash", false)
+	nextStart.Seq = 7
+	st.feed(nextMarker, log)
+	st.feed(nextStart, log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "After restart" {
+		t.Fatalf("post-snapshot task update = %+v", got)
+	}
+	settled := gwclient.Event{Type: "agent_settled", Seq: 8}
+	st.feed(settled, log)
+	if !st.done() {
+		t.Fatal("turn did not settle after sequence reset")
+	}
+}
+
+func TestOversizedToolIdentifiersAreNotRetained(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	longID := strings.Repeat("x", maxToolCallIDBytes+1)
+	st.feed(toolEvent(t, "tool_execution_start", longID, "bash", false), log)
+	if len(st.activeTasks) != 0 || len(st.seenToolCalls) != 0 || len(st.takeTaskUpdates()) != 0 {
+		t.Fatal("oversized tool call ID was retained as progress state")
+	}
+	longName := strings.Repeat("x", maxToolNameBytes+1)
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", longName, false), log)
+	if len(st.activeTasks) != 0 || len(st.seenToolCalls) != 0 {
+		t.Fatal("oversized tool name was retained as progress state")
+	}
+}
+
+func TestOversizedProgressMarkerIsRemovedFromReply(t *testing.T) {
+	log := discardLogger()
+	content := strings.Repeat("x", maxProgressTitleRunes+1)
+	marker := progressMarkerOpen + content + " tail" + progressMarkerClose
+	want := "Before  after"
+
+	streamed := newTurnState()
+	streamed.feed(textDelta(t, "Before "+progressMarkerOpen+content), log)
+	streamed.feed(textDelta(t, " tail"+progressMarkerClose+" after"), log)
+	if got := streamed.text(); got != want {
+		t.Fatalf("streamed oversized marker = %q, want %q", got, want)
+	}
+	if got := streamed.authoritativeText("Before " + marker + " after"); got != want {
+		t.Fatalf("authoritative oversized marker = %q, want %q", got, want)
+	}
+
+	recovered := newTurnState()
+	recovered.replace("Before " + marker + " after")
+	if got := recovered.text(); got != want {
+		t.Fatalf("recovered oversized marker = %q, want %q", got, want)
+	}
+}
+
+func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	for i := range 9 {
+		title := "Check step " + strings.Repeat("x", i+1)
+		st.feed(textDelta(t, "[[slack-progress: "+title+"]]"), log)
+	}
+	for i := range 9 {
+		id := "call-" + strings.Repeat("x", i+1)
+		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
+	}
+
+	updates := st.takeTaskUpdates()
+	if len(updates) != 2 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Check step x" || updates[0].Status != TaskInProgress || updates[1].ID != turnProgressTaskID || updates[1].Title != "Check step "+strings.Repeat("x", 9) || updates[1].Status != TaskInProgress {
+		t.Fatalf("coalesced task updates = %+v, want first and latest in-progress titles", updates)
+	}
+	if len(st.activeTasks) != 1 || len(st.seenToolCalls) != 9 {
+		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), len(st.seenToolCalls))
+	}
+
+	st.finishProgressTask(TaskComplete)
+	updates = st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Status != TaskComplete {
+		t.Fatalf("completed task update = %+v", updates)
+	}
+
+	st.feed(gwclient.Event{Type: "agent_settled"}, log)
+	st.feed(toolEvent(t, "tool_execution_start", "late-call", "bash", false), log)
+	if len(st.activeTasks) != 0 || len(st.takeTaskUpdates()) != 0 {
+		t.Fatal("a late tool event reopened progress after the turn settled")
+	}
+}
+
+func TestDuplicateToolStartDoesNotConsumeNextProgressTitle(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(textDelta(t, "[[slack-progress: First action]]"), log)
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "First action" {
+		t.Fatalf("first action = %+v", got)
+	}
+
+	st.feed(textDelta(t, "[[slack-progress: Second action]]"), log)
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	if got := st.takeTaskUpdates(); len(got) != 0 {
+		t.Fatalf("duplicate start emitted an update: %+v", got)
+	}
+	if len(st.pendingProgress) != 1 {
+		t.Fatalf("queued titles after duplicate start = %d, want one", len(st.pendingProgress))
+	}
+
+	st.feed(toolEvent(t, "tool_execution_start", "call-2", "bash", false), log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Second action" {
+		t.Fatalf("second action = %+v, want marker preserved for next call", got)
+	}
+}
+
+func TestProgressCaptureAndTitleQueueAreBounded(t *testing.T) {
+	log := discardLogger()
+	st := newTurnState()
+	overlong := strings.Repeat("x", maxProgressTitleRunes+1)
+	st.feed(textDelta(t, progressMarkerOpen+overlong), log)
+	if st.capturingProgress || st.progressCapture.Len() != 0 {
+		t.Fatalf("oversized marker retained capture state: capturing=%v bytes=%d", st.capturingProgress, st.progressCapture.Len())
+	}
+	st.startMessage()
+	st.feed(textDelta(t, "Final answer"), log)
+	if got := st.text(); got != "Final answer" {
+		t.Fatalf("text after an oversized marker boundary = %q, want final answer", got)
+	}
+
+	st = newTurnState()
+	for range maxPendingProgressTitles + 1 {
+		st.feed(textDelta(t, "[[slack-progress: Check service]]"), log)
+	}
+	if len(st.pendingProgress) != maxPendingProgressTitles {
+		t.Fatalf("queued titles = %d, want cap %d", len(st.pendingProgress), maxPendingProgressTitles)
+	}
+	for i := range maxPendingProgressTitles {
+		id := "queued-" + strings.Repeat("x", i+1)
+		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
+		if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Check service" {
+			t.Fatalf("queued progress %d = %+v", i, got)
+		}
+	}
+	st.feed(toolEvent(t, "tool_execution_start", "overflow", "bash", false), log)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" {
+		t.Fatalf("overflow should use the generic title: %+v", got)
+	}
+	if len(st.seenToolCalls) != maxSeenToolCallIDs {
+		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", len(st.seenToolCalls), maxSeenToolCallIDs)
 	}
 }
 
@@ -489,8 +984,8 @@ func TestObservedTurnRendersTaskProgressWithoutAssistantText(t *testing.T) {
 	if got := platform.startedTurns(); got != 1 {
 		t.Fatalf("renderer starts = %d, want a task-only reply", got)
 	}
-	if got := r.taskProgress(); len(got) != 2 || got[0].Status != TaskInProgress || got[1].Status != TaskComplete {
-		t.Fatalf("task updates = %+v, want start and completion", got)
+	if got := r.taskProgress(); len(got) != 2 || got[0].ID != turnProgressTaskID || got[0].Status != TaskInProgress || got[1].ID != turnProgressTaskID || got[1].Status != TaskComplete {
+		t.Fatalf("task updates = %+v, want in-progress followed by completion", got)
 	}
 	if got := r.startCount(); got != 0 {
 		t.Fatalf("empty text reply started %d times", got)

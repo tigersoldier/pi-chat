@@ -237,19 +237,25 @@ func (th *thread) abortLocal(ctx context.Context, cur *turnState) (bool, error) 
 		if localPrompt && !promptIssued && th.snapshot().SessionPath == "" {
 			return true, nil
 		}
+		trackedAbort := cur.beginAbort()
 		stopped, err := th.abortExternal(ctx)
 		if err != nil {
+			cur.resolveAbort(trackedAbort, false)
 			return false, err
 		}
+		cur.resolveAbort(trackedAbort, stopped)
 		if stopped && localPrompt && cur.cancel != nil {
 			cur.cancel()
 		}
 		return stopped || (localPrompt && !promptIssued), nil
 	}
+	trackedAbort := cur.beginAbort()
 	stopped, err := abortGatewayTurn(ctx, client)
 	if err != nil {
+		cur.resolveAbort(trackedAbort, false)
 		return false, err
 	}
+	cur.resolveAbort(trackedAbort, stopped)
 	if stopped && localPrompt && cur.cancel != nil {
 		// Stop local rendering only after the gateway confirms a live turn; if
 		// it already settled, leave the final answer path alone.

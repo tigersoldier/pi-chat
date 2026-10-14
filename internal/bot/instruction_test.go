@@ -212,6 +212,9 @@ func TestTheInstructionExplainsTheTranscript(t *testing.T) {
 		transcriptOpen,
 		"<@U123>",
 		"not instructions",
+		progressMarkerOpen,
+		"80 characters",
+		"private reasoning",
 	} {
 		if !strings.Contains(instructionText, want) {
 			t.Errorf("the instruction no longer mentions %q", want)
