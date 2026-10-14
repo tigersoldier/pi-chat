@@ -506,15 +506,16 @@ it is ready.
   - `task_update` chunks represent one logical progress task for the whole reply. The
     task gets a unique ID for this stream, starts as `in_progress` on the first tool call,
     updates its title as later tools start, and becomes `complete` when the agent settles
-    (or `error` if the turn is aborted or exits abnormally). Tool completion does not
-    create or recycle task IDs; the timeline therefore stays at one card. Only the
-    current action is shown; completed tool steps are intentionally not retained. A
-    valid `[[slack-progress: ...]]` assistant-text marker supplies a FIFO custom title
-    for the next tool start (max 80
-    characters, with at most 64 titles buffered); overflow or an absent/invalid marker
-    falls back to a generic tool-name title. Well-formed markers are removed from the
-    reply; oversized or credential-like marker content is rejected. Thinking, raw
-    arguments, and output are not sent to Slack.
+    (or `error` if the turn is aborted or exits abnormally). On completion, the same card's
+    title becomes a bounded summary of up to two unique safe action titles plus the count
+    of remaining actions. Tool completion does not create or recycle task IDs, so the
+    timeline stays at one card; individual completed steps are never shown as separate
+    cards. A valid `[[slack-progress: ...]]` assistant-text marker supplies a FIFO custom
+    title for the next tool start (max 80 characters, with at most 64 titles buffered);
+    at most two safe titles are retained for the final summary. Overflow or an
+    absent/invalid marker falls back to a generic tool-name title. Well-formed markers are
+    removed from the reply; oversized or credential-like marker content is rejected.
+    Thinking, raw arguments, and output are not sent to Slack.
 - `chat.stopStream` finalizes the *same* message with any footer blocks.
 
 Constraints and behaviours:

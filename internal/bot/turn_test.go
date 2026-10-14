@@ -124,7 +124,7 @@ func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T)
 	}
 	st.finishProgressTask(TaskComplete)
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Checking current service logs" || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Checking current service logs" || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion update = %+v", updates)
 	}
 }
@@ -198,7 +198,8 @@ func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
 
 	st.finishProgressTask(TaskComplete)
 	updates := st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != titles[len(titles)-1] || updates[0].Status != TaskComplete {
+	wantSummary := "Completed: Check first task, Check second task (+2 more)"
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != wantSummary || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion = %+v", updates)
 	}
 }
@@ -513,10 +514,13 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	if len(st.activeTasks) != 1 || len(st.seenToolCalls) != 9 {
 		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), len(st.seenToolCalls))
 	}
+	if len(st.progressSummaryTitles) != maxProgressSummaryTitles {
+		t.Fatalf("summary titles = %d, want bounded cap %d", len(st.progressSummaryTitles), maxProgressSummaryTitles)
+	}
 
 	st.finishProgressTask(TaskComplete)
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Check step x, Check step xx (+7 more)" || updates[0].Status != TaskComplete {
 		t.Fatalf("completed task update = %+v", updates)
 	}
 
