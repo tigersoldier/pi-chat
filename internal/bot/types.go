@@ -231,7 +231,7 @@ type ProgressReporter interface {
 
 // TaskProgress is a user-facing update to the turn's rolling progress item.
 // Successful completion may replace its current title with a bounded summary;
-// the update deliberately carries no tool arguments or output.
+// Details contains only bounded, safe action titles, never tool arguments or output.
 type TaskProgress struct {
 	ID      string
 	Title   string

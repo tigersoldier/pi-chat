@@ -108,8 +108,8 @@ func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T)
 
 	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
 	updates := st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].Title != "Checking current service logs" {
-		t.Fatalf("start updates = %+v, want concise public title", updates)
+	if len(updates) != 1 || updates[0].Title != "Checking current service logs" || updates[0].Details != "Progress so far:\n• Checking current service logs" {
+		t.Fatalf("start updates = %+v, want concise title and safe expanded details", updates)
 	}
 	if got := st.text(); strings.Contains(got, progressMarkerOpen) {
 		t.Fatalf("progress marker leaked into reply text %q", got)
@@ -124,7 +124,7 @@ func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T)
 	}
 	st.finishProgressTask(TaskComplete)
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Checking current service logs" || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Checking current service logs" || updates[0].Details != "Completed actions:\n• Checking current service logs" || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion update = %+v", updates)
 	}
 }
@@ -199,7 +199,8 @@ func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
 	st.finishProgressTask(TaskComplete)
 	updates := st.takeTaskUpdates()
 	wantSummary := "Completed: Check first task, Check second task (+2 more)"
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != wantSummary || updates[0].Status != TaskComplete {
+	wantDetails := "Completed actions:\n• Check first task\n• Check second task\n• Check third task\n• Check fourth task"
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != wantSummary || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion = %+v", updates)
 	}
 }
@@ -514,13 +515,14 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	if len(st.activeTasks) != 1 || len(st.seenToolCalls) != 9 {
 		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), len(st.seenToolCalls))
 	}
-	if len(st.progressSummaryTitles) != maxProgressSummaryTitles {
-		t.Fatalf("summary titles = %d, want bounded cap %d", len(st.progressSummaryTitles), maxProgressSummaryTitles)
+	if len(st.progressActionTitles) != maxProgressDetailTitles {
+		t.Fatalf("retained action titles = %d, want bounded cap %d", len(st.progressActionTitles), maxProgressDetailTitles)
 	}
 
 	st.finishProgressTask(TaskComplete)
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Check step x, Check step xx (+7 more)" || updates[0].Status != TaskComplete {
+	wantDetails := "Completed actions:\n• Check step x\n• Check step xx\n• Check step xxx\n• Check step xxxx\n• Check step xxxxx\n• Check step xxxxxx\n• 3 additional action(s) not listed"
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Check step x, Check step xx (+7 more)" || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
 		t.Fatalf("completed task update = %+v", updates)
 	}
 

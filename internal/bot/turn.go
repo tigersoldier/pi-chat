@@ -31,6 +31,8 @@ const (
 	maxToolCallIDBytes        = 256
 	maxToolNameBytes          = 256
 	maxProgressSummaryTitles  = 2
+	maxProgressDetailTitles   = 6
+	maxProgressDetailsRunes   = 600
 	turnProgressTaskID        = "turn-progress"
 )
 
@@ -521,8 +523,8 @@ type turnState struct {
 	donePending           bool
 	aborted               bool
 
-	progressSummaryTitles []string
-	progressActionCount   int
+	progressActionTitles []string
+	progressActionCount  int
 
 	progressRemainder       string
 	progressCapture         strings.Builder
@@ -748,19 +750,24 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 		title = "Using a tool"
 	}
 	s.rememberProgressTitleLocked(title)
-	update := TaskProgress{ID: turnProgressTaskID, Title: title, Status: TaskInProgress}
+	update := TaskProgress{
+		ID:      turnProgressTaskID,
+		Title:   title,
+		Status:  TaskInProgress,
+		Details: progressDetails(s.progressActionTitles, s.progressActionCount, false),
+	}
 	s.activeTasks[turnProgressTaskID] = update
 	s.queueProgressUpdateLocked(update)
 	s.mu.Unlock()
 	s.signalTaskUpdate()
 }
 
-// rememberProgressTitleLocked keeps only the first two unique safe titles for
-// the terminal summary. Callers hold s.mu.
+// rememberProgressTitleLocked keeps at most six unique safe titles for expanded
+// details; the terminal title uses only the first two. Callers hold s.mu.
 func (s *turnState) rememberProgressTitleLocked(title string) {
 	s.progressActionCount++
-	if len(s.progressSummaryTitles) < maxProgressSummaryTitles && !slices.Contains(s.progressSummaryTitles, title) {
-		s.progressSummaryTitles = append(s.progressSummaryTitles, title)
+	if len(s.progressActionTitles) < maxProgressDetailTitles && !slices.Contains(s.progressActionTitles, title) {
+		s.progressActionTitles = append(s.progressActionTitles, title)
 	}
 }
 
@@ -834,7 +841,8 @@ func (s *turnState) finalizeProgressLocked() bool {
 	if exists {
 		update.Status = status
 		if status == TaskComplete {
-			update.Title = summarizeProgressTitles(s.progressSummaryTitles, s.progressActionCount)
+			update.Title = summarizeProgressTitles(s.progressActionTitles, s.progressActionCount)
+			update.Details = progressDetails(s.progressActionTitles, s.progressActionCount, true)
 		}
 		if status == TaskError {
 			update.Details = "The turn ended before it completed."
@@ -914,17 +922,41 @@ func summarizeProgressTitles(titles []string, total int) string {
 	if len(titles) == 0 || total <= 0 {
 		return "Completed"
 	}
-	if total < len(titles) {
-		total = len(titles)
+	shown := min(len(titles), maxProgressSummaryTitles)
+	if total < shown {
+		total = shown
 	}
-	title := "Completed: " + strings.Join(titles, ", ")
-	if total > len(titles) {
-		title += fmt.Sprintf(" (+%d more)", total-len(titles))
+	title := "Completed: " + strings.Join(titles[:shown], ", ")
+	if total > shown {
+		title += fmt.Sprintf(" (+%d more)", total-shown)
 	}
 	if safe := trimProgressTitle(title); safe != "" {
 		return safe
 	}
 	return "Completed"
+}
+
+func progressDetails(titles []string, total int, completed bool) string {
+	if len(titles) == 0 || total <= 0 {
+		return ""
+	}
+	heading := "Progress so far:"
+	if completed {
+		heading = "Completed actions:"
+	}
+	lines := []string{heading}
+	for _, title := range titles {
+		lines = append(lines, "• "+title)
+	}
+	if total > len(titles) {
+		lines = append(lines, fmt.Sprintf("• %d additional action(s) not listed", total-len(titles)))
+	}
+	details := strings.Join(lines, "\n")
+	runes := []rune(details)
+	if len(runes) > maxProgressDetailsRunes {
+		return string(runes[:maxProgressDetailsRunes-1]) + "…"
+	}
+	return details
 }
 
 func taskTitle(toolName string) string {
@@ -1264,7 +1296,7 @@ func (s *turnState) finish() {
 		clear(s.seenToolCalls)
 		s.seenToolCallIDs = nil
 		s.pendingProgress = nil
-		s.progressSummaryTitles = nil
+		s.progressActionTitles = nil
 		s.mu.Unlock()
 		close(s.finishedCh)
 	})
