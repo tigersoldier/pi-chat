@@ -230,12 +230,14 @@ func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
 		"Use passcode 1482",
 		"Enter one-time code 172839",
 		"Enter verification code 314159",
+		"Enter code 123456",
+		"Enter code\n123456",
 	} {
 		if got := trimProgressTitle(risky); got != "" {
 			t.Errorf("credential-like progress title %q was accepted as %q", risky, got)
 		}
 	}
-	for _, safe := range []string{"Spinning up a service", "Pinpointing the issue", "Reviewing the 2026 report"} {
+	for _, safe := range []string{"Spinning up a service", "Pinpointing the issue", "Reviewing the 2026 report", "Review the code changes"} {
 		if got := trimProgressTitle(safe); got != safe {
 			t.Errorf("ordinary title %q was rejected as %q", safe, got)
 		}
@@ -244,11 +246,13 @@ func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
 		t.Fatalf("unsafe tool-name fallback = %q, want generic title", got)
 	}
 
-	st := newTurnState()
-	st.feed(textDelta(t, "[[slack-progress: Submit PIN 123456]]"), discardLogger())
-	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
-	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" || strings.Contains(got[0].Details, "123456") || strings.Contains(got[0].Details, "PIN") {
-		t.Fatalf("short-code marker was not safely replaced in title/details: %+v", got)
+	for _, marker := range []string{"Submit PIN 123456", "Enter code 123456"} {
+		st := newTurnState()
+		st.feed(textDelta(t, "[[slack-progress: "+marker+"]]"), discardLogger())
+		st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+		if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" || got[0].Details != "Progress so far:\n• Running a command" {
+			t.Fatalf("short-code marker %q was not safely replaced in title/details: %+v", marker, got)
+		}
 	}
 }
 
@@ -540,6 +544,20 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	st.feed(toolEvent(t, "tool_execution_start", "late-call", "bash", false), log)
 	if len(st.activeTasks) != 0 || len(st.takeTaskUpdates()) != 0 {
 		t.Fatal("a late tool event reopened progress after the turn settled")
+	}
+}
+
+func TestCompletionSummaryPreservesCountWithLongActionTitles(t *testing.T) {
+	titles := []string{
+		strings.Repeat("Review service ", 5),
+		strings.Repeat("Check results ", 5),
+	}
+	got := summarizeProgressTitles(titles, 7)
+	if len([]rune(got)) > maxProgressTitleRunes {
+		t.Fatalf("summary rune length = %d, want at most %d: %q", len([]rune(got)), maxProgressTitleRunes, got)
+	}
+	if !strings.HasPrefix(got, "Completed: ") || !strings.Contains(got, "Review service") || !strings.Contains(got, "Check results") || !strings.Contains(got, "…") || !strings.HasSuffix(got, "(+5 more)") {
+		t.Fatalf("long-title summary = %q, want shortened titles and preserved count", got)
 	}
 }
 

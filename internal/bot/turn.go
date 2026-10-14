@@ -927,14 +927,46 @@ func summarizeProgressTitles(titles []string, total int) string {
 	if total < shown {
 		total = shown
 	}
-	title := "Completed: " + strings.Join(titles[:shown], ", ")
+	const prefix = "Completed: "
+	suffix := ""
 	if total > shown {
-		title += fmt.Sprintf(" (+%d more)", total-shown)
+		suffix = fmt.Sprintf(" (+%d more)", total-shown)
 	}
-	if safe := trimProgressTitle(title); safe != "" {
+	available := maxProgressTitleRunes - len([]rune(prefix)) - len([]rune(suffix)) - 2*(shown-1)
+	parts := make([]string, 0, shown)
+	for i := range shown {
+		budget := available / (shown - i)
+		part := truncateProgressSummaryPart(titles[i], budget)
+		parts = append(parts, part)
+		available -= len([]rune(part))
+	}
+	title := prefix + strings.Join(parts, ", ") + suffix
+	if safe := trimProgressTitle(title); safe != "" && len([]rune(safe)) <= maxProgressTitleRunes {
 		return safe
 	}
-	return "Completed"
+	return fmt.Sprintf("Completed %d actions", total)
+}
+
+func truncateProgressSummaryPart(title string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(title)
+	if len(runes) <= maxRunes {
+		return title
+	}
+	if maxRunes == 1 {
+		return "…"
+	}
+	cutoff := maxRunes - 1
+	for i := cutoff; i > 0; i-- {
+		if unicode.IsSpace(runes[i]) {
+			if prefix := strings.TrimSpace(string(runes[:i])); prefix != "" {
+				return prefix + "…"
+			}
+		}
+	}
+	return string(runes[:cutoff]) + "…"
 }
 
 func progressDetails(titles []string, total int, completed bool) string {
@@ -1090,13 +1122,17 @@ func trimProgressTitle(text string) string {
 }
 
 // Short authentication-code labels are sensitive even when their values are
-// too short to trip the opaque-token length checks below. Match whole words to
-// avoid rejecting ordinary phrases such as "spinning up a service".
-var shortCredentialCodeCue = regexp.MustCompile(`(?i)\b(?:pin|otp|totp|hotp|pass[\s-]?code|one[\s-]?time[\s-]?(?:code|password|pass[\s-]?code)|verification[\s-]?code|security[\s-]?code|recovery[\s-]?code|access[\s-]?code|auth(?:entication)?[\s-]?code|mfa[\s-]?code|2fa[\s-]?code|two[\s-]?factor[\s-]?code)\b`)
+// too short to trip the opaque-token length checks below. Generic "code" labels
+// require a nearby numeric value. Whole-word matching avoids rejecting ordinary
+// phrases such as "spinning up a service" or "review the code changes".
+var (
+	shortCredentialCodeCue = regexp.MustCompile(`(?i)\b(?:pin|otp|totp|hotp|pass[\s-]?code|one[\s-]?time[\s-]?(?:code|password|pass[\s-]?code)|verification[\s-]?code|security[\s-]?code|recovery[\s-]?code|access[\s-]?code|auth(?:entication)?[\s-]?code|mfa[\s-]?code|2fa[\s-]?code|two[\s-]?factor[\s-]?code)\b`)
+	shortNumericCodeLabel  = regexp.MustCompile(`(?i)(?:\bcode\b.{0,24}\b\d{3,10}\b|\b\d{3,10}\b.{0,24}\bcode\b)`)
+)
 
 func containsCredentialLikeText(text string) bool {
-	lower := strings.ToLower(text)
-	if shortCredentialCodeCue.MatchString(lower) {
+	lower := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	if shortCredentialCodeCue.MatchString(lower) || shortNumericCodeLabel.MatchString(lower) {
 		return true
 	}
 	for _, cue := range []string{
