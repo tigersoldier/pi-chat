@@ -36,6 +36,37 @@ const (
 	turnProgressTaskID        = "turn-progress"
 )
 
+// boundedIDSet deduplicates a rolling window of IDs without retaining
+// unbounded per-turn state. Callers serialize access with turnState.mu.
+type boundedIDSet struct {
+	ids   map[string]struct{}
+	order []string
+}
+
+func (s *boundedIDSet) Add(id string) bool {
+	if s.ids == nil {
+		s.ids = make(map[string]struct{})
+	}
+	if _, exists := s.ids[id]; exists {
+		return false
+	}
+	if len(s.order) == maxSeenToolCallIDs {
+		delete(s.ids, s.order[0])
+		copy(s.order, s.order[1:])
+		s.order = s.order[:len(s.order)-1]
+	}
+	s.ids[id] = struct{}{}
+	s.order = append(s.order, id)
+	return true
+}
+
+func (s *boundedIDSet) Clear() {
+	clear(s.ids)
+	s.order = nil
+}
+
+func (s *boundedIDSet) Len() int { return len(s.ids) }
+
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	turnCtx, cancel := context.WithCancel(ctx)
@@ -510,10 +541,8 @@ type turnState struct {
 	pending               strings.Builder // text not yet rendered
 	pendingTasks          []TaskProgress  // task updates not yet rendered
 	activeTasks           map[string]TaskProgress
-	seenToolCalls         map[string]struct{}
-	seenToolCallIDs       []string
-	seenToolEnds          map[string]struct{}
-	seenToolEndIDs        []string
+	seenToolCalls         boundedIDSet
+	seenToolEnds          boundedIDSet
 	lastEventSeq          uint64
 	progressStartedSent   bool
 	terminal              bool
@@ -573,8 +602,6 @@ type turnState struct {
 func newTurnState() *turnState {
 	return &turnState{
 		activeTasks:     make(map[string]TaskProgress),
-		seenToolCalls:   make(map[string]struct{}),
-		seenToolEnds:    make(map[string]struct{}),
 		firstTextCh:     make(chan struct{}),
 		workCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
@@ -738,17 +765,10 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 		return
 	}
 	s.setProgressStartedAtLocked(time.Now())
-	if _, duplicate := s.seenToolCalls[callID]; duplicate {
+	if !s.seenToolCalls.Add(callID) {
 		s.mu.Unlock()
 		return
 	}
-	if len(s.seenToolCallIDs) == maxSeenToolCallIDs {
-		delete(s.seenToolCalls, s.seenToolCallIDs[0])
-		copy(s.seenToolCallIDs, s.seenToolCallIDs[1:])
-		s.seenToolCallIDs = s.seenToolCallIDs[:len(s.seenToolCallIDs)-1]
-	}
-	s.seenToolCalls[callID] = struct{}{}
-	s.seenToolCallIDs = append(s.seenToolCallIDs, callID)
 	title := safeToolTitle(name)
 	if len(s.pendingProgress) > 0 {
 		title = s.pendingProgress[0]
@@ -797,17 +817,9 @@ func (s *turnState) recordToolCompletion(ev gwclient.Event) {
 	if s.terminal {
 		return
 	}
-	if _, duplicate := s.seenToolEnds[callID]; duplicate {
-		return
+	if s.seenToolEnds.Add(callID) {
+		s.progressCompletedActionCount++
 	}
-	if len(s.seenToolEndIDs) == maxSeenToolCallIDs {
-		delete(s.seenToolEnds, s.seenToolEndIDs[0])
-		copy(s.seenToolEndIDs, s.seenToolEndIDs[1:])
-		s.seenToolEndIDs = s.seenToolEndIDs[:len(s.seenToolEndIDs)-1]
-	}
-	s.seenToolEnds[callID] = struct{}{}
-	s.seenToolEndIDs = append(s.seenToolEndIDs, callID)
-	s.progressCompletedActionCount++
 }
 
 func (s *turnState) markProgressStarted() {
@@ -1358,10 +1370,8 @@ func (s *turnState) markDone() {
 	s.flushProgressMarker()
 	s.mu.Lock()
 	s.pendingProgress = nil
-	clear(s.seenToolCalls)
-	s.seenToolCallIDs = nil
-	clear(s.seenToolEnds)
-	s.seenToolEndIDs = nil
+	s.seenToolCalls.Clear()
+	s.seenToolEnds.Clear()
 	s.terminal = true
 	closeDone := s.abortPending == 0
 	if !closeDone {
@@ -1381,10 +1391,8 @@ func (s *turnState) finish() {
 	s.finishOnce.Do(func() {
 		s.mu.Lock()
 		s.terminal = true
-		clear(s.seenToolCalls)
-		s.seenToolCallIDs = nil
-		clear(s.seenToolEnds)
-		s.seenToolEndIDs = nil
+		s.seenToolCalls.Clear()
+		s.seenToolEnds.Clear()
 		s.pendingProgress = nil
 		s.progressActionTitles = nil
 		s.mu.Unlock()

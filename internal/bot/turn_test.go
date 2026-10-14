@@ -484,12 +484,12 @@ func TestOversizedToolIdentifiersAreNotRetained(t *testing.T) {
 	log := discardLogger()
 	longID := strings.Repeat("x", maxToolCallIDBytes+1)
 	st.feed(toolEvent(t, "tool_execution_start", longID, "bash", false), log)
-	if len(st.activeTasks) != 0 || len(st.seenToolCalls) != 0 || len(st.takeTaskUpdates()) != 0 {
+	if len(st.activeTasks) != 0 || st.seenToolCalls.Len() != 0 || len(st.takeTaskUpdates()) != 0 {
 		t.Fatal("oversized tool call ID was retained as progress state")
 	}
 	longName := strings.Repeat("x", maxToolNameBytes+1)
 	st.feed(toolEvent(t, "tool_execution_start", "call-1", longName, false), log)
-	if len(st.activeTasks) != 0 || len(st.seenToolCalls) != 0 {
+	if len(st.activeTasks) != 0 || st.seenToolCalls.Len() != 0 {
 		t.Fatal("oversized tool name was retained as progress state")
 	}
 }
@@ -536,8 +536,8 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	if len(updates) != 2 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Check step x" || updates[0].Status != TaskInProgress || updates[1].ID != turnProgressTaskID || updates[1].Title != "Check step "+strings.Repeat("x", 9) || updates[1].Status != TaskInProgress {
 		t.Fatalf("coalesced task updates = %+v, want first and latest in-progress titles", updates)
 	}
-	if len(st.activeTasks) != 1 || len(st.seenToolCalls) != 9 {
-		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), len(st.seenToolCalls))
+	if len(st.activeTasks) != 1 || st.seenToolCalls.Len() != 9 {
+		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), st.seenToolCalls.Len())
 	}
 	if len(st.progressActionTitles) != maxProgressDetailTitles {
 		t.Fatalf("retained action titles = %d, want bounded cap %d", len(st.progressActionTitles), maxProgressDetailTitles)
@@ -619,6 +619,24 @@ func TestProgressDurationStartsAtFirstTurnStart(t *testing.T) {
 	}
 }
 
+func TestFirstToolStartProvidesDurationFallback(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(toolEvent(t, "tool_execution_start", "first", "read", false), log)
+	startedAt := st.progressStartedAt
+	if startedAt.IsZero() {
+		t.Fatal("first valid tool start did not establish the fallback start time")
+	}
+	st.takeTaskUpdates()
+
+	st.feed(toolEvent(t, "tool_execution_end", "first", "read", false), log)
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(3*time.Second))
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].Title != "Completed · 1 action · 3s" {
+		t.Fatalf("completion summary = %+v, want duration from first tool start", updates)
+	}
+}
+
 func TestDuplicateToolStartDoesNotConsumeNextProgressTitle(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
@@ -675,8 +693,8 @@ func TestProgressCaptureAndTitleQueueAreBounded(t *testing.T) {
 	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" {
 		t.Fatalf("overflow should use the generic title: %+v", got)
 	}
-	if len(st.seenToolCalls) != maxSeenToolCallIDs {
-		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", len(st.seenToolCalls), maxSeenToolCallIDs)
+	if st.seenToolCalls.Len() != maxSeenToolCallIDs {
+		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", st.seenToolCalls.Len(), maxSeenToolCallIDs)
 	}
 }
 

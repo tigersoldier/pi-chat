@@ -515,7 +515,7 @@ it is ready.
     individual completed steps are never shown as separate cards. A valid
     `[[slack-progress: ...]]` assistant-text marker supplies a FIFO custom title for the
     next tool start (max 80 characters, with at most 64 titles buffered); at most six safe
-    titles are retained for the summary/details. Overflow or an absent/invalid marker falls
+    titles are retained for details. Overflow or an absent/invalid marker falls
     back to a generic tool-name title. Well-formed markers are removed from the reply;
     oversized or credential-like marker content is rejected. Thinking, raw arguments, and
     output are not sent to Slack.
