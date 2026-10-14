@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1088,8 +1089,16 @@ func trimProgressTitle(text string) string {
 	return title
 }
 
+// Short authentication-code labels are sensitive even when their values are
+// too short to trip the opaque-token length checks below. Match whole words to
+// avoid rejecting ordinary phrases such as "spinning up a service".
+var shortCredentialCodeCue = regexp.MustCompile(`(?i)\b(?:pin|otp|totp|hotp|pass[\s-]?code|one[\s-]?time[\s-]?(?:code|password|pass[\s-]?code)|verification[\s-]?code|security[\s-]?code|recovery[\s-]?code|access[\s-]?code|auth(?:entication)?[\s-]?code|mfa[\s-]?code|2fa[\s-]?code|two[\s-]?factor[\s-]?code)\b`)
+
 func containsCredentialLikeText(text string) bool {
 	lower := strings.ToLower(text)
+	if shortCredentialCodeCue.MatchString(lower) {
+		return true
+	}
 	for _, cue := range []string{
 		"password", "passwd", "secret", "token", "credential", "authorization", "bearer",
 		"api key", "api_key", "api-key", "access key", "access_key", "access-key",

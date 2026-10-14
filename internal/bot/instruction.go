@@ -68,7 +68,8 @@ ordinary assistant text, for example [[slack-progress: Checking service logs]].
 Keep its content to one short action phrase of at most 80 characters. The
 integration displays that phrase as a Slack task title and removes the marker
 from the reply. Do not put private reasoning, tool arguments, tool output,
-credentials or other sensitive information in progress markers, and never use
+credentials (including PINs, passcodes, and one-time codes) or other sensitive
+information in progress markers, and never use
 thinking text as a progress update.`
 
 // instructionState is what this process knows about whether a session's context

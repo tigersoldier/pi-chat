@@ -225,9 +225,19 @@ func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
 		"Checking 4111111111111111",
 		"Checking 123456789012",
 		"Reading password=example",
+		"Submit PIN 123456",
+		"Enter OTP 654321",
+		"Use passcode 1482",
+		"Enter one-time code 172839",
+		"Enter verification code 314159",
 	} {
 		if got := trimProgressTitle(risky); got != "" {
 			t.Errorf("credential-like progress title %q was accepted as %q", risky, got)
+		}
+	}
+	for _, safe := range []string{"Spinning up a service", "Pinpointing the issue", "Reviewing the 2026 report"} {
+		if got := trimProgressTitle(safe); got != safe {
+			t.Errorf("ordinary title %q was rejected as %q", safe, got)
 		}
 	}
 	if got := safeToolTitle("read token abc123456789"); got != "Using a tool" {
@@ -235,10 +245,10 @@ func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
 	}
 
 	st := newTurnState()
-	st.feed(textDelta(t, "[[slack-progress: Checking AKIAIOSFODNN7EXAMPLE]]"), discardLogger())
+	st.feed(textDelta(t, "[[slack-progress: Submit PIN 123456]]"), discardLogger())
 	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
-	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" {
-		t.Fatalf("unsafe marker did not fall back to generic title: %+v", got)
+	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" || strings.Contains(got[0].Details, "123456") || strings.Contains(got[0].Details, "PIN") {
+		t.Fatalf("short-code marker was not safely replaced in title/details: %+v", got)
 	}
 }
 
