@@ -443,6 +443,7 @@ func TestTaskUpdatesShareTheReplyStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	progress.Status = bot.TaskComplete
+	progress.Details = "Completed actions:\n• Running a command"
 	other := bot.TaskProgress{ID: "tool-call-2", Title: "Reading files", Status: bot.TaskInProgress}
 	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress, other}); err != nil {
 		t.Fatal(err)
@@ -469,7 +470,7 @@ func TestTaskUpdatesShareTheReplyStream(t *testing.T) {
 	if got := calls[0].params["task_display_mode"]; got != "timeline" {
 		t.Fatalf("task_display_mode = %v, want timeline", got)
 	}
-	if len(complete) != 2 || complete[0].Type != "task_update" || complete[0].ID != progress.ID || complete[0].Status != string(bot.TaskComplete) || complete[1].Type != "task_update" || complete[1].ID != other.ID || complete[1].Status != string(bot.TaskInProgress) {
+	if len(complete) != 2 || complete[0].Type != "task_update" || complete[0].ID != progress.ID || complete[0].Status != string(bot.TaskComplete) || complete[0].Details != progress.Details || complete[1].Type != "task_update" || complete[1].ID != other.ID || complete[1].Status != string(bot.TaskInProgress) {
 		t.Fatalf("batched task chunks = %+v", complete)
 	}
 }

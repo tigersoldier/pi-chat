@@ -284,18 +284,21 @@ rather than once per turn.
   after a successful compaction — which is what can summarize it away.
 - **Whether it is already installed is asked of the catalog**, not guessed from the
   session's name: `gw_list_sessions[].spawn["append-system-prompt"]` is searched for the
-  instruction's own marker (`(pi-chat instruction)`). A session created before this build
-  has pi-chat's name and no instruction, and would otherwise never get one. A catalog that
-  cannot answer means it is sent — a repetition costs a few hundred tokens, while a
-  session that never learns how its prompts are shaped misreads every one of them.
+  instruction's own marker (`(pi-chat instruction v2)`). A session created before this
+  instruction version has pi-chat's name and no current marker, and would otherwise never
+  get the update. A catalog that cannot answer means it is sent — a repetition costs a few
+  hundred tokens, while a session that never learns how its prompts are shaped misreads
+  every one of them.
 - **`compaction_end` is applied to the thread rather than to the turn**, and only when it
   succeeded (not `aborted`, not `willRetry`): it can arrive between turns, its consequence
   outlives the turn it happened in, and the read goroutine that receives it must not
   block. A failed compaction changed nothing, so it discards nothing.
-- **The instruction is static per session.** Rewording it reaches future sessions only;
-  changing an existing one is `gw_reload_session{piArgs}`, which is refused while another
-  client is attached (§3). It opens by naming itself, because the agent is expected to
-  follow it, and a deployment that changes the rules should be able to say so.
+- **The system-prompt copy is static per session.** A new instruction version uses a new
+  marker, so adopted sessions receive that version in their next conversation prompt;
+  sessions created by pi-chat need a new spawn or an authorized `gw_reload_session{piArgs}`
+  to change their permanent system prompt (reload is refused while another client is
+  attached, §3). The instruction names itself so the agent can follow it and identify
+  version changes.
 
 ### The grammar of a turn (built, 2026-09-28)
 
@@ -500,9 +503,21 @@ it is ready.
 - `chat.startStream` uses timeline task display; `chat.appendStream` sends `chunks`:
   - `markdown_text` chunks for assistant text (standard markdown passes through — **no
     mrkdwn conversion table**),
-  - `task_update` chunks for `tool_execution_start`/`_end` (`in_progress` →
-    `complete`/`error`), so tool calls render as a real timeline. Only the tool name is
-    exposed; arguments and output are not sent to Slack.
+  - `task_update` chunks represent one logical progress task for the whole reply. The
+    task gets a unique ID for this stream, starts as `in_progress` on the first tool call,
+    updates its title as later tools start, and becomes `complete` when the agent settles
+    (or `error` if the turn is aborted or exits abnormally). On completion, the same card's
+    title becomes a bounded summary of up to two unique safe action titles plus the count
+    of remaining actions. Its expandable `details` lists up to six unique safe action
+    titles (at most 600 characters), refreshed as work starts and finalized on completion.
+    Tool completion does not create or recycle task IDs, so the timeline stays at one card;
+    individual completed steps are never shown as separate cards. A valid
+    `[[slack-progress: ...]]` assistant-text marker supplies a FIFO custom title for the
+    next tool start (max 80 characters, with at most 64 titles buffered); at most six safe
+    titles are retained for the summary/details. Overflow or an absent/invalid marker falls
+    back to a generic tool-name title. Well-formed markers are removed from the reply;
+    oversized or credential-like marker content is rejected. Thinking, raw arguments, and
+    output are not sent to Slack.
 - `chat.stopStream` finalizes the *same* message with any footer blocks.
 
 Constraints and behaviours:

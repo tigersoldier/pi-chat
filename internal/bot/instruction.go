@@ -15,7 +15,7 @@ import (
 //
 // The first line of instructionText is this marker, so the text reads as prose
 // and is still findable.
-const instructionMarker = "(pi-chat instruction)"
+const instructionMarker = "(pi-chat instruction v2)"
 
 // instructionOpen and instructionClose wrap the instruction when it travels in a
 // message rather than in the system prompt, so the agent can tell the
@@ -34,9 +34,10 @@ const (
 // convention and not something the agent can infer from a line like
 // `[Alice (U123)]`.
 //
-// The text is static per session: a created session carries it in its system
-// prompt, so changing this string changes future sessions, not existing ones
-// (DESIGN.md §3, §4).
+// The system-prompt copy is static per session. Changing the text alone will not
+// update a session that already carries this marker; bumping the marker makes an
+// older session eligible for the new conversation-prefixed instruction on its
+// next turn (DESIGN.md §3, §4).
 const instructionText = instructionMarker + ` You are the agent behind a Slack
 integration. This is a conversation in a Slack thread, and not everyone in it is
 talking to you.
@@ -60,7 +61,16 @@ name in prose. Answer in the thread rather than top-level, and answer for the ro
 rather than for one person in it.
 
 Slack renders a small Markdown: *bold*, _italic_, ` + "`code`" + `, and fenced
-code blocks. Headings, tables and images do not render.`
+code blocks. Headings, tables and images do not render.
+
+Before each tool call, emit only a brief, user-facing progress marker as
+ordinary assistant text, for example [[slack-progress: Checking service logs]].
+Keep its content to one short action phrase of at most 80 characters. The
+integration displays that phrase as a Slack task title and removes the marker
+from the reply. Do not put private reasoning, tool arguments, tool output,
+credentials (including PINs, passcodes, and one-time codes) or other sensitive
+information in progress markers, and never use
+thinking text as a progress update.`
 
 // instructionState is what this process knows about whether a session's context
 // already carries the instruction.

@@ -229,8 +229,9 @@ type ProgressReporter interface {
 	Progress() string
 }
 
-// TaskProgress is a user-facing update about one operation the agent is
-// performing. It deliberately carries no tool arguments or output.
+// TaskProgress is a user-facing update to the turn's rolling progress item.
+// Successful completion may replace its current title with a bounded summary;
+// Details contains only bounded, safe action titles, never tool arguments or output.
 type TaskProgress struct {
 	ID      string
 	Title   string
