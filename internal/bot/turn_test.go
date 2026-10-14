@@ -70,6 +70,8 @@ func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
+	startedAt := time.Unix(1_000, 0)
+	st.progressStartedAt = startedAt
 
 	start := toolEvent(t, "tool_execution_start", "call-1", "bash", false)
 	start.Raw = []byte(`{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"do-not-share"}}`)
@@ -89,9 +91,9 @@ func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 		t.Fatalf("tool completion should not create a second task: %+v", updates)
 	}
 
-	st.finishProgressTask(TaskComplete)
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(42*time.Second))
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 1 action · 42s" || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion update = %+v", updates)
 	}
 }
@@ -99,6 +101,8 @@ func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
+	startedAt := time.Unix(2_000, 0)
+	st.progressStartedAt = startedAt
 
 	st.feed(textDelta(t, "Checking the service. [[slack-prog"), log)
 	st.feed(textDelta(t, "ress: Checking current service\nlogs]]"), log)
@@ -122,9 +126,9 @@ func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T)
 	if updates := st.takeTaskUpdates(); len(updates) != 0 {
 		t.Fatalf("tool completion should not close the turn progress task: %+v", updates)
 	}
-	st.finishProgressTask(TaskComplete)
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(75*time.Second))
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Checking current service logs" || updates[0].Details != "Completed actions:\n• Checking current service logs" || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 1 action · 1m15s" || updates[0].Details != "Completed actions:\n• Checking current service logs" || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion update = %+v", updates)
 	}
 }
@@ -180,6 +184,8 @@ func TestReplaceClearsPartialProgressMarkerState(t *testing.T) {
 func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
+	startedAt := time.Unix(3_000, 0)
+	st.progressStartedAt = startedAt
 	titles := []string{"Check first task", "Check second task", "Check third task", "Check fourth task"}
 	for _, title := range titles {
 		st.feed(textDelta(t, "[[slack-progress: "+title+"]]"), log)
@@ -191,14 +197,15 @@ func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
 		if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != title || updates[0].Status != TaskInProgress {
 			t.Fatalf("tool %d progress = %+v, want title %q on one stable task", i+1, updates, title)
 		}
+		st.feed(toolEvent(t, "tool_execution_end", id, "bash", false), log)
 	}
 	if len(st.activeTasks) != 1 {
 		t.Fatalf("active tasks = %d, want one task for the entire turn", len(st.activeTasks))
 	}
 
-	st.finishProgressTask(TaskComplete)
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(2*time.Minute))
 	updates := st.takeTaskUpdates()
-	wantSummary := "Completed: Check first task, Check second task (+2 more)"
+	wantSummary := "Completed · 4 actions · 2m0s"
 	wantDetails := "Completed actions:\n• Check first task\n• Check second task\n• Check third task\n• Check fourth task"
 	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != wantSummary || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion = %+v", updates)
@@ -477,12 +484,12 @@ func TestOversizedToolIdentifiersAreNotRetained(t *testing.T) {
 	log := discardLogger()
 	longID := strings.Repeat("x", maxToolCallIDBytes+1)
 	st.feed(toolEvent(t, "tool_execution_start", longID, "bash", false), log)
-	if len(st.activeTasks) != 0 || len(st.seenToolCalls) != 0 || len(st.takeTaskUpdates()) != 0 {
+	if len(st.activeTasks) != 0 || st.seenToolCalls.Len() != 0 || len(st.takeTaskUpdates()) != 0 {
 		t.Fatal("oversized tool call ID was retained as progress state")
 	}
 	longName := strings.Repeat("x", maxToolNameBytes+1)
 	st.feed(toolEvent(t, "tool_execution_start", "call-1", longName, false), log)
-	if len(st.activeTasks) != 0 || len(st.seenToolCalls) != 0 {
+	if len(st.activeTasks) != 0 || st.seenToolCalls.Len() != 0 {
 		t.Fatal("oversized tool name was retained as progress state")
 	}
 }
@@ -513,6 +520,8 @@ func TestOversizedProgressMarkerIsRemovedFromReply(t *testing.T) {
 func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
+	startedAt := time.Unix(4_000, 0)
+	st.progressStartedAt = startedAt
 	for i := range 9 {
 		title := "Check step " + strings.Repeat("x", i+1)
 		st.feed(textDelta(t, "[[slack-progress: "+title+"]]"), log)
@@ -520,23 +529,24 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	for i := range 9 {
 		id := "call-" + strings.Repeat("x", i+1)
 		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
+		st.feed(toolEvent(t, "tool_execution_end", id, "bash", false), log)
 	}
 
 	updates := st.takeTaskUpdates()
 	if len(updates) != 2 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Check step x" || updates[0].Status != TaskInProgress || updates[1].ID != turnProgressTaskID || updates[1].Title != "Check step "+strings.Repeat("x", 9) || updates[1].Status != TaskInProgress {
 		t.Fatalf("coalesced task updates = %+v, want first and latest in-progress titles", updates)
 	}
-	if len(st.activeTasks) != 1 || len(st.seenToolCalls) != 9 {
-		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), len(st.seenToolCalls))
+	if len(st.activeTasks) != 1 || st.seenToolCalls.Len() != 9 {
+		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), st.seenToolCalls.Len())
 	}
 	if len(st.progressActionTitles) != maxProgressDetailTitles {
 		t.Fatalf("retained action titles = %d, want bounded cap %d", len(st.progressActionTitles), maxProgressDetailTitles)
 	}
 
-	st.finishProgressTask(TaskComplete)
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(45*time.Second))
 	updates = st.takeTaskUpdates()
 	wantDetails := "Completed actions:\n• Check step x\n• Check step xx\n• Check step xxx\n• Check step xxxx\n• Check step xxxxx\n• Check step xxxxxx\n• 3 additional action(s) not listed"
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed: Check step x, Check step xx (+7 more)" || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 9 actions · 45s" || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
 		t.Fatalf("completed task update = %+v", updates)
 	}
 
@@ -547,17 +557,83 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	}
 }
 
-func TestCompletionSummaryPreservesCountWithLongActionTitles(t *testing.T) {
-	titles := []string{
-		strings.Repeat("Review service ", 5),
-		strings.Repeat("Check results ", 5),
+func TestProgressSummaryFormatsActionCountAndDuration(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      TaskProgressStatus
+		actions     int
+		elapsed     time.Duration
+		wantSummary string
+	}{
+		{name: "singular under one second", status: TaskComplete, actions: 1, elapsed: 500 * time.Millisecond, wantSummary: "Completed · 1 action · <1s"},
+		{name: "plural rounded duration", status: TaskComplete, actions: 2, elapsed: 65 * time.Second, wantSummary: "Completed · 2 actions · 1m5s"},
+		{name: "incomplete turn", status: TaskError, actions: 0, elapsed: time.Second, wantSummary: "Incomplete · 0 actions · 1s"},
 	}
-	got := summarizeProgressTitles(titles, 7)
-	if len([]rune(got)) > maxProgressTitleRunes {
-		t.Fatalf("summary rune length = %d, want at most %d: %q", len([]rune(got)), maxProgressTitleRunes, got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := summarizeProgressMetrics(tt.status, tt.actions, tt.elapsed); got != tt.wantSummary {
+				t.Fatalf("summary = %q, want %q", got, tt.wantSummary)
+			}
+		})
 	}
-	if !strings.HasPrefix(got, "Completed: ") || !strings.Contains(got, "Review service") || !strings.Contains(got, "Check results") || !strings.Contains(got, "…") || !strings.HasSuffix(got, "(+5 more)") {
-		t.Fatalf("long-title summary = %q, want shortened titles and preserved count", got)
+}
+
+func TestCompletedActionCountUsesUniqueToolEnds(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	startedAt := time.Unix(5_000, 0)
+	st.progressStartedAt = startedAt
+
+	st.feed(toolEvent(t, "tool_execution_start", "completed-1", "bash", false), log)
+	st.takeTaskUpdates()
+	end := toolEvent(t, "tool_execution_end", "completed-1", "bash", false)
+	st.feed(end, log)
+	st.feed(end, log)
+
+	st.feed(toolEvent(t, "tool_execution_start", "completed-2", "bash", false), log)
+	st.takeTaskUpdates()
+	st.feed(toolEvent(t, "tool_execution_end", "completed-2", "bash", true), log)
+
+	st.feed(toolEvent(t, "tool_execution_start", "still-running", "bash", false), log)
+	st.takeTaskUpdates()
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(125*time.Second))
+
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].Title != "Completed · 2 actions · 2m5s" {
+		t.Fatalf("completion summary = %+v, want two returned calls and elapsed time", updates)
+	}
+}
+
+func TestProgressDurationStartsAtFirstTurnStart(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(gwclient.Event{Type: "agent_start"}, log)
+	startedAt := st.progressStartedAt
+	if startedAt.IsZero() {
+		t.Fatal("agent_start did not establish the progress start time")
+	}
+
+	st.feed(gwclient.Event{Type: "turn_start"}, log)
+	if !st.progressStartedAt.Equal(startedAt) {
+		t.Fatal("a later turn_start reset the original progress start time")
+	}
+}
+
+func TestFirstToolStartProvidesDurationFallback(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(toolEvent(t, "tool_execution_start", "first", "read", false), log)
+	startedAt := st.progressStartedAt
+	if startedAt.IsZero() {
+		t.Fatal("first valid tool start did not establish the fallback start time")
+	}
+	st.takeTaskUpdates()
+
+	st.feed(toolEvent(t, "tool_execution_end", "first", "read", false), log)
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(3*time.Second))
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].Title != "Completed · 1 action · 3s" {
+		t.Fatalf("completion summary = %+v, want duration from first tool start", updates)
 	}
 }
 
@@ -617,8 +693,8 @@ func TestProgressCaptureAndTitleQueueAreBounded(t *testing.T) {
 	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" {
 		t.Fatalf("overflow should use the generic title: %+v", got)
 	}
-	if len(st.seenToolCalls) != maxSeenToolCallIDs {
-		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", len(st.seenToolCalls), maxSeenToolCallIDs)
+	if st.seenToolCalls.Len() != maxSeenToolCallIDs {
+		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", st.seenToolCalls.Len(), maxSeenToolCallIDs)
 	}
 }
 

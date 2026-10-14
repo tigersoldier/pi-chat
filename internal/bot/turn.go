@@ -31,11 +31,41 @@ const (
 	maxSeenToolCallIDs        = 64
 	maxToolCallIDBytes        = 256
 	maxToolNameBytes          = 256
-	maxProgressSummaryTitles  = 2
 	maxProgressDetailTitles   = 6
 	maxProgressDetailsRunes   = 600
 	turnProgressTaskID        = "turn-progress"
 )
+
+// boundedIDSet deduplicates a rolling window of IDs without retaining
+// unbounded per-turn state. Callers serialize access with turnState.mu.
+type boundedIDSet struct {
+	ids   map[string]struct{}
+	order []string
+}
+
+func (s *boundedIDSet) Add(id string) bool {
+	if s.ids == nil {
+		s.ids = make(map[string]struct{})
+	}
+	if _, exists := s.ids[id]; exists {
+		return false
+	}
+	if len(s.order) == maxSeenToolCallIDs {
+		delete(s.ids, s.order[0])
+		copy(s.order, s.order[1:])
+		s.order = s.order[:len(s.order)-1]
+	}
+	s.ids[id] = struct{}{}
+	s.order = append(s.order, id)
+	return true
+}
+
+func (s *boundedIDSet) Clear() {
+	clear(s.ids)
+	s.order = nil
+}
+
+func (s *boundedIDSet) Len() int { return len(s.ids) }
 
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
@@ -511,8 +541,8 @@ type turnState struct {
 	pending               strings.Builder // text not yet rendered
 	pendingTasks          []TaskProgress  // task updates not yet rendered
 	activeTasks           map[string]TaskProgress
-	seenToolCalls         map[string]struct{}
-	seenToolCallIDs       []string
+	seenToolCalls         boundedIDSet
+	seenToolEnds          boundedIDSet
 	lastEventSeq          uint64
 	progressStartedSent   bool
 	terminal              bool
@@ -524,8 +554,12 @@ type turnState struct {
 	donePending           bool
 	aborted               bool
 
-	progressActionTitles []string
-	progressActionCount  int
+	progressActionTitles         []string
+	progressActionCount          int
+	progressCompletedActionCount int
+	progressStartedAt            time.Time
+	progressElapsed              time.Duration
+	progressElapsedCaptured      bool
 
 	progressRemainder       string
 	progressCapture         strings.Builder
@@ -568,7 +602,6 @@ type turnState struct {
 func newTurnState() *turnState {
 	return &turnState{
 		activeTasks:     make(map[string]TaskProgress),
-		seenToolCalls:   make(map[string]struct{}),
 		firstTextCh:     make(chan struct{}),
 		workCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
@@ -630,7 +663,11 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		s.startMessage()
 		s.markWork()
 
-	case "turn_start", "agent_start", "tool_execution_update":
+	case "turn_start", "agent_start":
+		s.markProgressStarted()
+		s.markWork()
+
+	case "tool_execution_update":
 		s.markWork()
 
 	case "tool_execution_start":
@@ -638,6 +675,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		s.markWork()
 
 	case "tool_execution_end":
+		s.recordToolCompletion(ev)
 		s.markWork()
 
 	case "agent_settled":
@@ -726,17 +764,11 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 		s.mu.Unlock()
 		return
 	}
-	if _, duplicate := s.seenToolCalls[callID]; duplicate {
+	s.setProgressStartedAtLocked(time.Now())
+	if !s.seenToolCalls.Add(callID) {
 		s.mu.Unlock()
 		return
 	}
-	if len(s.seenToolCallIDs) == maxSeenToolCallIDs {
-		delete(s.seenToolCalls, s.seenToolCallIDs[0])
-		copy(s.seenToolCallIDs, s.seenToolCallIDs[1:])
-		s.seenToolCallIDs = s.seenToolCallIDs[:len(s.seenToolCallIDs)-1]
-	}
-	s.seenToolCalls[callID] = struct{}{}
-	s.seenToolCallIDs = append(s.seenToolCallIDs, callID)
 	title := safeToolTitle(name)
 	if len(s.pendingProgress) > 0 {
 		title = s.pendingProgress[0]
@@ -763,8 +795,57 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	s.signalTaskUpdate()
 }
 
+// recordToolCompletion counts tool calls that returned, including calls that
+// returned an error. Arguments and tool output are intentionally ignored.
+func (s *turnState) recordToolCompletion(ev gwclient.Event) {
+	var tool struct {
+		ToolCallID string `json:"toolCallId"`
+	}
+	if err := ev.Unmarshal(&tool); err != nil {
+		return
+	}
+	if len(tool.ToolCallID) > maxToolCallIDBytes {
+		return
+	}
+	callID := strings.TrimSpace(tool.ToolCallID)
+	if callID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminal {
+		return
+	}
+	if s.seenToolEnds.Add(callID) {
+		s.progressCompletedActionCount++
+	}
+}
+
+func (s *turnState) markProgressStarted() {
+	s.mu.Lock()
+	s.setProgressStartedAtLocked(time.Now())
+	s.mu.Unlock()
+}
+
+// setProgressStartedAtLocked records the first observed start only. Callers hold s.mu.
+func (s *turnState) setProgressStartedAtLocked(startedAt time.Time) {
+	if s.progressStartedAt.IsZero() {
+		s.progressStartedAt = startedAt
+	}
+}
+
+func (s *turnState) captureProgressElapsedLocked(endedAt time.Time) {
+	if s.progressElapsedCaptured {
+		return
+	}
+	s.setProgressStartedAtLocked(endedAt)
+	s.progressElapsed = max(endedAt.Sub(s.progressStartedAt), time.Duration(0))
+	s.progressElapsedCaptured = true
+}
+
 // rememberProgressTitleLocked keeps at most six unique safe titles for expanded
-// details; the terminal title uses only the first two. Callers hold s.mu.
+// details. Callers hold s.mu.
 func (s *turnState) rememberProgressTitleLocked(title string) {
 	s.progressActionCount++
 	if len(s.progressActionTitles) < maxProgressDetailTitles && !slices.Contains(s.progressActionTitles, title) {
@@ -805,11 +886,16 @@ func (s *turnState) queueProgressUpdateLocked(update TaskProgress) {
 // finishProgressTask closes the single logical progress task for this reply.
 // Tool activity only changes its title; it is complete or failed with the turn.
 func (s *turnState) finishProgressTask(status TaskProgressStatus) {
+	s.finishProgressTaskAt(status, time.Now())
+}
+
+func (s *turnState) finishProgressTaskAt(status TaskProgressStatus, endedAt time.Time) {
 	s.mu.Lock()
 	if s.progressFinalized {
 		s.mu.Unlock()
 		return
 	}
+	s.captureProgressElapsedLocked(endedAt)
 	s.terminal = true
 	if !s.settled {
 		s.settled = true
@@ -841,8 +927,8 @@ func (s *turnState) finalizeProgressLocked() bool {
 	update, exists := s.activeTasks[turnProgressTaskID]
 	if exists {
 		update.Status = status
+		update.Title = summarizeProgressMetrics(status, s.progressCompletedActionCount, s.progressElapsed)
 		if status == TaskComplete {
-			update.Title = summarizeProgressTitles(s.progressActionTitles, s.progressActionCount)
 			update.Details = progressDetails(s.progressActionTitles, s.progressActionCount, true)
 		}
 		if status == TaskError {
@@ -919,54 +1005,20 @@ func safeToolTitle(toolName string) string {
 	return title
 }
 
-func summarizeProgressTitles(titles []string, total int) string {
-	if len(titles) == 0 || total <= 0 {
-		return "Completed"
+func summarizeProgressMetrics(status TaskProgressStatus, actionCount int, elapsed time.Duration) string {
+	label := "Completed"
+	if status == TaskError {
+		label = "Incomplete"
 	}
-	shown := min(len(titles), maxProgressSummaryTitles)
-	if total < shown {
-		total = shown
+	actionLabel := "actions"
+	if actionCount == 1 {
+		actionLabel = "action"
 	}
-	const prefix = "Completed: "
-	suffix := ""
-	if total > shown {
-		suffix = fmt.Sprintf(" (+%d more)", total-shown)
+	duration := "<1s"
+	if elapsed >= time.Second {
+		duration = elapsed.Round(time.Second).String()
 	}
-	available := maxProgressTitleRunes - len([]rune(prefix)) - len([]rune(suffix)) - 2*(shown-1)
-	parts := make([]string, 0, shown)
-	for i := range shown {
-		budget := available / (shown - i)
-		part := truncateProgressSummaryPart(titles[i], budget)
-		parts = append(parts, part)
-		available -= len([]rune(part))
-	}
-	title := prefix + strings.Join(parts, ", ") + suffix
-	if safe := trimProgressTitle(title); safe != "" && len([]rune(safe)) <= maxProgressTitleRunes {
-		return safe
-	}
-	return fmt.Sprintf("Completed %d actions", total)
-}
-
-func truncateProgressSummaryPart(title string, maxRunes int) string {
-	if maxRunes <= 0 {
-		return ""
-	}
-	runes := []rune(title)
-	if len(runes) <= maxRunes {
-		return title
-	}
-	if maxRunes == 1 {
-		return "…"
-	}
-	cutoff := maxRunes - 1
-	for i := cutoff; i > 0; i-- {
-		if unicode.IsSpace(runes[i]) {
-			if prefix := strings.TrimSpace(string(runes[:i])); prefix != "" {
-				return prefix + "…"
-			}
-		}
-	}
-	return string(runes[:cutoff]) + "…"
+	return fmt.Sprintf("%s · %d %s · %s", label, actionCount, actionLabel, duration)
 }
 
 func progressDetails(titles []string, total int, completed bool) string {
@@ -1214,6 +1266,7 @@ func (s *turnState) finishOpenTasks() {
 		s.mu.Unlock()
 		return
 	}
+	s.captureProgressElapsedLocked(time.Now())
 	s.terminal = true
 	s.settled = true
 	s.pendingTerminalStatus = TaskError
@@ -1317,8 +1370,8 @@ func (s *turnState) markDone() {
 	s.flushProgressMarker()
 	s.mu.Lock()
 	s.pendingProgress = nil
-	clear(s.seenToolCalls)
-	s.seenToolCallIDs = nil
+	s.seenToolCalls.Clear()
+	s.seenToolEnds.Clear()
 	s.terminal = true
 	closeDone := s.abortPending == 0
 	if !closeDone {
@@ -1338,8 +1391,8 @@ func (s *turnState) finish() {
 	s.finishOnce.Do(func() {
 		s.mu.Lock()
 		s.terminal = true
-		clear(s.seenToolCalls)
-		s.seenToolCallIDs = nil
+		s.seenToolCalls.Clear()
+		s.seenToolEnds.Clear()
 		s.pendingProgress = nil
 		s.progressActionTitles = nil
 		s.mu.Unlock()
