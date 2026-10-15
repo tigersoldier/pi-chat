@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // schemaV1 is the schema as version 1 wrote it: the threads table without the
@@ -118,6 +119,13 @@ func TestMigratesAVersionOneDatabase(t *testing.T) {
 	}
 	if row.ObservedTS != "1700000000.000500" {
 		t.Errorf("ObservedTS = %q, want the value just written", row.ObservedTS)
+	}
+	pending := PendingUI{
+		RouteID: "migrated-route", RequestID: "migrated-dialog", ThreadKey: row.ThreadKey, SessionPath: row.SessionPath,
+		Method: "confirm", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+	}
+	if inserted, err := s.PutPendingUI(ctx, pending); err != nil || !inserted {
+		t.Errorf("pending UI on a migrated v1 database = inserted %v, err %v", inserted, err)
 	}
 }
 

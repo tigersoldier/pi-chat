@@ -22,6 +22,8 @@ import (
 // first write of a turn's life and it happens before the session is touched,
 // so a duplicate is dropped rather than de-duplicated afterwards.
 //
+// PutPendingUI also stores namespaced `ui-route:` replay markers here so a
+// gateway replay cannot recreate a dialog whose response was already handled.
 // An empty eventID claims nothing and reports true: a platform that sends no
 // identity gets no dedupe rather than sharing one row with every other
 // identifier-less event.

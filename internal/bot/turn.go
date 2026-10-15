@@ -623,21 +623,21 @@ func (s *turnState) hasSeenEvent(seq uint64) bool {
 	return seq <= s.lastEventSeq
 }
 
-func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
+func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 	if ev.Type == "gw_snapshot" {
 		if snapshot, err := ev.Snapshot(); err == nil {
 			s.mu.Lock()
 			s.lastEventSeq = snapshot.HeadSeq
 			s.mu.Unlock()
 		}
-		return
+		return true
 	}
 	// Resume replay carries the original sequence; never apply a frame twice.
 	if ev.Seq != 0 {
 		s.mu.Lock()
 		if ev.Seq <= s.lastEventSeq {
 			s.mu.Unlock()
-			return
+			return false
 		}
 		s.lastEventSeq = ev.Seq
 		s.mu.Unlock()
@@ -689,7 +689,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 	case "gw_turn":
 		turn, err := ev.Turn()
 		if err != nil {
-			return
+			return true
 		}
 		if turn.State == "running" {
 			s.markWork()
@@ -715,7 +715,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 		if !ok {
 			log.Warn("pi sent an extension UI request that could not be decoded",
 				"event", string(ev.Raw))
-			return
+			return true
 		}
 		if !request.Blocking {
 			// Fire-and-forget: never answered, and not silenced by `--approve`,
@@ -724,22 +724,20 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) {
 			if request.Method == gwclient.UIMethodNotify && request.NotifyTypeOrInfo() != "info" {
 				log.Warn("pi raised a notification",
 					"type", request.NotifyTypeOrInfo(), "text", stripANSI(request.Text))
-				return
+				return true
 			}
 			log.Debug("extension notification ignored",
 				"method", request.Method, "status_key", request.StatusKey)
-			return
+			return true
 		}
-		// A dialog blocks pi until somebody answers it. With approvals on auto
-		// pi resolves what it can itself, so reaching here means the thread
-		// stalls until pi's own timeout. Phase 2 answers these with Block Kit.
-		log.Warn("pi is waiting for an answer this build cannot give; the turn stalls until pi times out",
-			"method", request.Method, "id", request.ID,
-			"title", request.Title, "message", stripANSI(request.Message))
+		// The owner presents blocking dialogs outside the gateway reader and
+		// routes the eventual answer back to this session.
+		log.Debug("pi is waiting for a dialog response", "method", request.Method, "id", request.ID)
 
 	case "extension_error":
 		log.Warn("pi reported an extension error", "event", string(ev.Raw))
 	}
+	return true
 }
 
 func (s *turnState) recordToolTask(ev gwclient.Event) {
@@ -1636,7 +1634,15 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 		return
 	}
 	th.log.Debug("gateway event", "type", ev.Type)
-	cur.feed(ev, th.log)
+	if !cur.feed(ev, th.log) {
+		return
+	}
+	if request, ok := ev.UIRequest(); ok && request.Blocking {
+		go th.presentApproval(client, sessionPath, ev.Seq, ApprovalRequest{
+			ID: request.ID, Method: request.Method, Title: request.Title, Message: request.Message,
+			Options: request.Options, Placeholder: request.Placeholder, Prefill: request.Prefill,
+		}, request.TimeoutMS)
+	}
 }
 
 // flush renders accumulated text until the turn ends. It creates the reply on

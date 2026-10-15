@@ -570,6 +570,15 @@ func (a *API) SetSuggestedPrompts(ctx context.Context, channelID, title string, 
 	return a.call(ctx, "assistant.threads.setSuggestedPrompts", params, nil)
 }
 
+// OpenView opens one Slack modal. The trigger id only comes from an interactive
+// callback and expires quickly, so callers must use it synchronously.
+func (a *API) OpenView(ctx context.Context, triggerID string, view map[string]any) error {
+	if triggerID == "" {
+		return errors.New("slack views.open: no trigger id")
+	}
+	return a.call(ctx, "views.open", map[string]any{"trigger_id": triggerID, "view": view}, nil)
+}
+
 // SetAgentStatus sets the lifecycle status of the agent session for a thread
 // (Slack's agent messaging experience). Slack creates the session if it does
 // not exist yet, which is also what makes writing this the thing that opens the

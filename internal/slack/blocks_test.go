@@ -13,8 +13,8 @@ func TestEveryButtonInOneBlockGetsItsOwnActionID(t *testing.T) {
 	// rejected exactly that way the first time it had two sessions to offer —
 	// and because the error report went through the same response URL, the
 	// command was silent at both ends.
-	buttons := make([]bot.Button, 0, buttonLimit+1)
-	for i := 0; i < buttonLimit+1; i++ {
+	buttons := make([]bot.Button, 0, noticeButtonLimit+1)
+	for i := 0; i < noticeButtonLimit+1; i++ {
 		buttons = append(buttons, bot.Button{ActionID: bot.ActionResume, Text: "a session", Value: "/sessions/a.jsonl"})
 	}
 
@@ -28,8 +28,8 @@ func TestEveryButtonInOneBlockGetsItsOwnActionID(t *testing.T) {
 	}
 	// The block is capped, so the ids below are the ones that would have been
 	// rendered — and the cap is what keeps them within Slack's own limit.
-	if len(elements) != buttonLimit {
-		t.Fatalf("rendered %d buttons, want the cap of %d", len(elements), buttonLimit)
+	if len(elements) != noticeButtonLimit {
+		t.Fatalf("rendered %d buttons, want the cap of %d", len(elements), noticeButtonLimit)
 	}
 
 	seen := map[string]bool{}

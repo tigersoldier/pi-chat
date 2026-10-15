@@ -979,6 +979,7 @@ func (th *thread) dialSession(ctx context.Context, sessionPath string) (*gwclien
 func (th *thread) dialConfigured(ctx context.Context, attachPath, eventPath string, resume bool) (*gwclient.Client, error) {
 	row := th.snapshot()
 	var eventClient atomic.Pointer[gwclient.Client]
+	clientReady := make(chan struct{})
 	epoch := th.sessionEpoch.Load()
 	cfg := gwclient.Config{
 		StateDir:  th.b.cfg.Gateway.StateDir,
@@ -988,6 +989,10 @@ func (th *thread) dialConfigured(ctx context.Context, attachPath, eventPath stri
 		Tags:      map[string]string{"platform": platformName, "thread": th.key},
 		Session:   attachPath,
 		OnEvent: func(ev gwclient.Event) {
+			// Dial starts its event pump before returning. Hold early callbacks
+			// until the client pointer is published so blocking UI requests can
+			// always be answered or canceled.
+			<-clientReady
 			th.onSessionEventWithClient(eventPath, ev, eventClient.Load(), epoch)
 		},
 	}
@@ -1005,6 +1010,7 @@ func (th *thread) dialConfigured(ctx context.Context, attachPath, eventPath stri
 		return nil, fmt.Errorf("open the thread connection: %w", err)
 	}
 	eventClient.Store(client)
+	close(clientReady)
 	return client, nil
 }
 

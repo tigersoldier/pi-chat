@@ -56,8 +56,8 @@ const (
 // dump.
 const (
 	// resumeLimit is how many sessions /pi resume offers. It must not exceed the
-	// adapter's buttonLimit (internal/slack/blocks.go): the adapter caps the
-	// buttons it renders, so a longer list would silently lose its tail.
+	// adapter's noticeButtonLimit (internal/slack/blocks.go), or the tail would
+	// be omitted from the picker.
 	resumeLimit = 5
 	// commandLimit is how many of the session's own commands /help lists.
 	commandLimit = 20
