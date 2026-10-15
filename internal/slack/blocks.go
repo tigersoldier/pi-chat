@@ -12,11 +12,9 @@ import (
 // become Slack's JSON.
 type block map[string]any
 
-// buttonLimit is Slack's cap on the elements of one actions block, and therefore
-// the number of sessions /pi resume may offer (bot.resumeLimit). The two must not
-// drift: the adapter drops the buttons past its cap, so a longer list would lose
-// its tail without an error.
-const buttonLimit = 5
+// noticeButtonLimit is the app's small-notice picker budget (currently
+// bot.resumeLimit), not Slack's 25-element Actions-block limit.
+const noticeButtonLimit = 5
 
 // blocksFor renders a notice's buttons, or nothing when it has none: an empty
 // actions block is rejected, and a notice usually is text alone.
@@ -26,7 +24,7 @@ func blocksFor(buttons []bot.Button) []block {
 	}
 	elements := make([]block, 0, len(buttons))
 	for i, button := range buttons {
-		if len(elements) == buttonLimit {
+		if len(elements) == noticeButtonLimit {
 			break
 		}
 		element := block{

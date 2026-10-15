@@ -23,8 +23,11 @@ worktrees, `/pi help|status|resume`, pass-through commands, idle close and cold 
 The Slack app manifest enables Agent Sessions, including status and a stop button when the
 workspace allows the agent experience. Opt-in read-only chat-tools v1 is implemented and
 unit-tested, but has not yet been verified against a live Slack workspace. Phase 2 is
-underway: `/abort`, `/model`, and `/stop` are implemented; interactive approvals, warm-session
-eviction/queueing, and streaming fallback hardening remain. Details: `PLAN.md`.
+underway: `/abort`, `/model`, `/stop`, and interactive approvals are implemented. Blocking
+`confirm`/`select` dialogs use buttons; `input`/`editor` dialogs use Slack modals. The flows are
+unit-tested; live Slack acceptance is pending. Warm-session eviction/queueing and streaming
+fallback hardening remain. Slack's current `views.open` reference requires no additional
+OAuth scope, so modals do not require a manifest permission change. Details: `PLAN.md`.
 
 ## Surfaces
 
@@ -154,8 +157,9 @@ are not supported yet. The bot needs the `files:read` scope (included in both ap
 manifests); reinstall the Slack app if your existing token does not have it.
 
 State lives in SQLite at `paths.db_path` (created on first run, inside a 0700 directory). It
-holds thread keys, session identities, cursors, handled event IDs and chat-tool binding
-metadata — never transcripts, prompts, app credentials, or answers. Pi's own session file
+holds thread keys, session identities, cursors, dedupe keys, pending-dialog routing
+metadata, and chat-tool bindings — never transcripts, prompts, dialog contents, app
+credentials, or answers. Pi's own session file
 may retain tool results under normal gateway retention and deletion behavior.
 
 ## Layout

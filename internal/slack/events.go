@@ -3,9 +3,12 @@ package slack
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
 )
+
+const approvalHandleBudget = 2 * time.Second // leave one second inside Slack's trigger lifetime
 
 // parseMessage turns one Socket Mode event envelope into a core message. It
 // reports false for everything pi-chat does not treat as a message: other event
@@ -208,7 +211,17 @@ func parseAction(env Envelope) (bot.Action, bool) {
 			ThreadTS string `json:"thread_ts"`
 		} `json:"message"`
 		ResponseURL string `json:"response_url"`
-		Actions     []struct {
+		TriggerID   string `json:"trigger_id"`
+		View        struct {
+			CallbackID      string `json:"callback_id"`
+			PrivateMetadata string `json:"private_metadata"`
+			State           struct {
+				Values map[string]map[string]struct {
+					Value string `json:"value"`
+				} `json:"values"`
+			} `json:"state"`
+		} `json:"view"`
+		Actions []struct {
 			ActionID string `json:"action_id"`
 			Value    string `json:"value"`
 		} `json:"actions"`
@@ -216,10 +229,29 @@ func parseAction(env Envelope) (bot.Action, bool) {
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		return bot.Action{}, false
 	}
-	if payload.Type != "block_actions" || len(payload.Actions) == 0 {
+	if payload.User.ID == "" {
 		return bot.Action{}, false
 	}
-	if payload.User.ID == "" || payload.Channel.ID == "" {
+	if payload.Type == "view_submission" || payload.Type == "view_closed" {
+		if payload.View.CallbackID != approvalViewCallbackID || payload.View.PrivateMetadata == "" {
+			return bot.Action{}, false
+		}
+		actionID := bot.ActionUICancel
+		value := ""
+		if payload.Type == "view_submission" {
+			input, ok := payload.View.State.Values[approvalModalBlockID]["value"]
+			if !ok {
+				return bot.Action{}, false
+			}
+			actionID = bot.ActionUISubmit
+			value = input.Value
+		}
+		return bot.Action{
+			EventID: env.EnvelopeID, UserID: payload.User.ID, Workspace: payload.Team.ID,
+			ActionID: actionID, RouteID: payload.View.PrivateMetadata, Value: value,
+		}, true
+	}
+	if payload.Type != "block_actions" || len(payload.Actions) == 0 || payload.Channel.ID == "" {
 		return bot.Action{}, false
 	}
 
@@ -235,6 +267,24 @@ func parseAction(env Envelope) (bot.Action, bool) {
 			Surface:   bot.SurfaceApp,
 		}
 	}
+	actionID := coreActionID(payload.Actions[0].ActionID)
+	actionValue := payload.Actions[0].Value
+	routeID := ""
+	switch actionID {
+	case bot.ActionUIConfirmYes, bot.ActionUIConfirmNo, bot.ActionUISelect, bot.ActionUIOpenModal, bot.ActionUICancel:
+		var value struct {
+			RouteID string `json:"route_id"`
+			Value   string `json:"value"`
+		}
+		if json.Unmarshal([]byte(actionValue), &value) != nil || value.RouteID == "" {
+			return bot.Action{}, false
+		}
+		routeID, actionValue = value.RouteID, value.Value
+	}
+	var handleExpiresAt time.Time
+	if !env.ReceivedAt.IsZero() && payload.TriggerID != "" {
+		handleExpiresAt = env.ReceivedAt.Add(approvalHandleBudget)
+	}
 	return bot.Action{
 		EventID:   env.EnvelopeID,
 		Channel:   payload.Channel.ID,
@@ -243,8 +293,11 @@ func parseAction(env Envelope) (bot.Action, bool) {
 		Workspace: payload.Team.ID,
 		// The press carries the id the adapter rendered, which is unique per
 		// button; the core named the button by what it means.
-		ActionID: coreActionID(payload.Actions[0].ActionID),
-		Value:    payload.Actions[0].Value,
+		ActionID:                actionID,
+		Value:                   actionValue,
+		ApprovalHandle:          payload.TriggerID,
+		ApprovalHandleExpiresAt: handleExpiresAt,
+		RouteID:                 routeID,
 		// Slack names a one-to-one conversation `directmessage` and ids it with a
 		// D. A group DM is neither (it behaves like a channel), so both have to
 		// agree before the core is told this is a DM.

@@ -941,20 +941,31 @@ func TestFireAndForgetUINeedsNoAnswer(t *testing.T) {
 	}
 }
 
-func TestBlockingUIDialogWarns(t *testing.T) {
-	// A dialog stalls the turn until pi times out, which the operator should
-	// learn from the journal rather than from a thread that never answers.
+func TestBlockingUIDialogIsRecognizedWithoutLoggingItsContents(t *testing.T) {
 	log, logs := captureLogger()
 	st := newTurnState()
 	st.feed(uiEvent(t, `"id":"q1","method":"confirm","title":"Run this?",`+
 		`"message":"\u001b[1mrm -rf build\u001b[0m"`), log)
 
 	got := logs.String()
-	if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "confirm") {
-		t.Fatalf("a blocking dialog should warn and name its method: %s", got)
+	if strings.Contains(got, "level=WARN") || !strings.Contains(got, "method=confirm") {
+		t.Fatalf("a blocking dialog should be recognized at debug level: %s", got)
 	}
-	if strings.Contains(got, "\\u001b") {
-		t.Fatalf("the message should be stripped of escapes: %s", got)
+	if strings.Contains(got, "Run this?") || strings.Contains(got, "rm -rf build") || strings.Contains(got, "\\u001b") {
+		t.Fatalf("the extension-supplied dialog content should not be logged: %s", got)
+	}
+}
+
+func TestReplayedBlockingUIDialogIsFedOnlyOnce(t *testing.T) {
+	log := discardLogger()
+	st := newTurnState()
+	ev := uiEvent(t, `"id":"q2","method":"confirm"`)
+	ev.Seq = 17
+	if !st.feed(ev, log) {
+		t.Fatal("the first UI event was marked as a replay")
+	}
+	if st.feed(ev, log) {
+		t.Fatal("a replayed UI event was accepted twice")
 	}
 }
 
