@@ -633,9 +633,11 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 		defer b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
 		if err := th.runTurn(ctx, m, r); err != nil {
 			b.log.Warn("turn failed", "thread", th.key, "error", err)
-			if ferr := r.Fail(ctx, err); ferr != nil {
+			terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+			if ferr := r.Fail(terminalCtx, err); ferr != nil {
 				b.log.Error("cannot report the failure", "thread", th.key, "error", ferr)
 			}
+			cancel()
 			b.failRequest(ctx, m)
 		}
 	}()

@@ -985,14 +985,16 @@ func TestStripANSI(t *testing.T) {
 
 // recordingRenderer records what a turn renders.
 type recordingRenderer struct {
-	mu       sync.Mutex
-	starts   int
-	startErr error
-	deltas   []string
-	tasks    []TaskProgress
-	finals   []string
-	failure  string
-	signal   chan struct{} // if set, receives a value on every Delta
+	mu                 sync.Mutex
+	starts             int
+	startErr           error
+	deltas             []string
+	tasks              []TaskProgress
+	finals             []string
+	failure            string
+	failureContextErr  error
+	failureHasDeadline bool
+	signal             chan struct{} // if set, receives a value on every Delta
 }
 
 func (r *recordingRenderer) Start(context.Context) error {
@@ -1030,11 +1032,20 @@ func (r *recordingRenderer) Finish(_ context.Context, final string) error {
 	return nil
 }
 
-func (r *recordingRenderer) Fail(_ context.Context, cause error) error {
+func (r *recordingRenderer) Fail(ctx context.Context, cause error) error {
+	_, hasDeadline := ctx.Deadline()
 	r.mu.Lock()
 	r.failure = cause.Error()
+	r.failureContextErr = ctx.Err()
+	r.failureHasDeadline = hasDeadline
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *recordingRenderer) failureContext() (error, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failureContextErr, r.failureHasDeadline
 }
 
 func (r *recordingRenderer) finalAnswers() []string {
@@ -1214,6 +1225,12 @@ func TestCanceledTurnMarksOriginalRequestFailed(t *testing.T) {
 		t.Errorf("completed %d requests after the turn failed", got)
 	}
 	assertFailureReporterUsesLiveBoundedContext(t, platform)
+	platform.mu.Lock()
+	renderer := platform.renderer
+	platform.mu.Unlock()
+	if err, hasDeadline := renderer.failureContext(); err != nil || !hasDeadline {
+		t.Fatalf("renderer failure context err/deadline = %v/%v, want live and bounded", err, hasDeadline)
+	}
 }
 
 func TestStartTurnErrorMarksOriginalRequestFailed(t *testing.T) {

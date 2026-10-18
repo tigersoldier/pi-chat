@@ -372,8 +372,8 @@ func TestStartStreamRetriesWithoutARecipient(t *testing.T) {
 	if err := first.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !first.streaming {
-		t.Fatal("the retry should have kept streaming")
+	if first.streamState != streamActive {
+		t.Fatalf("stream state = %v, want active", first.streamState)
 	}
 
 	// The refusal is remembered, so the next turn does not repeat a doomed
@@ -507,9 +507,9 @@ func TestTaskAppendFailureFallsBackToMessageUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"chat.startStream", "chat.appendStream", "chat.update", "chat.update"}
+	want := []string{"chat.startStream", "chat.appendStream", "chat.stopStream", "chat.update"}
 	if got := stub.methods(); strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("calls = %v, want message-update fallback after task append failure", got)
+		t.Fatalf("calls = %v, want stream closure before message-update fallback", got)
 	}
 }
 
@@ -589,7 +589,7 @@ func TestStreamFailureFallsBackToPatching(t *testing.T) {
 	}
 }
 
-func TestAppendFailureMidTurnFallsBackToPatching(t *testing.T) {
+func TestAppendFailureMidTurnDefersFallbackUntilSettlement(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")
 	ctx := context.Background()
@@ -602,10 +602,237 @@ func TestAppendFailureMidTurnFallsBackToPatching(t *testing.T) {
 	stub.mu.Unlock()
 
 	if err := r.Delta(ctx, "hello"); err != nil {
-		t.Fatalf("a failed append should degrade, not fail the turn: %v", err)
+		t.Fatalf("a failed append should be retained for settlement: %v", err)
 	}
-	if got := strings.Join(stub.methods(), ","); !strings.HasSuffix(got, "chat.appendStream,chat.update") {
-		t.Fatalf("calls = %v, want an update after the failed append", got)
+	if got := strings.Join(stub.methods(), ","); got != "chat.startStream,chat.appendStream" {
+		t.Fatalf("calls after ambiguous append = %v, want no unsafe update", got)
+	}
+	if r.ts == "" || r.streamState != streamUnknown {
+		t.Fatalf("append failure lost stream handle/state: ts=%q state=%v", r.ts, r.streamState)
+	}
+	if err := r.Finish(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want closure before fallback", got)
+	}
+}
+
+func TestTerminalAppendFailureIsSafeForFinishAndFail(t *testing.T) {
+	for _, outcome := range []string{"finish", "failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+				if method == "chat.appendStream" {
+					return "message_not_in_streaming_state"
+				}
+				return ""
+			}}
+			r := newTestRenderer(t, stub, "stream")
+			ctx := context.Background()
+			if err := r.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Delta(ctx, "partial"); err != nil {
+				t.Fatal(err)
+			}
+			if r.streamState != streamClosed || r.ts == "" {
+				t.Fatalf("terminal append lost closure or timestamp: state=%v ts=%q", r.streamState, r.ts)
+			}
+			switch outcome {
+			case "finish":
+				if err := r.Finish(ctx, "authoritative answer"); err != nil {
+					t.Fatal(err)
+				}
+			case "failure":
+				if err := r.Fail(ctx, errors.New("turn failed")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := stub.recorded()
+			for _, call := range calls {
+				if call.method == "chat.stopStream" {
+					t.Fatal("an already-stopped stream should not be stopped again")
+				}
+			}
+			last := calls[len(calls)-1]
+			if last.method != "chat.update" {
+				t.Fatalf("last call = %s, want update of the original message", last.method)
+			}
+			got := last.params["text"].(string)
+			if outcome == "finish" && got != "authoritative answer" {
+				t.Fatalf("final text = %q", got)
+			}
+			if outcome == "failure" && !strings.Contains(got, "turn failed") {
+				t.Fatalf("failure text = %q", got)
+			}
+		})
+	}
+}
+
+func TestAmbiguousAppendWaitsForSettlementToStopStream(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"chat.appendStream": "ratelimited"}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "partial"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(stub.methods(), ","); got != "chat.startStream,chat.appendStream" {
+		t.Fatalf("calls before settlement = %v, want no fallback update", got)
+	}
+	if err := r.Finish(ctx, "authoritative answer"); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want stop before fallback update", got)
+	}
+}
+
+func TestStopFailurePreservesStreamStateAndHandle(t *testing.T) {
+	for _, initial := range []streamState{streamActive, streamUnknown} {
+		t.Run(map[streamState]string{streamActive: "active", streamUnknown: "unknown"}[initial], func(t *testing.T) {
+			stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+				switch method {
+				case "chat.appendStream":
+					return "ratelimited"
+				case "chat.stopStream":
+					return "ratelimited"
+				default:
+					return ""
+				}
+			}}
+			r := newTestRenderer(t, stub, "stream")
+			ctx := context.Background()
+			if err := r.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if initial == streamUnknown {
+				if err := r.Delta(ctx, "partial"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ts := r.ts
+			if err := r.Finish(ctx, "answer"); err == nil {
+				t.Fatal("a failed stop should fail final delivery")
+			}
+			if r.ts != ts || r.streamState != initial {
+				t.Fatalf("failed stop changed handle/state: ts=%q state=%v, want ts=%q state=%v", r.ts, r.streamState, ts, initial)
+			}
+			if err := r.Fail(ctx, errors.New("turn failed")); err == nil {
+				t.Fatal("failure reporting must also surface an unclosed stream")
+			}
+			if r.ts != ts || r.streamState != initial {
+				t.Fatalf("failed failure-report stop changed handle/state: ts=%q state=%v", r.ts, r.streamState)
+			}
+			for _, call := range stub.recorded() {
+				if call.method == "chat.update" || call.method == "chat.postMessage" {
+					t.Fatalf("fallback attempted with unclosed stream: %v", stub.methods())
+				}
+			}
+		})
+	}
+}
+
+func TestUpdateConflictStopsBeforeRetryingFallback(t *testing.T) {
+	updates, stops := 0, 0
+	stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+		switch method {
+		case "chat.appendStream":
+			return "ratelimited"
+		case "chat.stopStream":
+			stops++
+		case "chat.update":
+			updates++
+			if updates == 1 {
+				return "streaming_state_conflict"
+			}
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "partial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "authoritative answer"); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.update,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want stop after conflict before retry: %s", got, want)
+	}
+	if stops != 2 || updates != 2 {
+		t.Fatalf("stops/updates = %d/%d, want 2/2", stops, updates)
+	}
+}
+
+func TestUpdateConflictStopFailureDoesNotOrphanOrDuplicate(t *testing.T) {
+	stops, updates := 0, 0
+	stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+		switch method {
+		case "chat.appendStream":
+			return "ratelimited"
+		case "chat.stopStream":
+			stops++
+			if stops == 2 {
+				return "ratelimited"
+			}
+		case "chat.update":
+			updates++
+			return "streaming_state_conflict"
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "partial"); err != nil {
+		t.Fatal(err)
+	}
+	ts := r.ts
+	if err := r.Finish(ctx, "authoritative answer"); err == nil {
+		t.Fatal("a failed stop after update conflict should surface as a transport error")
+	}
+	if r.ts != ts || r.streamState != streamUnknown {
+		t.Fatalf("unclosed stream lost its handle/state: ts=%q state=%v", r.ts, r.streamState)
+	}
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.update,chat.stopStream"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want no fallback after failed conflict closure", got)
+	}
+	if stops != 2 || updates != 1 {
+		t.Fatalf("stops/updates = %d/%d, want 2/1", stops, updates)
+	}
+}
+
+func TestAlreadyStoppedStreamCanBePatched(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"chat.stopStream": "message_not_in_streaming_state"}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "partial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "authoritative answer"); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want explicit already-stopped response to allow update", got)
+	}
+	if r.streamState != streamClosed || r.ts == "" {
+		t.Fatalf("already-stopped response lost state/handle: state=%v ts=%q", r.streamState, r.ts)
 	}
 }
 
