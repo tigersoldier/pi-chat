@@ -23,6 +23,7 @@ import (
 // reached when a prompt is accepted and then produces nothing.
 const (
 	startGrace                = 15 * time.Second
+	renderTerminalTimeout     = 15 * time.Second
 	assistantMessageSeparator = "\n\n"
 	progressMarkerOpen        = "[[slack-progress:"
 	progressMarkerClose       = "]]"
@@ -418,7 +419,7 @@ waitForCompletion:
 		reconcile()
 	}
 
-	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 	defer cancel()
 	if waitErr != nil {
 		if err := r.Fail(terminalCtx, waitErr); err != nil {

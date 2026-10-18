@@ -302,9 +302,10 @@ func parseOpened(env Envelope) (bot.Opened, bool) {
 // work.
 //
 // The event also carries `streaming_message_ts`, the streams Slack has already
-// stopped. Nothing here needs it: a later append to a stopped stream fails, and
-// the renderer already answers an append failure by switching to message
-// updates, which is how the partial answer still gets its final text.
+// stopped. The renderer keeps its original timestamp; if settlement tries to
+// stop a stream Slack already stopped for this event, Slack's explicit
+// `message_not_in_streaming_state` response establishes closure before any
+// message update is attempted.
 func parseStopped(env Envelope) (bot.Action, bool) {
 	if env.Type != "events_api" {
 		return bot.Action{}, false

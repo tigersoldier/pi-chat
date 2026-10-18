@@ -632,10 +632,11 @@ func (a *API) AppendStream(ctx context.Context, channel, ts string, chunks []str
 	}, nil)
 }
 
-// StopStream finalizes a streaming message. The text is not repeated here: it
-// was already appended, and whether stopStream's own markdown_text replaces or
-// appends the streamed content is not documented, so relying on it could
-// duplicate the answer.
+// StopStream finalizes a streaming message. Slack may return
+// message_not_in_streaming_state when another path (such as the agent stop
+// button) has already closed it. The text is not repeated here: it was already
+// appended, and whether stopStream's own markdown_text replaces or appends the
+// streamed content is not documented, so relying on it could duplicate the answer.
 func (a *API) StopStream(ctx context.Context, channel, ts string) error {
 	return a.call(ctx, "chat.stopStream", map[string]any{
 		"channel": channel,
