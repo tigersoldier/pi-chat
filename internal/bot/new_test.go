@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tigersoldier/pi-gateway/gwclient"
+
 	"github.com/tigersoldier/pi-chat/internal/store"
 )
 
@@ -65,13 +67,9 @@ func TestNewRetiresTheSessionAndKeepsItResumable(t *testing.T) {
 		Text:   "/new",
 	})
 
-	waitFor(t, "the answer", func() bool { return len(plat.postedNotices()) >= 1 })
-	notice, ok := noticeWith(plat.postedNotices(), "/pi resume")
-	if !ok {
-		t.Fatalf("no notice mentioned where the old session went: %+v", plat.postedNotices())
-	}
-	if !notice.Ephemeral {
-		t.Error("a command answer belongs to whoever typed it, so it is ephemeral")
+	waitFor(t, "the session retirement", func() bool { return th.snapshot().SessionPath == "" })
+	if notices := plat.postedNotices(); len(notices) != 0 {
+		t.Errorf("successful /new posted a notice: %+v", notices)
 	}
 
 	// The thread let go of the session, including the observation watermark: the
@@ -85,6 +83,23 @@ func TestNewRetiresTheSessionAndKeepsItResumable(t *testing.T) {
 	}
 	if row.ObservedTS != "" {
 		t.Errorf("the new session inherits the old watermark: %q", row.ObservedTS)
+	}
+
+	// The retired session remains available through the thread's /resume picker.
+	b.gw = &fakeGateway{rows: []gwclient.SessionRow{{Path: "/sessions/C1.jsonl", Name: "old-session"}}}
+	b.HandleCommand(context.Background(), Command{
+		EventID: "Ev2", Channel: "C1", UserID: "U1", Workspace: "T1",
+		Thread: &Thread{Workspace: "T1", Channel: "C1", ThreadTS: ts},
+		Text:   "/resume",
+	})
+	waitFor(t, "the retired session picker", func() bool { return len(plat.postedNotices()) == 1 })
+	picker := plat.postedNotices()[0]
+	if len(picker.Buttons) != 1 || picker.Buttons[0].ActionID != ActionResumeRetired {
+		t.Fatalf("retired picker = %+v, want a button for the old session", picker.Buttons)
+	}
+	choice, ok := decodeRetiredChoice(picker.Buttons[0].Value)
+	if !ok || choice.SessionPath != "/sessions/C1.jsonl" {
+		t.Errorf("retired session choice = %+v, %v; want the replaced session", choice, ok)
 	}
 
 	// The retired session is on record — that is what keeps its directory and
@@ -121,6 +136,9 @@ func TestNewWithTextStartsTheFreshSessionOnIt(t *testing.T) {
 	})
 
 	waitFor(t, "the turn", func() bool { return plat.startedTurns() == 1 })
+	if notices := plat.postedNotices(); len(notices) != 0 {
+		t.Errorf("/new with a first prompt posted a separate notice: %+v", notices)
+	}
 	turns := plat.postedTurns()
 	if want := "summarize the failing test"; turns[0].Text != want {
 		t.Errorf("the turn's prompt = %q, want %q", turns[0].Text, want)
@@ -183,9 +201,9 @@ func TestNewRefusesWhileATurnIsRunning(t *testing.T) {
 	}
 }
 
-func TestATopLevelDMMessageAnnouncesANewSession(t *testing.T) {
+func TestATopLevelDMMessageStartsQuietlyWhenTheDMAlreadyHadASession(t *testing.T) {
 	b, plat, st := newTestBot(t)
-	threadWithSession(t, b, st, "D1", "1700000000.000100")
+	previous := threadWithSession(t, b, st, "D1", "1700000000.000100")
 
 	b.HandleMessage(context.Background(), Message{
 		EventID:   "Ev1",
@@ -197,15 +215,12 @@ func TestATopLevelDMMessageAnnouncesANewSession(t *testing.T) {
 		Direct:    true,
 	})
 
-	waitFor(t, "the notice", func() bool { return len(plat.postedNotices()) >= 1 })
-	notice, ok := noticeWith(plat.postedNotices(), "New session", "/pi resume")
-	if !ok {
-		t.Fatalf("notices = %+v, want one announcing the new session", plat.postedNotices())
+	waitFor(t, "the new DM turn", func() bool { return plat.startedTurns() == 1 })
+	if notices := plat.postedNotices(); len(notices) != 0 {
+		t.Errorf("a top-level DM message posted a new-session notice: %+v", notices)
 	}
-	// It is about the conversation rather than about one interaction, so it is
-	// visible rather than ephemeral.
-	if notice.Ephemeral {
-		t.Error("the new-session notice should be visible")
+	if row := previous.snapshot(); row.SessionPath != "/sessions/D1.jsonl" {
+		t.Errorf("starting a new DM thread changed the earlier session: %+v", row)
 	}
 }
 
@@ -223,7 +238,7 @@ func TestATopLevelDMMessageIsSilentWhenTheDMWasEmpty(t *testing.T) {
 	})
 
 	waitFor(t, "the turn", func() bool { return plat.startedTurns() == 1 })
-	if _, ok := noticeWith(plat.postedNotices(), "New session"); ok {
-		t.Error("a first message in a DM is not a reset, so there is nothing to announce")
+	if notices := plat.postedNotices(); len(notices) != 0 {
+		t.Errorf("a first message in a DM should not post a notice: %+v", notices)
 	}
 }

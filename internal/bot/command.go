@@ -188,12 +188,12 @@ func (b *Bot) cmdResume(ctx context.Context, r request, _ string) error {
 	return b.pickResumable(ctx, r)
 }
 
-// cmdNew answers @pi /new: replace this thread's session with a fresh one.
+// cmdNew replaces this thread's session with a fresh one.
 //
 // The text after the command, when there is any, is the new session's first
 // prompt — otherwise the next message here is. The session being replaced stays
-// resumable, and the answer says so, because somebody who wanted their work gone
-// would have asked for `/pi delete` instead (DESIGN.md §4).
+// resumable; somebody who wanted their work gone would have asked for `/pi delete`
+// instead (DESIGN.md §4).
 func (b *Bot) cmdNew(ctx context.Context, r request, arg string) error {
 	th, err := b.threadFor(*r.thread)
 	if err != nil {
@@ -223,9 +223,8 @@ func (b *Bot) cmdNew(ctx context.Context, r request, arg string) error {
 		return nil
 	}
 
-	// The notice answers the command, so it is ephemeral like every other command
-	// answer; the fresh session's own answer is a normal message.
-	b.answer(ctx, r, "Starting a new session. The previous one stays available in `/pi resume`.")
+	// A successful replacement posts no separate notice. The retired session
+	// remains available through `@pi /resume`.
 	if text := strings.TrimSpace(arg); text != "" {
 		b.startTurn(ctx, th, Message{
 			Thread:    *r.thread,

@@ -154,14 +154,6 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		return
 	}
 
-	// A top-level message in a DM starts a session of its own — the thread is the
-	// session, so a new thread is a new session by construction — and saying so is
-	// what keeps that reset from being invisible when the DM already had one
-	// (DESIGN.md §4, §5).
-	if m.Direct && m.TS != "" && m.TS == m.Thread.ThreadTS {
-		b.noticeNewDMSession(ctx, m)
-	}
-
 	// `@pi /status` is a command, not a prompt: the vocabulary is resolved
 	// before anything reaches the agent (DESIGN.md §5).
 	if m.Mentioned && strings.HasPrefix(strings.TrimSpace(m.Text), "/") {
@@ -859,28 +851,3 @@ func (b *Bot) projectForCwd(cwd string) string {
 	first := strings.Split(rel, string(filepath.Separator))[0]
 	return filepath.Join(root, first)
 }
-
-// noticeNewDMSession tells the user that this message starts a session of its
-// own, when the DM already had one.
-//
-// It is a posted message rather than an ephemeral one: it is about the
-// conversation, not about one interaction, and it is the only sign that the
-// earlier session is still there (DESIGN.md §5).
-func (b *Bot) noticeNewDMSession(ctx context.Context, m Message) {
-	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
-	defer cancel()
-	had, err := b.store.ChannelHasSession(ctx, m.Workspace, m.Thread.Channel, m.Thread.Key())
-	if err != nil {
-		b.log.Warn("cannot tell whether this DM already had a session", "error", err)
-		return
-	}
-	if !had {
-		return
-	}
-	b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: newSessionNotice})
-}
-
-// newSessionNotice is the one line that keeps a new DM session from being a
-// silent reset. The prefix is the same word the command uses, so the two ways to
-// start fresh look alike.
-const newSessionNotice = "New session. The earlier one stays available in `/pi resume`."
