@@ -184,22 +184,162 @@ func (p *Platform) AcknowledgeRequest(ctx context.Context, m bot.Message, allowe
 	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, reaction)
 }
 
-// CompleteRequest replaces the in-progress eyes reaction with a check mark.
+// QueueRequest marks an accepted request while it waits behind an active turn.
+func (p *Platform) QueueRequest(ctx context.Context, m bot.Message) error {
+	return p.transitionRequestReaction(ctx, m, "eyes", "hourglass_flowing_sand")
+}
+
+// StartRequest removes this install's old request reactions from prior user
+// messages, then promotes a queued request to eyes. Thread replies are paged
+// through the current request, and direct-message root history is paged through
+// all earlier roots. Both scans process one Slack page at a time; the caller's
+// bounded context is the only scan limit.
+func (p *Platform) StartRequest(ctx context.Context, m bot.Message, queued bool) error {
+	var result error
+	if queued {
+		result = p.transitionRequestReaction(ctx, m, "hourglass_flowing_sand", "eyes")
+	}
+	if p.id.UserID == "" {
+		return result
+	}
+
+	found, err := p.api.WalkRepliesUntil(ctx, m.Thread.Channel, m.Thread.ThreadTS, m.TS, func(prior Message) error {
+		if !timestampBefore(prior.TS, m.TS) {
+			return nil
+		}
+		if err := p.removePriorRequestReaction(ctx, m.Thread.Channel, prior); err != nil && result == nil {
+			result = err
+		}
+		return nil // reaction failures must not stop the scan
+	})
+	if err != nil && result == nil {
+		result = fmt.Errorf("read the thread's request reactions: %w", err)
+	} else if err == nil && !found && result == nil {
+		result = fmt.Errorf("request %s was not in the thread reply scan", m.TS)
+	}
+
+	if m.Direct && m.TS == m.Thread.ThreadTS {
+		cursor := ""
+		for {
+			history, err := p.api.HistoryCursorPage(ctx, m.Thread.Channel, m.TS, cursor, historyPageSize)
+			if err != nil {
+				if result == nil {
+					result = fmt.Errorf("read earlier direct-message request reactions: %w", err)
+				}
+				break
+			}
+			if err := p.removePriorRequestReactions(ctx, m.Thread.Channel, history.Messages, m.TS); err != nil && result == nil {
+				result = err
+			}
+			if !history.HasMore || history.NextCursor == "" {
+				break
+			}
+			cursor = history.NextCursor
+		}
+	}
+	return result
+}
+
+func (p *Platform) removePriorRequestReactions(ctx context.Context, channel string, messages []Message, before string) error {
+	var result error
+	for _, prior := range messages {
+		if !timestampBefore(prior.TS, before) {
+			continue
+		}
+		if err := p.removePriorRequestReaction(ctx, channel, prior); err != nil && result == nil {
+			result = err
+		}
+	}
+	return result
+}
+
+func (p *Platform) removePriorRequestReaction(ctx context.Context, channel string, prior Message) error {
+	if !p.isUserMessage(prior) {
+		return nil
+	}
+	var result error
+	for _, reaction := range prior.Reactions {
+		if !isRequestReaction(reaction.Name) || !containsUser(reaction.Users, p.id.UserID) {
+			continue
+		}
+		if err := p.api.RemoveReaction(ctx, channel, prior.TS, reaction.Name); err != nil && !IsCode(err, "no_reaction") && result == nil {
+			result = fmt.Errorf("remove stale %s reaction from %s: %w", reaction.Name, prior.TS, err)
+		}
+	}
+	return result
+}
+
+// CompleteRequest replaces an in-progress reaction with a check mark.
 func (p *Platform) CompleteRequest(ctx context.Context, m bot.Message) error {
 	return p.replaceRequestReaction(ctx, m, "white_check_mark")
 }
 
-// FailRequest replaces the in-progress eyes reaction with a warning reaction.
+// FailRequest replaces an in-progress reaction with a warning reaction.
 func (p *Platform) FailRequest(ctx context.Context, m bot.Message) error {
 	return p.replaceRequestReaction(ctx, m, "warning")
 }
 
-// replaceRequestReaction moves an accepted request out of its in-progress state.
+// replaceRequestReaction moves an accepted request out of either in-progress state.
 func (p *Platform) replaceRequestReaction(ctx context.Context, m bot.Message, next string) error {
-	if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, "eyes"); err != nil && !IsCode(err, "no_reaction") {
-		return fmt.Errorf("remove the in-progress reaction: %w", err)
+	for _, reaction := range []string{"eyes", "hourglass_flowing_sand"} {
+		if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, reaction); err != nil && !IsCode(err, "no_reaction") {
+			return fmt.Errorf("remove the in-progress %s reaction: %w", reaction, err)
+		}
 	}
 	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, next)
+}
+
+// transitionRequestReaction moves between request states. It attempts the new
+// marker even if removing the old one failed, since reactions are best-effort.
+func (p *Platform) transitionRequestReaction(ctx context.Context, m bot.Message, old, next string) error {
+	var result error
+	if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, old); err != nil && !IsCode(err, "no_reaction") {
+		result = fmt.Errorf("remove the %s request reaction: %w", old, err)
+	}
+	if err := p.api.AddReaction(ctx, m.Thread.Channel, m.TS, next); err != nil && !IsCode(err, "already_reacted") && result == nil {
+		result = fmt.Errorf("add the %s request reaction: %w", next, err)
+	}
+	return result
+}
+
+func (p *Platform) isUserMessage(m Message) bool {
+	return m.User != "" && m.User != p.id.UserID && m.BotID == ""
+}
+
+func containsUser(users []string, userID string) bool {
+	for _, user := range users {
+		if user == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func isRequestReaction(name string) bool {
+	switch name {
+	case "eyes", "hourglass_flowing_sand", "white_check_mark", "warning", "shrug":
+		return true
+	default:
+		return false
+	}
+}
+
+func timestampBefore(a, b string) bool {
+	aSeconds, aFraction, aOK := strings.Cut(a, ".")
+	bSeconds, bFraction, bOK := strings.Cut(b, ".")
+	if !aOK || !bOK {
+		return a < b
+	}
+	if len(aSeconds) != len(bSeconds) {
+		return len(aSeconds) < len(bSeconds)
+	}
+	if aSeconds != bSeconds {
+		return aSeconds < bSeconds
+	}
+	width := max(len(aFraction), len(bFraction))
+	aFraction += strings.Repeat("0", width-len(aFraction))
+	bFraction += strings.Repeat("0", width-len(bFraction))
+	return aFraction < bFraction
 }
 
 // OpenThread posts a top-level message and returns the thread it starts: the

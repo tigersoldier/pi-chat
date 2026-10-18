@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
+	"github.com/tigersoldier/pi-chat/internal/slack"
 )
 
 // postCounter answers chat.postMessage with a fresh timestamp per call, the way
@@ -20,6 +21,192 @@ func postCounter() func(url.Values) string {
 	return func(url.Values) string {
 		return fmt.Sprintf(`{"ok":true,"ts":"9.%d"}`, n.Add(1))
 	}
+}
+
+func TestSelfDMRequestLifecycleThroughProductionMux(t *testing.T) {
+	base := time.Now().Add(-3 * time.Minute)
+	prior := selfDMTestTS(base)
+	daemon := selfDMTestTS(base.Add(time.Minute))
+	other := selfDMTestTS(base.Add(90 * time.Second))
+	current := selfDMTestTS(base.Add(2 * time.Minute))
+	stubReplies := `{"ok":true,"messages":[` +
+		`{"ts":"` + prior + `","user":"U1","reactions":[` +
+		`{"name":"eyes","users":["U1"]},` +
+		`{"name":"hourglass_flowing_sand","users":["U1"]},` +
+		`{"name":"shrug","users":["U1"]},` +
+		`{"name":"white_check_mark","users":["U1"]},` +
+		`{"name":"warning","users":["U1"]},` +
+		`{"name":"heart","users":["U1"]}]},` +
+		`{"ts":"` + daemon + `","user":"U1","reactions":[{"name":"eyes","users":["U1"]}]},` +
+		`{"ts":"` + other + `","user":"U1","reactions":[{"name":"eyes","users":["U2"]}]},` +
+		`{"ts":"` + current + `","user":"U1","reactions":[{"name":"heart","users":["U1"]}]}]}`
+	surface, _, stub, state := surfaceFor(t, map[string]func(url.Values) string{
+		"conversations.history": func(url.Values) string { return `{"ok":true,"messages":[]}` },
+		"conversations.replies": func(url.Values) string { return stubReplies },
+		"reactions.add":         func(url.Values) string { return `{"ok":true}` },
+		"reactions.remove":      func(url.Values) string { return `{"ok":true}` },
+	})
+	state.markPosted(daemon)
+	mux := slack.NewMultiPlatform(discardLogger(), nil, map[string]bot.Platform{"D1": surface.plat})
+	message := bot.Message{
+		Thread:    bot.Thread{Workspace: "T1", Channel: "D1", ThreadTS: prior},
+		UserID:    "U1",
+		Workspace: "T1",
+		TS:        current,
+		Mentioned: true,
+		Direct:    true,
+	}
+	ctx := context.Background()
+
+	if err := mux.AcknowledgeRequest(ctx, message, true); err != nil {
+		t.Fatalf("AcknowledgeRequest through mux: %v", err)
+	}
+	if err := mux.QueueRequest(ctx, message); err != nil {
+		t.Fatalf("QueueRequest through mux: %v", err)
+	}
+	if err := mux.StartRequest(ctx, message, true); err != nil {
+		t.Fatalf("StartRequest through mux: %v", err)
+	}
+	if err := mux.CompleteRequest(ctx, message); err != nil {
+		t.Fatalf("CompleteRequest through mux: %v", err)
+	}
+
+	calls := recordedCalls(stub)
+	var got []stubCall
+	for _, call := range calls {
+		switch call.method {
+		case "reactions.add", "reactions.remove", "conversations.replies":
+			got = append(got, call)
+		}
+	}
+	want := []struct{ method, name, ts string }{
+		{"reactions.add", "eyes", current},
+		{"reactions.remove", "eyes", current},
+		{"reactions.add", "hourglass_flowing_sand", current},
+		{"reactions.remove", "hourglass_flowing_sand", current},
+		{"reactions.add", "eyes", current},
+		{"conversations.replies", "", ""},
+		{"reactions.remove", "eyes", prior},
+		{"reactions.remove", "hourglass_flowing_sand", prior},
+		{"reactions.remove", "shrug", prior},
+		{"reactions.remove", "white_check_mark", prior},
+		{"reactions.remove", "warning", prior},
+		{"reactions.remove", "eyes", current},
+		{"reactions.remove", "hourglass_flowing_sand", current},
+		{"reactions.add", "white_check_mark", current},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("request reaction calls = %+v, want %d calls", got, len(want))
+	}
+	for i, expected := range want {
+		if got[i].method != expected.method || got[i].params.Get("name") != expected.name ||
+			(expected.ts != "" && got[i].params.Get("timestamp") != expected.ts) {
+			t.Errorf("request reaction call %d = %+v, want %s %s at %s", i, got[i], expected.method, expected.name, expected.ts)
+		}
+	}
+	if stub.count("reactions.remove") != 9 {
+		t.Errorf("reactions.remove calls = %d, want current state transitions plus five prior request markers", stub.count("reactions.remove"))
+	}
+}
+
+func TestSelfDMRequestCleanupFailsClosedOnPostedLedgerError(t *testing.T) {
+	base := time.Now().Add(-3 * time.Minute)
+	uncertain := selfDMTestTS(base)
+	safe := selfDMTestTS(base.Add(time.Minute))
+	current := selfDMTestTS(base.Add(2 * time.Minute))
+	replies := `{"ok":true,"messages":[` +
+		`{"ts":"` + uncertain + `","user":"U1","reactions":[{"name":"eyes","users":["U1"]}]},` +
+		`{"ts":"` + safe + `","user":"U1","reactions":[{"name":"warning","users":["U1"]}]},` +
+		`{"ts":"` + current + `","user":"U1"}]}`
+	surface, _, stub, state := surfaceFor(t, map[string]func(url.Values) string{
+		"conversations.history": func(url.Values) string { return `{"ok":true,"messages":[]}` },
+		"conversations.replies": func(url.Values) string { return replies },
+		"reactions.remove":      func(url.Values) string { return `{"ok":true}` },
+	})
+	failed := &postedLedgerError{memState: state, ts: uncertain}
+	surface.state = failed
+	surface.plat.state = failed
+	message := bot.Message{Thread: bot.Thread{Workspace: "T1", Channel: "D1", ThreadTS: uncertain}, UserID: "U1", Workspace: "T1", TS: current, Mentioned: true, Direct: true}
+
+	if err := surface.plat.StartRequest(context.Background(), message, false); err == nil {
+		t.Fatal("StartRequest error = nil, want the ledger failure to be reported")
+	}
+	removals := 0
+	for _, call := range recordedCalls(stub) {
+		if call.method != "reactions.remove" {
+			continue
+		}
+		removals++
+		if call.params.Get("timestamp") != safe || call.params.Get("name") != "warning" {
+			t.Errorf("removal = %+v, want only the certain user request", call.params)
+		}
+	}
+	if removals != 1 {
+		t.Errorf("reaction removals = %d, want one; uncertain daemon/user messages must be preserved", removals)
+	}
+}
+
+func TestSelfDMRootRequestCleanupSkipsNearLedgerCutoffThroughProductionMux(t *testing.T) {
+	now := time.Now()
+	current := selfDMTestTS(now.Add(-time.Minute))
+	daemon := selfDMTestTS(now.Add(-time.Hour))
+	prior := selfDMTestTS(now.Add(-2 * time.Hour))
+	nearBoundary := selfDMTestTS(now.Add(-postedTTL + time.Minute))
+	surface, _, stub, state := surfaceFor(t, map[string]func(url.Values) string{
+		"conversations.history": func(params url.Values) string {
+			if params.Get("latest") == "" {
+				return `{"ok":true,"messages":[]}`
+			}
+			return `{"ok":true,"messages":[` +
+				`{"ts":"` + daemon + `","user":"U1","reactions":[{"name":"eyes","users":["U1"]}]},` +
+				`{"ts":"` + prior + `","user":"U1","reactions":[{"name":"warning","users":["U1"]}]},` +
+				`{"ts":"` + nearBoundary + `","user":"U1","reactions":[{"name":"eyes","users":["U1"]}]}]}`
+		},
+		"conversations.replies": func(url.Values) string {
+			return `{"ok":true,"messages":[{"ts":"` + current + `","user":"U1"}]}`
+		},
+		"reactions.remove": func(url.Values) string { return `{"ok":true}` },
+	})
+	state.markPosted(daemon)
+	mux := slack.NewMultiPlatform(discardLogger(), nil, map[string]bot.Platform{"D1": surface.plat})
+	message := bot.Message{
+		Thread: bot.Thread{Workspace: "T1", Channel: "D1", ThreadTS: current},
+		UserID: "U1", Workspace: "T1", TS: current, Mentioned: true, Direct: true,
+	}
+	if err := mux.StartRequest(context.Background(), message, false); err != nil {
+		t.Fatalf("StartRequest through mux: %v", err)
+	}
+	if stub.count("conversations.history") != 2 {
+		t.Fatalf("history calls = %d, want startup probe plus the prior-root scan", stub.count("conversations.history"))
+	}
+	if got := stub.params("conversations.history", 1).Get("latest"); got != current {
+		t.Errorf("history latest = %q, want current root %q", got, current)
+	}
+	if stub.count("reactions.remove") != 1 || stub.params("reactions.remove", 0).Get("timestamp") != prior || stub.params("reactions.remove", 0).Get("name") != "warning" {
+		t.Errorf("reaction removals = %+v, want only the recent prior user root; near-boundary roots are skipped with the ledger safety grace", recordedCalls(stub))
+	}
+}
+
+func selfDMTestTS(t time.Time) string {
+	return fmt.Sprintf("%d.%06d", t.Unix(), t.Nanosecond()/1000)
+}
+
+func recordedCalls(stub *stubSlack) []stubCall {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	return append([]stubCall(nil), stub.calls...)
+}
+
+type postedLedgerError struct {
+	*memState
+	ts string
+}
+
+func (s *postedLedgerError) SurfacePosted(ctx context.Context, surface, ts string) (bool, error) {
+	if ts == s.ts {
+		return false, errors.New("posted ledger unavailable")
+	}
+	return s.memState.SurfacePosted(ctx, surface, ts)
 }
 
 // TestPostTurnsButtonsIntoNumbers is this surface's whole interactivity: a

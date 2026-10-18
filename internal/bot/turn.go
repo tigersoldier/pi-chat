@@ -77,9 +77,14 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	var st *turnState
 	held := false
 	waited := false
+	queuedReaction := false
 	for {
 		if !th.turnMu.TryLock() {
 			waited = true
+			if !queuedReaction {
+				th.b.queueRequest(ctx, m)
+				queuedReaction = true
+			}
 			th.turnMu.Lock()
 		}
 		held = true
@@ -99,6 +104,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 			continue
 		}
 		waited = true
+		if !queuedReaction {
+			th.b.queueRequest(ctx, m)
+			queuedReaction = true
+		}
 		select {
 		case <-active.finishedCh:
 		case <-ctx.Done():
@@ -117,6 +126,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		// observed turn may have lowered it while this request was queued.
 		th.b.setStatus(ctx, th, StatusBusy)
 	}
+	th.b.startRequest(ctx, m, queuedReaction)
 
 	client, err := th.ensure(ctx, m.Text)
 	if err != nil {

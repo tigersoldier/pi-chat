@@ -36,19 +36,29 @@ type requestFailureRecord struct {
 	hasDeadline bool
 }
 
+type requestStartRecord struct {
+	message Message
+	queued  bool
+}
+
 // fakePlatform records what the core asks a platform to do.
 type fakePlatform struct {
-	mu        sync.Mutex
-	turns     []Message
-	notices   []Notice
-	acks      []requestAck
-	completed []Message
-	failed    []requestFailureRecord
-	opened    []string // the text of each thread the core asked for
-	thread    Thread   // what OpenThread returns; zero means a stand-in
-	renderer  *recordingRenderer
-	startErr  error
-	statuses  []Status // lifecycle states, in the order the core asked for them
+	mu                sync.Mutex
+	turns             []Message
+	notices           []Notice
+	acks              []requestAck
+	queued            []Message
+	started           []requestStartRecord
+	completed         []Message
+	failed            []requestFailureRecord
+	onStart           func()
+	opened            []string // the text of each thread the core asked for
+	thread            Thread   // what OpenThread returns; zero means a stand-in
+	renderer          *recordingRenderer
+	startErr          error
+	queueError        error
+	requestStartError error
+	statuses          []Status // lifecycle states, in the order the core asked for them
 
 	prompts        []Suggestion
 	promptsChannel string
@@ -103,6 +113,25 @@ func (p *fakePlatform) AcknowledgeRequest(_ context.Context, m Message, allowed 
 	defer p.mu.Unlock()
 	p.acks = append(p.acks, requestAck{message: m, allowed: allowed})
 	return nil
+}
+
+func (p *fakePlatform) QueueRequest(_ context.Context, m Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.queued = append(p.queued, m)
+	return p.queueError
+}
+
+func (p *fakePlatform) StartRequest(_ context.Context, m Message, queued bool) error {
+	p.mu.Lock()
+	p.started = append(p.started, requestStartRecord{message: m, queued: queued})
+	onStart := p.onStart
+	err := p.requestStartError
+	p.mu.Unlock()
+	if onStart != nil {
+		onStart()
+	}
+	return err
 }
 
 func (p *fakePlatform) CompleteRequest(_ context.Context, m Message) error {
@@ -200,6 +229,18 @@ func (p *fakePlatform) acknowledgedRequests() []requestAck {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]requestAck(nil), p.acks...)
+}
+
+func (p *fakePlatform) queuedRequests() []Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Message(nil), p.queued...)
+}
+
+func (p *fakePlatform) startedRequests() []requestStartRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]requestStartRecord(nil), p.started...)
 }
 
 func (p *fakePlatform) completedRequests() []Message {

@@ -463,15 +463,22 @@ func (a *API) Respond(ctx context.Context, responseURL, text string, blocks []bl
 // parent: the self-DM surface uses them to decide which threads it has to read
 // replies from.
 type Message struct {
-	TS          string `json:"ts"`
-	ThreadTS    string `json:"thread_ts"`
-	User        string `json:"user"`
-	BotID       string `json:"bot_id"`
-	Subtype     string `json:"subtype"`
-	Text        string `json:"text"`
-	ReplyCount  int    `json:"reply_count"`
-	LatestReply string `json:"latest_reply"`
-	Files       []File `json:"files"`
+	TS          string     `json:"ts"`
+	ThreadTS    string     `json:"thread_ts"`
+	User        string     `json:"user"`
+	BotID       string     `json:"bot_id"`
+	Subtype     string     `json:"subtype"`
+	Text        string     `json:"text"`
+	ReplyCount  int        `json:"reply_count"`
+	LatestReply string     `json:"latest_reply"`
+	Files       []File     `json:"files"`
+	Reactions   []Reaction `json:"reactions"`
+}
+
+// Reaction is one emoji reaction and the Slack users who added it.
+type Reaction struct {
+	Name  string   `json:"name"`
+	Users []string `json:"users"`
 }
 
 // Reply is retained as the name for a message returned by conversations.replies.
@@ -488,8 +495,9 @@ const (
 // HistoryPage is one page of conversations.history, still in Slack's order:
 // newest first.
 type HistoryPage struct {
-	Messages []Message
-	HasMore  bool
+	Messages   []Message
+	HasMore    bool
+	NextCursor string
 }
 
 // historyPageSize is Slack's maximum for conversations.history.
@@ -504,6 +512,17 @@ const historyPageSize = 200
 // cursor is durable, so paging is a decision about how far behind the daemon
 // is willing to be, not about what the API can carry.
 func (a *API) History(ctx context.Context, channel, oldest, latest string, limit int) (HistoryPage, error) {
+	return a.historyPage(ctx, channel, oldest, latest, "", limit)
+}
+
+// HistoryCursorPage reads one page of history before latest, following the
+// cursor returned by the prior page. The newest-first order lets callers process
+// older roots incrementally without retaining the full channel history.
+func (a *API) HistoryCursorPage(ctx context.Context, channel, latest, cursor string, limit int) (HistoryPage, error) {
+	return a.historyPage(ctx, channel, "", latest, cursor, limit)
+}
+
+func (a *API) historyPage(ctx context.Context, channel, oldest, latest, cursor string, limit int) (HistoryPage, error) {
 	if limit <= 0 || limit > historyPageSize {
 		limit = historyPageSize
 	}
@@ -514,14 +533,20 @@ func (a *API) History(ctx context.Context, channel, oldest, latest string, limit
 	if latest != "" {
 		params["latest"] = latest
 	}
+	if cursor != "" {
+		params["cursor"] = cursor
+	}
 	var page struct {
 		Messages []Message `json:"messages"`
 		HasMore  bool      `json:"has_more"`
+		Metadata struct {
+			NextCursor string `json:"next_cursor"`
+		} `json:"response_metadata"`
 	}
 	if err := a.call(ctx, "conversations.history", params, &page); err != nil {
 		return HistoryPage{}, err
 	}
-	return HistoryPage{Messages: page.Messages, HasMore: page.HasMore}, nil
+	return HistoryPage{Messages: page.Messages, HasMore: page.HasMore, NextCursor: page.Metadata.NextCursor}, nil
 }
 
 // Replies reads a thread's conversation in order, following Slack's cursor
@@ -554,6 +579,44 @@ func (a *API) Replies(ctx context.Context, channel, threadTS, oldest string) ([]
 		out = append(out, page.Messages...)
 		if !page.HasMore || page.Metadata.NextCursor == "" || len(out) >= replyFetchLimit {
 			return out, nil
+		}
+		cursor = page.Metadata.NextCursor
+	}
+}
+
+// WalkRepliesUntil processes thread messages in Slack's oldest-first cursor
+// order, stopping before anchorTS. It holds only one Slack page at a time and
+// does not apply Replies' transcript fetch limit.
+func (a *API) WalkRepliesUntil(ctx context.Context, channel, threadTS, anchorTS string, visit func(Message) error) (bool, error) {
+	if anchorTS == "" {
+		return false, errors.New("slack replies until: no anchor timestamp")
+	}
+	cursor := ""
+	for {
+		params := map[string]any{"channel": channel, "ts": threadTS, "limit": replyPageSize}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var page struct {
+			Messages []Message `json:"messages"`
+			HasMore  bool      `json:"has_more"`
+			Metadata struct {
+				NextCursor string `json:"next_cursor"`
+			} `json:"response_metadata"`
+		}
+		if err := a.call(ctx, "conversations.replies", params, &page); err != nil {
+			return false, err
+		}
+		for _, message := range page.Messages {
+			if message.TS == anchorTS {
+				return true, nil
+			}
+			if err := visit(message); err != nil {
+				return false, err
+			}
+		}
+		if !page.HasMore || page.Metadata.NextCursor == "" {
+			return false, nil
 		}
 		cursor = page.Metadata.NextCursor
 	}

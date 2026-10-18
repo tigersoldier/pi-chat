@@ -44,9 +44,16 @@ func (fakeRenderer) Finish(context.Context, string) error { return nil }
 func (fakeRenderer) Fail(context.Context, error) error    { return nil }
 
 // capablePlatform adds the optional capabilities the mux has to delegate.
+type requestStartCall struct {
+	message bot.Message
+	queued  bool
+}
+
 type capablePlatform struct {
 	fakePlatform
 	acks       []bool
+	queued     []bot.Message
+	started    []requestStartCall
 	completed  []bot.Message
 	failed     []bot.Message
 	imageReads []string
@@ -54,6 +61,16 @@ type capablePlatform struct {
 
 func (c *capablePlatform) AcknowledgeRequest(_ context.Context, _ bot.Message, allowed bool) error {
 	c.acks = append(c.acks, allowed)
+	return nil
+}
+
+func (c *capablePlatform) QueueRequest(_ context.Context, m bot.Message) error {
+	c.queued = append(c.queued, m)
+	return nil
+}
+
+func (c *capablePlatform) StartRequest(_ context.Context, m bot.Message, queued bool) error {
+	c.started = append(c.started, requestStartCall{message: m, queued: queued})
 	return nil
 }
 
@@ -128,6 +145,39 @@ func TestMuxRoutesByChannel(t *testing.T) {
 	}
 	if len(app.notices) != 1 || app.notices[0].Channel != "C9" {
 		t.Errorf("app notices = %+v, want exactly the C9 notice", app.notices)
+	}
+}
+
+func TestMuxRoutesRequestLifecycleByChannel(t *testing.T) {
+	ctx := context.Background()
+	app := &capablePlatform{}
+	dm := &capablePlatform{}
+	mux := NewMultiPlatform(discardLogger(), app, map[string]bot.Platform{"D1": dm})
+
+	for _, tc := range []struct {
+		channel  string
+		platform *capablePlatform
+	}{
+		{channel: "D1", platform: dm},
+		{channel: "C9", platform: app},
+	} {
+		message := bot.Message{Thread: bot.Thread{Channel: tc.channel, ThreadTS: "1.1"}, TS: "1.2"}
+		if err := mux.QueueRequest(ctx, message); err != nil {
+			t.Fatalf("QueueRequest(%s): %v", tc.channel, err)
+		}
+		if err := mux.StartRequest(ctx, message, true); err != nil {
+			t.Fatalf("StartRequest(%s): %v", tc.channel, err)
+		}
+		if len(tc.platform.queued) != 1 || tc.platform.queued[0].TS != message.TS {
+			t.Errorf("queued on %s = %+v, want the routed request", tc.channel, tc.platform.queued)
+		}
+		if len(tc.platform.started) != 1 || tc.platform.started[0].message.TS != message.TS || !tc.platform.started[0].queued {
+			t.Errorf("started on %s = %+v, want the routed queued request", tc.channel, tc.platform.started)
+		}
+	}
+	if len(app.queued) != 1 || len(app.started) != 1 || len(dm.queued) != 1 || len(dm.started) != 1 {
+		t.Fatalf("request lifecycle routed incorrectly: app queued/started=%d/%d, dm=%d/%d",
+			len(app.queued), len(app.started), len(dm.queued), len(dm.started))
 	}
 }
 

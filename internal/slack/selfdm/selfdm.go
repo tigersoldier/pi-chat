@@ -60,11 +60,12 @@ const (
 	// rather than once a second.
 	pollBackoffMax = 5 * time.Minute
 
-	// postedTTL is how long the posted ledger is kept. It only has to outlive
-	// the window in which a restart could read a message back, and the cursor
-	// has moved past every entry long before a day is out.
-	postedTTL  = 24 * time.Hour
-	pruneEvery = 6 * time.Hour
+	// postedTTL is how long the posted ledger is kept. Reaction cleanup uses a
+	// safety grace near this cutoff because a concurrent prune can remove an entry
+	// between its age check and ledger lookup.
+	postedTTL               = 24 * time.Hour
+	postedLedgerSafetyGrace = time.Hour
+	pruneEvery              = 6 * time.Hour
 )
 
 // State is the durable part of the surface: where the poller got to, and which

@@ -323,6 +323,20 @@ type RequestAcknowledger interface {
 	AcknowledgeRequest(ctx context.Context, m Message, allowed bool) error
 }
 
+// RequestQueueReporter marks an addressed message while its turn waits behind
+// another turn. It is optional because some surfaces cannot react to the
+// original message.
+type RequestQueueReporter interface {
+	QueueRequest(ctx context.Context, m Message) error
+}
+
+// RequestStartReporter updates an addressed message when its turn actually
+// starts, after any queue wait. It is optional because some surfaces cannot
+// react to the original message.
+type RequestStartReporter interface {
+	StartRequest(ctx context.Context, m Message, queued bool) error
+}
+
 // RequestCompleter marks an addressed message after its turn succeeds. It is
 // optional because some surfaces cannot react to the original message.
 type RequestCompleter interface {
