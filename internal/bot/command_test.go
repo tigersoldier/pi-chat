@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -327,9 +329,13 @@ func TestDispatchResumeWithoutCandidates(t *testing.T) {
 
 func TestResumeSessionAdoptsTheChosenSession(t *testing.T) {
 	b, platform, _ := newTestBot(t)
-	b.gw = &fakeGateway{rows: []gwclient.SessionRow{
-		{Path: "/sessions/theirs.jsonl", Name: "their-session", ID: "sid", Cwd: "/home/pi/code/thing"},
-	}}
+	candidate := gwclient.SessionRow{
+		Path: "/sessions/theirs.jsonl", Name: "opaque-session-name",
+		Title: "What broke in the test?", ID: "550e8400-e29b-41d4-a716-446655440000",
+		Cwd: "/home/pi/code/thing",
+	}
+	response := "The test failed because the resumed session did not load its state."
+	b.gw = &fakeGateway{rows: []gwclient.SessionRow{candidate}, lastAssistant: response}
 
 	b.HandleAction(context.Background(), Action{
 		EventID: "Ev-action", Channel: "C1", UserID: "U1", Workspace: "T1",
@@ -341,8 +347,19 @@ func TestResumeSessionAdoptsTheChosenSession(t *testing.T) {
 		return err == nil && found && row.SessionPath == "/sessions/theirs.jsonl"
 	})
 
-	if opened := platform.openedThreads(); len(opened) != 1 {
-		t.Errorf("opened %d threads, want 1 for a root command", len(opened))
+	opened := platform.openedThreads()
+	if len(opened) != 1 {
+		t.Fatalf("opened %d threads, want 1 for a root command", len(opened))
+	}
+	wantOpening := "Resuming from session " + sessionLabel(candidate) + ".\n" +
+		"Here is the last agent response in that session:\n\n" + response
+	if opened[0] != wantOpening {
+		t.Errorf("thread opening = %q, want %q", opened[0], wantOpening)
+	}
+	for _, unwanted := range []string{candidate.ID, candidate.Path, filepath.Base(candidate.Path), candidate.Name, candidate.Cwd} {
+		if strings.Contains(opened[0], unwanted) {
+			t.Errorf("thread opening leaked %q: %q", unwanted, opened[0])
+		}
 	}
 
 	// A root command has no thread of its own, so one is opened and bound to the
@@ -351,12 +368,41 @@ func TestResumeSessionAdoptsTheChosenSession(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("the adopted thread was not recorded: found=%v err=%v", found, err)
 	}
-	if row.SessionPath != "/sessions/theirs.jsonl" || row.SessionName != "their-session" {
+	if row.SessionPath != "/sessions/theirs.jsonl" || row.SessionName != "opaque-session-name" {
 		t.Errorf("the row does not carry the adopted session: %+v", row)
 	}
 	// An adopted session's directory is not pi-chat's to delete.
 	if row.ProjectDir != "" {
 		t.Errorf("an adopted session got a project directory: %q", row.ProjectDir)
+	}
+}
+
+func TestResumeSessionAdoptsWhenLastResponseCannotBeRead(t *testing.T) {
+	b, platform, _ := newTestBot(t)
+	candidate := gwclient.SessionRow{
+		Name: "550e8400-e29b-41d4-a716-446655440000",
+		ID:   "550e8400-e29b-41d4-a716-446655440000",
+		Path: "/sessions/550e8400-e29b-41d4-a716-446655440000.jsonl",
+	}
+	b.gw = &fakeGateway{
+		rows: []gwclient.SessionRow{candidate}, lastAssistantErr: errors.New("session history unavailable"),
+	}
+
+	b.HandleAction(context.Background(), Action{
+		EventID: "Ev-action-unavailable-answer", Channel: "C1", UserID: "U1", Workspace: "T1",
+		ActionID: ActionResume, Value: candidate.Path,
+	})
+
+	waitFor(t, "adoption without a readable last response", func() bool {
+		row, found, err := b.store.Thread(context.Background(), "T1:C1:900.000001")
+		return err == nil && found && row.SessionPath == candidate.Path
+	})
+	opened := platform.openedThreads()
+	if len(opened) != 1 {
+		t.Fatalf("opened %d threads, want adoption to continue", len(opened))
+	}
+	if opened[0] != "Resuming a session." {
+		t.Errorf("thread opening leaked an identifier or invented a label: %q", opened[0])
 	}
 }
 

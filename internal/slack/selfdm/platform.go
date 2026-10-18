@@ -145,7 +145,7 @@ func (p *Platform) Post(ctx context.Context, n bot.Notice) error {
 // under — adopting a session with `/pi resume`, for instance — and here the
 // notice is also the thread's first message, exactly as a person's would be.
 func (p *Platform) OpenThread(ctx context.Context, channel, text string) (bot.Thread, error) {
-	ts, err := p.post(ctx, channel, "", text)
+	ts, err := p.postPlainText(ctx, channel, text)
 	if err != nil {
 		return bot.Thread{}, err
 	}
@@ -196,6 +196,17 @@ func (p *Platform) TakeAction(_ context.Context, channel, threadTS, userID, work
 // failing the turn would leave it posted anyway with the turn reported broken.
 func (p *Platform) post(ctx context.Context, channel, threadTS, text string) (string, error) {
 	ts, err := p.api.PostMessage(ctx, channel, threadTS, text)
+	if err != nil {
+		return "", err
+	}
+	if err := p.state.MarkSurfacePosted(ctx, SurfaceName, ts); err != nil {
+		p.log.Warn("cannot record a posted message; it may be read back as input", "ts", ts, "error", err)
+	}
+	return ts, nil
+}
+
+func (p *Platform) postPlainText(ctx context.Context, channel, text string) (string, error) {
+	ts, err := p.api.PostPlainTextMessage(ctx, channel, "", text)
 	if err != nil {
 		return "", err
 	}

@@ -300,6 +300,27 @@ func (a *API) PostMessage(ctx context.Context, channel, threadTS, text string) (
 	return a.PostBlocks(ctx, channel, threadTS, text, nil)
 }
 
+// PostPlainTextMessage posts text without Slack mrkdwn, mention, or automatic
+// link parsing and returns the message's timestamp.
+func (a *API) PostPlainTextMessage(ctx context.Context, channel, threadTS, text string) (string, error) {
+	params := map[string]any{
+		"channel": channel,
+		"text":    text,
+		"mrkdwn":  false,
+		"parse":   "none",
+	}
+	if threadTS != "" {
+		params["thread_ts"] = threadTS
+	}
+	var out struct {
+		TS string `json:"ts"`
+	}
+	if err := a.call(ctx, "chat.postMessage", params, &out); err != nil {
+		return "", err
+	}
+	return out.TS, nil
+}
+
 // PostBlocks posts text with optional Block Kit blocks and returns the
 // message's timestamp.
 func (a *API) PostBlocks(ctx context.Context, channel, threadTS, text string, blocks []block) (string, error) {

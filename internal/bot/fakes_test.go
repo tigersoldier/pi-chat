@@ -233,13 +233,19 @@ func (p *fakePlatform) openedThreads() []string {
 
 // fakeGateway serves a canned session catalog.
 type fakeGateway struct {
-	rows   []gwclient.SessionRow
-	status string
-	err    error
+	rows             []gwclient.SessionRow
+	status           string
+	err              error
+	lastAssistant    string
+	lastAssistantErr error
 }
 
 func (g *fakeGateway) Sessions(context.Context) ([]gwclient.SessionRow, error) {
 	return g.rows, g.err
+}
+
+func (g *fakeGateway) LastAssistantText(context.Context, string) (string, error) {
+	return g.lastAssistant, g.lastAssistantErr
 }
 
 func (g *fakeGateway) Status(context.Context) string { return g.status }

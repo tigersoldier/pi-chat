@@ -212,7 +212,8 @@ func TestOpenThreadStartsAtTheNewMessagesTimestamp(t *testing.T) {
 	stub := &stubSlack{}
 	platform := newTestPlatform(t, stub, "stream")
 
-	thread, err := platform.OpenThread(context.Background(), "C1", "Resuming something")
+	text := "Resuming from session <!channel> *bold* `code` <https://example.test|link>"
+	thread, err := platform.OpenThread(context.Background(), "C1", text)
 	if err != nil {
 		t.Fatalf("OpenThread: %v", err)
 	}
@@ -227,6 +228,12 @@ func TestOpenThreadStartsAtTheNewMessagesTimestamp(t *testing.T) {
 	call := stub.recorded()[0]
 	if call.params["thread_ts"] != nil {
 		t.Errorf("OpenThread posted into a thread: %+v", call.params)
+	}
+	if call.params["text"] != text {
+		t.Errorf("OpenThread changed the plain text: %v", call.params["text"])
+	}
+	if call.params["mrkdwn"] != "false" || call.params["parse"] != "none" {
+		t.Errorf("OpenThread left Slack parsing enabled for dynamic text: %+v", call.params)
 	}
 }
 

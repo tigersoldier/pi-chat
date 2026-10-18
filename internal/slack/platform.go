@@ -206,7 +206,7 @@ func (p *Platform) replaceRequestReaction(ctx context.Context, m bot.Message, ne
 // new message's own timestamp is the thread root. The core needs this when a
 // root command has no message of its own to answer under.
 func (p *Platform) OpenThread(ctx context.Context, channel, text string) (bot.Thread, error) {
-	ts, err := p.api.PostMessage(ctx, channel, "", text)
+	ts, err := p.api.PostPlainTextMessage(ctx, channel, "", text)
 	if err != nil {
 		return bot.Thread{}, err
 	}

@@ -68,6 +68,31 @@ func TestPostTurnsButtonsIntoNumbers(t *testing.T) {
 	}
 }
 
+func TestOpenThreadPostsPlainTextWithDynamicSlackSyntax(t *testing.T) {
+	s, _, stub, st := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+	})
+	text := "Resuming <!channel> *bold* `code` <https://example.test|link>"
+
+	thread, err := s.plat.OpenThread(context.Background(), "D1", text)
+	if err != nil {
+		t.Fatalf("OpenThread: %v", err)
+	}
+	if thread.ThreadTS != "9.1" {
+		t.Fatalf("thread root = %q, want posted timestamp 9.1", thread.ThreadTS)
+	}
+	params := stub.params("chat.postMessage", 0)
+	if params.Get("text") != text {
+		t.Errorf("OpenThread changed the plain text: %q", params.Get("text"))
+	}
+	if params.Get("mrkdwn") != "false" || params.Get("parse") != "none" {
+		t.Errorf("OpenThread left Slack parsing enabled: %v", params)
+	}
+	if !st.posted[SurfaceName+"/9.1"] {
+		t.Error("the plain-text thread root was not recorded in the surface ledger")
+	}
+}
+
 // TestTakeActionAcceptsTheButtonText: a number is the hint, but the button's own
 // words are just as unambiguous.
 func TestTakeActionAcceptsTheButtonText(t *testing.T) {
