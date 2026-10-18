@@ -308,8 +308,8 @@ rather than once per turn.
   the thread back from its watermark.
 - **In a one-to-one DM the conversation is the address**, so plain text turns — and a
   **top-level DM message starts a session of its own**, which the thread model gives for
-  free: a new thread is a new session. When the DM already had one, a visible one-line
-  notice says so, because a reset that shows nothing is how work gets lost.
+  free: a new thread is a new session. No separate new-session notice is posted even if
+  earlier threads in the DM already have sessions; those threads are left untouched.
 - **A mention registers the thread but provisions nothing**: the worktree and the pi
   process are created by the first turn, so a bare `@pi` or `@pi /help` costs a row.
 - **`@pi /new [<text>]` replaces the thread's session.** It retires the current one
@@ -318,8 +318,9 @@ rather than once per turn.
   "new session" means a clean slate rather than "throw my work away" (that is `/delete`,
   with its confirmation button). The retired session is recorded (see `retired` in §7) so
   the startup sweep keeps its directory, and it stays resumable in the same thread through
-  `@pi /resume`. A following `<text>` becomes the new session's first prompt; without one,
-  the next message here is. A turn already running in the thread is refused rather than waited for.
+  `@pi /resume`. A successful replacement posts no separate notice. A following `<text>`
+  becomes the new session's first prompt; without one, the next message here is. A turn
+  already running in the thread is refused rather than waited for.
 - **A thread's later sessions get a generation suffix** (`slack-<ws>-<ch>-<ts>-2`): one
   thread can now have more than one session, and two of them under one name would leave the
   catalog ambiguous — for `@pi /resume`, and for anyone reading it. The suffix is the number

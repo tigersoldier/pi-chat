@@ -181,25 +181,3 @@ func (s *Store) RetiredProjects(ctx context.Context) ([]string, error) {
 	}
 	return out, nil
 }
-
-// ChannelHasSession reports whether any thread in this channel other than
-// exceptKey owns a session.
-//
-// It answers one question: a top-level message in a DM starts a new session, and
-// whether that is worth telling the user about depends on whether the DM already
-// had one (DESIGN.md §5).
-func (s *Store) ChannelHasSession(ctx context.Context, workspaceID, channelID, exceptKey string) (bool, error) {
-	var one int
-	err := s.db.QueryRowContext(ctx, `
-        SELECT 1 FROM threads
-        WHERE workspace_id = ? AND channel_id = ? AND thread_key <> ?
-          AND session_path <> '' AND state <> ?
-        LIMIT 1`, workspaceID, channelID, exceptKey, StateDeleted).Scan(&one)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("store: look for a session in %s: %w", channelID, err)
-	}
-	return true, nil
-}
