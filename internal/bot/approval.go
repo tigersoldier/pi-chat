@@ -148,9 +148,18 @@ func approvalTimeout(timeoutMS int) time.Duration {
 // presentApproval persists the routing identity before exposing any action to
 // Slack. It runs off the gateway reader so posting a prompt cannot stall event
 // delivery for the session.
-func (th *thread) presentApproval(client uiResponder, sessionPath string, eventSeq uint64, request ApprovalRequest, timeoutMS int) {
+func (th *thread) presentApproval(client uiResponder, sessionPath string, eventSeq uint64, requesterUserID string, request ApprovalRequest, timeoutMS int) {
 	if client == nil || request.ID == "" {
 		th.log.Warn("pi sent an incomplete blocking UI request", "method", request.Method)
+		return
+	}
+	if requesterUserID == "" {
+		th.log.Warn("pi sent a blocking dialog without a Slack requester; canceling it", "method", request.Method)
+		ctx, cancel := th.approvalContext()
+		defer cancel()
+		if err := client.RespondUI(ctx, request.ID, map[string]any{"cancelled": true}); err != nil {
+			th.log.Warn("cannot cancel pi's unowned UI request", "method", request.Method, "error", err)
+		}
 		return
 	}
 	routeID := approvalRouteID(th.key, sessionPath, eventSeq, request.ID)
@@ -180,8 +189,8 @@ func (th *thread) presentApproval(client uiResponder, sessionPath string, eventS
 		expiresAt = now.Add(timeout)
 	}
 	pending := store.PendingUI{
-		RouteID: routeID, RequestID: request.ID, ThreadKey: th.key, SessionPath: sessionPath, Method: request.Method,
-		CreatedAt: now, ExpiresAt: expiresAt,
+		RouteID: routeID, RequestID: request.ID, ThreadKey: th.key, RequesterUserID: requesterUserID,
+		SessionPath: sessionPath, Method: request.Method, CreatedAt: now, ExpiresAt: expiresAt,
 	}
 	inserted, err := th.b.store.PutPendingUI(ctx, pending)
 	if err != nil {
@@ -317,7 +326,7 @@ func (b *Bot) sendApprovalResponse(ctx context.Context, pending store.PendingUI,
 	if err != nil {
 		return true, fmt.Errorf("store: retire answered approval route %s: %w", pending.RouteID, err)
 	}
-	if found && (retired.RequestID != pending.RequestID || retired.SessionPath != pending.SessionPath) {
+	if found && (retired.RequestID != pending.RequestID || retired.SessionPath != pending.SessionPath || retired.RequesterUserID != pending.RequesterUserID) {
 		return true, fmt.Errorf("store: answered approval route %s changed identity", pending.RouteID)
 	}
 	b.forgetApproval(pending.RouteID)
@@ -335,6 +344,57 @@ func (b *Bot) retireApproval(ctx context.Context, thread Thread, pending store.P
 	}
 	b.forgetApproval(consumed.RouteID)
 	b.finishApprovalMessage(ctx, thread, consumed, fallbackTS, notice)
+}
+
+// cancelUnownedApproval retires a pre-migration route only after Pi accepts a
+// cancellation (or reports it stale). On transient gateway errors it leaves the
+// route unanswerable but retryable by the maintenance sweep.
+func (b *Bot) cancelUnownedApproval(ctx context.Context, thread Thread, pending store.PendingUI, fallbackTS string) {
+	if pending.RequesterUserID != "" || !b.beginUIResponse(pending.RouteID) {
+		return
+	}
+	defer b.endUIResponse(pending.RouteID)
+
+	cancelCtx, cancel := context.WithTimeout(ctx, approvalActionTimeout)
+	defer cancel()
+	th, err := b.threadFor(thread)
+	if err != nil {
+		b.log.Warn("cannot attach the thread to cancel an unowned approval", "route_id", pending.RouteID, "error", err)
+		return
+	}
+	if th.snapshot().SessionPath != pending.SessionPath {
+		b.retireApproval(cancelCtx, thread, pending, fallbackTS, "This older approval could not be verified and was canceled. Ask the original requester to retry.")
+		return
+	}
+	client, err := th.bind(cancelCtx, "", false)
+	if err != nil {
+		if errors.Is(err, errSessionGone) || errors.Is(err, errNoSession) {
+			b.retireApproval(cancelCtx, thread, pending, fallbackTS, "This older approval is no longer active. Ask the original requester to retry.")
+			return
+		}
+		b.log.Warn("cannot reconnect to cancel an unowned approval", "route_id", pending.RouteID, "error", err)
+		return
+	}
+	if session := client.Session(); session == nil || session.Path != pending.SessionPath {
+		b.retireApproval(cancelCtx, thread, pending, fallbackTS, "This older approval could not be verified and was canceled. Ask the original requester to retry.")
+		return
+	}
+
+	sent, err := b.sendApprovalResponse(cancelCtx, pending, client, map[string]any{"cancelled": true})
+	if err != nil && !sent {
+		var responseErr *gwclient.ResponseError
+		if errors.As(err, &responseErr) && responseErr.Code == protocol.CodeUIStale {
+			b.retireApproval(cancelCtx, thread, pending, fallbackTS, "This older approval is no longer active. Ask the original requester to retry.")
+			return
+		}
+		b.log.Warn("cannot cancel an unowned approval yet", "route_id", pending.RouteID, "error", err)
+		return
+	}
+	if err != nil {
+		b.log.Error("Pi canceled an unowned approval but its route could not be retired", "route_id", pending.RouteID, "error", err)
+	}
+	b.finishApprovalMessage(cancelCtx, thread, pending, fallbackTS,
+		"This older approval was canceled because its requester could not be verified. Ask the original requester to try again.")
 }
 
 func (b *Bot) handleApprovalAction(ctx context.Context, action Action) {
@@ -369,6 +429,17 @@ func (b *Bot) handleApprovalAction(ctx context.Context, action Action) {
 	}
 	if !b.allowed(action.UserID, thread.Channel) {
 		b.refuse(ctx, action.UserID, thread.Channel, &thread, action.ReplyTo)
+		return
+	}
+	if pending.RequesterUserID == "" {
+		b.cancelUnownedApproval(ctx, thread, pending, action.MessageTS)
+		b.reply(ctx, Notice{Thread: &thread, UserID: action.UserID, Ephemeral: true,
+			Text: "This older approval has no verified requester and cannot be answered. Ask the original requester to try again."})
+		return
+	}
+	if action.UserID != pending.RequesterUserID {
+		b.reply(ctx, Notice{Thread: &thread, UserID: action.UserID, Ephemeral: true,
+			Text: "Only the person who started this request can respond."})
 		return
 	}
 	if !pending.ExpiresAt.IsZero() && !time.Now().Before(pending.ExpiresAt) {
@@ -534,6 +605,29 @@ func (b *Bot) expirePendingUI(ctx context.Context) {
 	if b.store == nil {
 		return
 	}
+	unowned, err := b.store.UnownedPendingUI(ctx)
+	if err != nil {
+		b.log.Warn("cannot list pending dialogs without a requester", "error", err)
+	} else {
+		for _, pending := range unowned {
+			row, found, err := b.store.Thread(ctx, pending.ThreadKey)
+			if err != nil {
+				b.log.Warn("cannot read the thread of an unowned approval", "route_id", pending.RouteID, "error", err)
+				continue
+			}
+			if !found {
+				b.log.Warn("the thread of an unowned approval no longer exists", "route_id", pending.RouteID)
+				b.forgetApproval(pending.RouteID)
+				if _, _, takeErr := b.store.TakePendingUI(ctx, pending.RouteID); takeErr != nil {
+					b.log.Warn("cannot retire an unowned approval without a thread", "route_id", pending.RouteID, "error", takeErr)
+				}
+				continue
+			}
+			thread := Thread{Workspace: row.WorkspaceID, Channel: row.ChannelID, ThreadTS: row.ThreadTS, Surface: row.Surface}
+			b.cancelUnownedApproval(ctx, thread, pending, "")
+		}
+	}
+
 	expired, err := b.store.TakeExpiredPendingUI(ctx, time.Now())
 	if err != nil {
 		b.log.Warn("cannot expire pending pi dialogs", "error", err)

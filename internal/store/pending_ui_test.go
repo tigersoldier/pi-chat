@@ -11,7 +11,7 @@ func TestPendingUIDeduplicatesAndCanBeConsumedOnce(t *testing.T) {
 	s, _ := newStore(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	want := PendingUI{
-		RouteID: "route-1", RequestID: "dialog-1", ThreadKey: "T1:C1:1.1", SessionPath: "/sessions/a.jsonl",
+		RouteID: "route-1", RequestID: "dialog-1", ThreadKey: "T1:C1:1.1", RequesterUserID: "U1", SessionPath: "/sessions/a.jsonl",
 		Method: "confirm", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
 	}
 	inserted, err := s.PutPendingUI(ctx, want)
@@ -23,10 +23,16 @@ func TestPendingUIDeduplicatesAndCanBeConsumedOnce(t *testing.T) {
 		t.Fatalf("duplicate PutPendingUI = inserted %v, err %v; want an idempotent no-op", inserted, err)
 	}
 	if _, err := s.PutPendingUI(ctx, PendingUI{
-		RouteID: want.RouteID, RequestID: want.RequestID, ThreadKey: want.ThreadKey,
+		RouteID: want.RouteID, RequestID: want.RequestID, ThreadKey: want.ThreadKey, RequesterUserID: want.RequesterUserID,
 		SessionPath: "/sessions/other.jsonl", Method: want.Method,
 	}); err == nil {
 		t.Fatal("a reused route id from another session was accepted")
+	}
+	if _, err := s.PutPendingUI(ctx, PendingUI{
+		RouteID: want.RouteID, RequestID: want.RequestID, ThreadKey: want.ThreadKey, RequesterUserID: "U2",
+		SessionPath: want.SessionPath, Method: want.Method,
+	}); err == nil {
+		t.Fatal("a reused route id with a different requester was accepted")
 	}
 	if err := s.SetPendingUIMessage(ctx, want.RouteID, "2.2"); err != nil {
 		t.Fatalf("SetPendingUIMessage: %v", err)
@@ -35,7 +41,7 @@ func TestPendingUIDeduplicatesAndCanBeConsumedOnce(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("PendingUI = found %v, err %v", found, err)
 	}
-	if got.RouteID != want.RouteID || got.RequestID != want.RequestID || got.ThreadKey != want.ThreadKey || got.SessionPath != want.SessionPath ||
+	if got.RouteID != want.RouteID || got.RequestID != want.RequestID || got.ThreadKey != want.ThreadKey || got.RequesterUserID != want.RequesterUserID || got.SessionPath != want.SessionPath ||
 		got.Method != want.Method || got.MessageTS != "2.2" || !got.ExpiresAt.Equal(want.ExpiresAt) {
 		t.Errorf("PendingUI = %+v, want the persisted route %+v", got, want)
 	}
@@ -47,7 +53,7 @@ func TestPendingUIDeduplicatesAndCanBeConsumedOnce(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("TakePendingUI = found %v, err %v", found, err)
 	}
-	if consumed.MessageTS != "2.2" || consumed.SessionPath != want.SessionPath || consumed.RequestID != want.RequestID {
+	if consumed.MessageTS != "2.2" || consumed.SessionPath != want.SessionPath || consumed.RequestID != want.RequestID || consumed.RequesterUserID != want.RequesterUserID {
 		t.Errorf("consumed row = %+v", consumed)
 	}
 	var consumedAt int64
@@ -68,12 +74,23 @@ func TestPendingUIDeduplicatesAndCanBeConsumedOnce(t *testing.T) {
 	}
 }
 
+func TestPutPendingUIRequiresRequester(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newStore(t)
+	if _, err := s.PutPendingUI(ctx, PendingUI{
+		RouteID: "unowned", RequestID: "dialog-unowned", ThreadKey: "T1:C1:1.1",
+		SessionPath: "/sessions/a.jsonl", Method: "input",
+	}); err == nil {
+		t.Fatal("a pending dialog without a requester was accepted")
+	}
+}
+
 func TestPendingUIAllowsSessionLocalRequestIDsToRepeat(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newStore(t)
 	for _, row := range []PendingUI{
-		{RouteID: "route-a", RequestID: "ui-1", ThreadKey: "T1:C1:1.1", SessionPath: "/s/a", Method: "confirm"},
-		{RouteID: "route-b", RequestID: "ui-1", ThreadKey: "T1:C2:2.2", SessionPath: "/s/b", Method: "confirm"},
+		{RouteID: "route-a", RequestID: "ui-1", ThreadKey: "T1:C1:1.1", RequesterUserID: "U1", SessionPath: "/s/a", Method: "confirm"},
+		{RouteID: "route-b", RequestID: "ui-1", ThreadKey: "T1:C2:2.2", RequesterUserID: "U2", SessionPath: "/s/b", Method: "confirm"},
 	} {
 		if inserted, err := s.PutPendingUI(ctx, row); err != nil || !inserted {
 			t.Fatalf("PutPendingUI(%s) = inserted %v, err %v", row.RouteID, inserted, err)
@@ -86,8 +103,8 @@ func TestTakeExpiredPendingUIDoesNotConsumeLiveRows(t *testing.T) {
 	s, _ := newStore(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	for _, row := range []PendingUI{
-		{RouteID: "expired", RequestID: "ui-expired", ThreadKey: "T1:C1:1.1", SessionPath: "/s/1", Method: "confirm", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(-time.Second)},
-		{RouteID: "live", RequestID: "ui-live", ThreadKey: "T1:C1:2.2", SessionPath: "/s/2", Method: "input", CreatedAt: now, ExpiresAt: now.Add(time.Minute)},
+		{RouteID: "expired", RequestID: "ui-expired", ThreadKey: "T1:C1:1.1", RequesterUserID: "U1", SessionPath: "/s/1", Method: "confirm", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(-time.Second)},
+		{RouteID: "live", RequestID: "ui-live", ThreadKey: "T1:C1:2.2", RequesterUserID: "U1", SessionPath: "/s/2", Method: "input", CreatedAt: now, ExpiresAt: now.Add(time.Minute)},
 	} {
 		if _, err := s.PutPendingUI(ctx, row); err != nil {
 			t.Fatalf("PutPendingUI(%s): %v", row.RouteID, err)
@@ -124,7 +141,7 @@ func TestPendingUIExpiryRoundsUpAndDoesNotExpireEarly(t *testing.T) {
 	base := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
 	pending := PendingUI{
 		RouteID: "fractional-expiry", RequestID: "ui-fractional", ThreadKey: "T1:C1:1.1",
-		SessionPath: "/s/1", Method: "confirm", CreatedAt: base, ExpiresAt: base.Add(1500 * time.Millisecond),
+		RequesterUserID: "U1", SessionPath: "/s/1", Method: "confirm", CreatedAt: base, ExpiresAt: base.Add(1500 * time.Millisecond),
 	}
 	if inserted, err := s.PutPendingUI(ctx, pending); err != nil || !inserted {
 		t.Fatalf("PutPendingUI = inserted %v, err %v", inserted, err)

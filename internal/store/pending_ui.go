@@ -14,13 +14,14 @@ const pendingUISeenPrefix = "ui-route:"
 // unique across session event streams; RequestID is the original, session-local
 // gateway id needed by RespondUI. Dialog text and choices stay out of SQLite.
 type PendingUI struct {
-	RouteID     string
-	RequestID   string
-	ThreadKey   string
-	SessionPath string
-	Method      string
-	MessageTS   string
-	CreatedAt   time.Time
+	RouteID         string
+	RequestID       string
+	ThreadKey       string
+	RequesterUserID string
+	SessionPath     string
+	Method          string
+	MessageTS       string
+	CreatedAt       time.Time
 	// ExpiresAt is zero when Pi supplied no timeout; local cleanup must not
 	// expire the route before Pi stops waiting.
 	ExpiresAt time.Time
@@ -33,8 +34,8 @@ type pendingUIQuery interface {
 // PutPendingUI records a dialog before it is shown. The seen marker is refreshed
 // on consumption or expiry so a replayed gateway event cannot resurrect it.
 func (s *Store) PutPendingUI(ctx context.Context, row PendingUI) (inserted bool, err error) {
-	if row.RouteID == "" || row.RequestID == "" || row.ThreadKey == "" || row.SessionPath == "" || row.Method == "" {
-		return false, errors.New("store: a pending dialog needs a route, request, thread, session path and method")
+	if row.RouteID == "" || row.RequestID == "" || row.ThreadKey == "" || row.RequesterUserID == "" || row.SessionPath == "" || row.Method == "" {
+		return false, errors.New("store: a pending dialog needs a route, request, thread, requester, session path and method")
 	}
 	if row.CreatedAt.IsZero() {
 		row.CreatedAt = time.Now()
@@ -56,7 +57,7 @@ func (s *Store) PutPendingUI(ctx context.Context, row PendingUI) (inserted bool,
 	}
 	if found {
 		if previous.RequestID != row.RequestID || previous.ThreadKey != row.ThreadKey ||
-			previous.SessionPath != row.SessionPath || previous.Method != row.Method {
+			previous.RequesterUserID != row.RequesterUserID || previous.SessionPath != row.SessionPath || previous.Method != row.Method {
 			return false, fmt.Errorf("store: pending route %s belongs to a different dialog", row.RouteID)
 		}
 		if err := tx.Commit(); err != nil {
@@ -80,9 +81,9 @@ func (s *Store) PutPendingUI(ctx context.Context, row PendingUI) (inserted bool,
 
 	_, err = tx.ExecContext(ctx, `
         INSERT INTO pending_ui
-            (route_id, request_id, thread_key, session_path, method, message_ts, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		row.RouteID, row.RequestID, row.ThreadKey, row.SessionPath, row.Method, row.MessageTS,
+            (route_id, request_id, thread_key, requester_user_id, session_path, method, message_ts, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.RouteID, row.RequestID, row.ThreadKey, row.RequesterUserID, row.SessionPath, row.Method, row.MessageTS,
 		row.CreatedAt.Unix(), expiresAt)
 	if err != nil {
 		return false, fmt.Errorf("store: save pending route %s: %w", row.RouteID, err)
@@ -107,9 +108,9 @@ func readPendingUI(ctx context.Context, query pendingUIQuery, routeID string) (P
 	var row PendingUI
 	var createdAt, expiresAt int64
 	err := query.QueryRowContext(ctx, `
-        SELECT route_id, request_id, thread_key, session_path, method, message_ts, created_at, expires_at
+        SELECT route_id, request_id, thread_key, requester_user_id, session_path, method, message_ts, created_at, expires_at
         FROM pending_ui WHERE route_id = ?`, routeID).Scan(
-		&row.RouteID, &row.RequestID, &row.ThreadKey, &row.SessionPath, &row.Method, &row.MessageTS, &createdAt, &expiresAt)
+		&row.RouteID, &row.RequestID, &row.ThreadKey, &row.RequesterUserID, &row.SessionPath, &row.Method, &row.MessageTS, &createdAt, &expiresAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return PendingUI{}, false, nil
@@ -151,8 +152,8 @@ func (s *Store) TakePendingUI(ctx context.Context, routeID string) (PendingUI, b
 	var createdAt, expiresAt int64
 	err = tx.QueryRowContext(ctx, `
         DELETE FROM pending_ui WHERE route_id = ?
-        RETURNING route_id, request_id, thread_key, session_path, method, message_ts, created_at, expires_at`,
-		routeID).Scan(&row.RouteID, &row.RequestID, &row.ThreadKey, &row.SessionPath, &row.Method,
+        RETURNING route_id, request_id, thread_key, requester_user_id, session_path, method, message_ts, created_at, expires_at`,
+		routeID).Scan(&row.RouteID, &row.RequestID, &row.ThreadKey, &row.RequesterUserID, &row.SessionPath, &row.Method,
 		&row.MessageTS, &createdAt, &expiresAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -175,6 +176,38 @@ func (s *Store) TakePendingUI(ctx context.Context, routeID string) (PendingUI, b
 	return row, true, nil
 }
 
+// UnownedPendingUI lists pre-migration routes whose requester is unknown. They
+// must be canceled, never answered, and remain available for retry if the
+// gateway cannot be reached during cleanup.
+func (s *Store) UnownedPendingUI(ctx context.Context) ([]PendingUI, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT route_id, request_id, thread_key, requester_user_id, session_path, method, message_ts, created_at, expires_at
+        FROM pending_ui WHERE requester_user_id = '' ORDER BY created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list unowned pending dialogs: %w", err)
+	}
+	defer rows.Close()
+
+	var pending []PendingUI
+	for rows.Next() {
+		var row PendingUI
+		var createdAt, expiresAt int64
+		if err := rows.Scan(&row.RouteID, &row.RequestID, &row.ThreadKey, &row.RequesterUserID, &row.SessionPath, &row.Method,
+			&row.MessageTS, &createdAt, &expiresAt); err != nil {
+			return nil, fmt.Errorf("store: read an unowned pending dialog: %w", err)
+		}
+		row.CreatedAt = time.Unix(createdAt, 0).UTC()
+		if expiresAt != 0 {
+			row.ExpiresAt = time.Unix(expiresAt, 0).UTC()
+		}
+		pending = append(pending, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list unowned pending dialogs: %w", err)
+	}
+	return pending, nil
+}
+
 // TakeExpiredPendingUI removes expired routes and refreshes their replay markers.
 // The caller marks still-pending Slack messages expired outside the DB call.
 func (s *Store) TakeExpiredPendingUI(ctx context.Context, now time.Time) ([]PendingUI, error) {
@@ -192,7 +225,7 @@ func (s *Store) TakeExpiredPendingUI(ctx context.Context, now time.Time) ([]Pend
 	}
 	rows, err := tx.QueryContext(ctx, `
         DELETE FROM pending_ui WHERE expires_at > 0 AND expires_at <= ?
-        RETURNING route_id, request_id, thread_key, session_path, method, message_ts, created_at, expires_at`, now.Unix())
+        RETURNING route_id, request_id, thread_key, requester_user_id, session_path, method, message_ts, created_at, expires_at`, now.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("store: expire pending dialogs: %w", err)
 	}
@@ -201,7 +234,7 @@ func (s *Store) TakeExpiredPendingUI(ctx context.Context, now time.Time) ([]Pend
 	for rows.Next() {
 		var row PendingUI
 		var createdAt, expiresAt int64
-		if err := rows.Scan(&row.RouteID, &row.RequestID, &row.ThreadKey, &row.SessionPath, &row.Method,
+		if err := rows.Scan(&row.RouteID, &row.RequestID, &row.ThreadKey, &row.RequesterUserID, &row.SessionPath, &row.Method,
 			&row.MessageTS, &createdAt, &expiresAt); err != nil {
 			return nil, fmt.Errorf("store: read an expired dialog: %w", err)
 		}
