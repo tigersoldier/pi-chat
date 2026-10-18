@@ -15,7 +15,7 @@ import (
 //
 // The first line of instructionText is this marker, so the text reads as prose
 // and is still findable.
-const instructionMarker = "(pi-chat instruction v2)"
+const instructionMarker = "(pi-chat instruction v3)"
 
 // instructionOpen and instructionClose wrap the instruction when it travels in a
 // message rather than in the system prompt, so the agent can tell the
@@ -59,6 +59,11 @@ To bring somebody into the conversation, mention them as <@U123> — that is wha
 the ID in a line, or in the request's own attribution, is for. Refer to people by
 name in prose. Answer in the thread rather than top-level, and answer for the room
 rather than for one person in it.
+
+Before editing, verify the requested project or component against the repository and
+worktree context available in this session. Do not choose a repository from a plausible
+name alone. If multiple similar candidates exist, or the intended target is unclear, ask
+the user before modifying files.
 
 Slack renders a small Markdown: *bold*, _italic_, ` + "`code`" + `, and fenced
 code blocks. Headings, tables and images do not render.

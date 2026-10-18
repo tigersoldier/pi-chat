@@ -222,6 +222,19 @@ func TestTheInstructionExplainsTheTranscript(t *testing.T) {
 	}
 }
 
+func TestTheInstructionVerifiesProjectContextBeforeEditing(t *testing.T) {
+	text := strings.Join(strings.Fields(instructionText), " ")
+	for _, want := range []string{
+		"Before editing, verify the requested project or component against the repository and worktree context available in this session.",
+		"Do not choose a repository from a plausible name alone.",
+		"If multiple similar candidates exist, or the intended target is unclear, ask the user before modifying files.",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the instruction no longer contains the project-context safety rule %q", want)
+		}
+	}
+}
+
 // countFlag counts how many times a long flag appears, in either spelling.
 func countFlag(args []string, flag string) int {
 	n := 0
