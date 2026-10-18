@@ -125,10 +125,13 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	}
 
 	allowed := b.allowed(m.UserID, m.Thread.Channel)
-	if m.Mentioned || m.Direct {
-		b.acknowledgeRequest(ctx, m, allowed)
+	acknowledge := func(allowed bool) {
+		if m.Mentioned || m.Direct {
+			b.acknowledgeRequest(ctx, m, allowed)
+		}
 	}
 	if !allowed {
+		acknowledge(false)
 		b.refuse(ctx, m.UserID, m.Thread.Channel, &m.Thread, "")
 		return
 	}
@@ -139,6 +142,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	if strings.TrimSpace(m.Text) == "" && len(m.Files) > 0 {
 		reader, ok := b.plat.(ImageReader)
 		if !ok || !reader.CanReadImage(m.Thread.Channel) {
+			acknowledge(true)
 			b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
 				Text: "This platform cannot read attachments — send the text instead."})
 			return
@@ -147,6 +151,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 
 	th, err := b.threadFor(m.Thread)
 	if err != nil {
+		acknowledge(true)
 		// Without the stored state a prompt could create a second session for a
 		// thread that already has one, so this is a refusal, not a risk to take.
 		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID,
@@ -157,6 +162,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	// `@pi /status` is a command, not a prompt: the vocabulary is resolved
 	// before anything reaches the agent (DESIGN.md §5).
 	if m.Mentioned && strings.HasPrefix(strings.TrimSpace(m.Text), "/") {
+		acknowledge(true)
 		b.dispatch(ctx, Command{
 			Thread:    &m.Thread,
 			Channel:   m.Thread.Channel,
@@ -173,6 +179,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 		// A bare mention: the user introduced the bot without asking anything.
 		// Answering costs nothing, and it is how the grammar is discovered from
 		// inside Slack.
+		acknowledge(true)
 		b.reply(ctx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: mentionHelp})
 		return
 	}
@@ -182,6 +189,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m Message) {
 	// spend a turn to be told the obvious (DESIGN.md §5, rule 3).
 	if m.Mentioned {
 		if name := bareControlName(m.Text); name != "" {
+			acknowledge(true)
 			b.reply(ctx, Notice{Thread: &m.Thread, Ephemeral: true, UserID: m.UserID,
 				Text: "Did you mean `@pi /" + name + "`?"})
 			return

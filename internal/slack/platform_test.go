@@ -232,6 +232,27 @@ func TestQueueRequestAddsQueueMarkerWhenEyesRemovalFails(t *testing.T) {
 	}
 }
 
+func TestStartRequestAddsEyesWhenNotQueued(t *testing.T) {
+	const currentTS = "1700000000.000300"
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "conversations.replies" {
+			return repliesBody(`{"ts":"`+currentTS+`","user":"U1"}`, false, "")
+		}
+		return ""
+	}}
+	platform := testPlatformWithIdentity(t, stub, Identity{TeamID: "T1", UserID: "UBOT"})
+	message := testMessage()
+	message.TS = currentTS
+
+	if err := platform.StartRequest(context.Background(), message, false); err != nil {
+		t.Fatalf("StartRequest: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) < 2 || calls[0].method != "reactions.add" || calls[0].params["timestamp"] != currentTS || calls[0].params["name"] != "eyes" {
+		t.Fatalf("calls = %+v, want eyes added before the history scan", calls)
+	}
+}
+
 func TestQueuedRequestLifecycleCleansOwnStaleReactions(t *testing.T) {
 	const replies = `{"ok":true,"messages":[` +
 		`{"ts":"1700000000.000100","user":"U1","reactions":[` +
