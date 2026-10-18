@@ -99,14 +99,17 @@ func (p *Platform) QueueRequest(ctx context.Context, m bot.Message) error {
 	return p.transitionRequestReaction(ctx, m, "eyes", "hourglass_flowing_sand")
 }
 
-// StartRequest promotes a queued request to eyes and removes this install's old
-// request reactions. The posted-message ledger is authoritative on this surface:
-// daemon messages are authored by the same Slack user, so cleanup only considers
+// StartRequest marks an immediate request with eyes or promotes a queued
+// request from the queue marker to eyes, then removes this install's old request
+// reactions. The posted-message ledger is authoritative on this surface: daemon
+// messages are authored by the same Slack user, so cleanup only considers
 // messages younger than the ledger TTL minus its pruning safety grace.
 func (p *Platform) StartRequest(ctx context.Context, m bot.Message, queued bool) error {
 	var result error
 	if queued {
 		result = p.transitionRequestReaction(ctx, m, "hourglass_flowing_sand", "eyes")
+	} else if err := p.api.AddReaction(ctx, m.Thread.Channel, m.TS, "eyes"); err != nil && !slack.IsCode(err, "already_reacted") {
+		result = fmt.Errorf("add the eyes request reaction: %w", err)
 	}
 	if p.id.UserID == "" {
 		return result

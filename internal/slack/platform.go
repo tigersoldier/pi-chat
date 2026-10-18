@@ -189,15 +189,18 @@ func (p *Platform) QueueRequest(ctx context.Context, m bot.Message) error {
 	return p.transitionRequestReaction(ctx, m, "eyes", "hourglass_flowing_sand")
 }
 
-// StartRequest removes this install's old request reactions from prior user
-// messages, then promotes a queued request to eyes. Thread replies are paged
-// through the current request, and direct-message root history is paged through
-// all earlier roots. Both scans process one Slack page at a time; the caller's
-// bounded context is the only scan limit.
+// StartRequest marks an immediate request with eyes or promotes a queued
+// request from the queue marker to eyes, then removes this install's old request
+// reactions from prior user messages. Thread replies are paged through the
+// current request, and direct-message root history is paged through all earlier
+// roots. Both scans process one Slack page at a time; the caller's bounded
+// context is the only scan limit.
 func (p *Platform) StartRequest(ctx context.Context, m bot.Message, queued bool) error {
 	var result error
 	if queued {
 		result = p.transitionRequestReaction(ctx, m, "hourglass_flowing_sand", "eyes")
+	} else if err := p.api.AddReaction(ctx, m.Thread.Channel, m.TS, "eyes"); err != nil && !IsCode(err, "already_reacted") {
+		result = fmt.Errorf("add the eyes request reaction: %w", err)
 	}
 	if p.id.UserID == "" {
 		return result

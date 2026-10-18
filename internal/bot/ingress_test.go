@@ -142,7 +142,7 @@ func TestOnlyAddressedMessagesAreClaimed(t *testing.T) {
 	}
 }
 
-func TestAddressedMessageIsAcknowledgedBeforeAuthorizationOutcome(t *testing.T) {
+func TestAcceptedPromptsWaitForQueueOrStartBeforeAcknowledging(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		userID  string
@@ -164,18 +164,25 @@ func TestAddressedMessageIsAcknowledgedBeforeAuthorizationOutcome(t *testing.T) 
 
 			b.HandleMessage(context.Background(), message)
 
-			acks := platform.acknowledgedRequests()
-			if len(acks) != 1 || acks[0].allowed != tc.allowed || acks[0].message.TS != message.TS {
-				t.Fatalf("acknowledgements = %+v, want one for the addressed message with allowed=%v", acks, tc.allowed)
-			}
 			if tc.allowed {
+				if acks := platform.acknowledgedRequests(); len(acks) != 0 {
+					t.Fatalf("accepted prompt received an ingress acknowledgement: %+v", acks)
+				}
 				waitFor(t, "the turn", func() bool { return platform.startedTurns() == 1 })
+				waitFor(t, "the started reaction", func() bool { return len(platform.startedRequests()) == 1 })
+				if got := platform.startedRequests()[0]; got.message.TS != message.TS || got.queued {
+					t.Errorf("started request = %+v, want the immediate turn for %s", got, message.TS)
+				}
 				if len(platform.postedNotices()) != 0 {
 					t.Errorf("allowlisted request produced a refusal: %+v", platform.postedNotices())
 				}
 				return
 			}
 
+			acks := platform.acknowledgedRequests()
+			if len(acks) != 1 || acks[0].allowed || acks[0].message.TS != message.TS {
+				t.Fatalf("acknowledgements = %+v, want one denial acknowledgement", acks)
+			}
 			if platform.startedTurns() != 0 {
 				t.Error("a request from outside the allowlist started a turn")
 			}
@@ -184,6 +191,33 @@ func TestAddressedMessageIsAcknowledgedBeforeAuthorizationOutcome(t *testing.T) 
 				t.Errorf("notices = %+v, want a private refusal to the sender", notices)
 			}
 		})
+	}
+}
+
+func TestQueuedPromptGetsQueueMarkerWithoutIngressAcknowledgement(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	message := newTestMessage("Ev1", "please help")
+	message.TS = "1700000000.000200"
+	active := newPromptTurnState()
+	th.cur.Store(active)
+	th.turnMu.Lock()
+
+	b.HandleMessage(context.Background(), message)
+	waitFor(t, "queued request marker", func() bool { return len(platform.queuedRequests()) == 1 })
+	if acks := platform.acknowledgedRequests(); len(acks) != 0 {
+		t.Fatalf("queued prompt got an eyes acknowledgement before its queue marker: %+v", acks)
+	}
+	if starts := platform.startedRequests(); len(starts) != 0 {
+		t.Fatalf("queued request started before the active turn finished: %+v", starts)
+	}
+
+	th.cur.CompareAndSwap(active, nil)
+	active.finish()
+	th.turnMu.Unlock()
+	waitFor(t, "queued request start", func() bool { return len(platform.startedRequests()) == 1 })
+	if got := platform.startedRequests()[0]; got.message.TS != message.TS || !got.queued {
+		t.Errorf("started request = %+v, want queued message %s", got, message.TS)
 	}
 }
 

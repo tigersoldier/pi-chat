@@ -109,6 +109,41 @@ func TestSelfDMRequestLifecycleThroughProductionMux(t *testing.T) {
 	}
 }
 
+func TestSelfDMStartRequestAddsEyesWhenNotQueued(t *testing.T) {
+	current := selfDMTestTS(time.Now().Add(-time.Minute))
+	surface, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
+		"conversations.history": func(url.Values) string { return `{"ok":true,"messages":[]}` },
+		"conversations.replies": func(url.Values) string {
+			return `{"ok":true,"messages":[{"ts":"` + current + `","user":"U1"}]}`
+		},
+		"reactions.add": func(url.Values) string { return `{"ok":true}` },
+	})
+	message := bot.Message{
+		Thread: bot.Thread{Workspace: "T1", Channel: "D1", ThreadTS: current},
+		UserID: "U1", Workspace: "T1", TS: current, Direct: true,
+	}
+
+	if err := surface.plat.StartRequest(context.Background(), message, false); err != nil {
+		t.Fatalf("StartRequest: %v", err)
+	}
+	calls := recordedCalls(stub)
+	addAt, repliesAt := -1, -1
+	for i, call := range calls {
+		if call.method == "reactions.add" {
+			addAt = i
+			if call.params.Get("timestamp") != current || call.params.Get("name") != "eyes" {
+				t.Errorf("reaction add = %+v, want eyes on current request", call.params)
+			}
+		}
+		if call.method == "conversations.replies" {
+			repliesAt = i
+		}
+	}
+	if addAt < 0 || repliesAt < 0 || addAt > repliesAt {
+		t.Fatalf("calls = %+v, want eyes added before history cleanup", calls)
+	}
+}
+
 func TestSelfDMRequestCleanupFailsClosedOnPostedLedgerError(t *testing.T) {
 	base := time.Now().Add(-3 * time.Minute)
 	uncertain := selfDMTestTS(base)
@@ -121,6 +156,7 @@ func TestSelfDMRequestCleanupFailsClosedOnPostedLedgerError(t *testing.T) {
 	surface, _, stub, state := surfaceFor(t, map[string]func(url.Values) string{
 		"conversations.history": func(url.Values) string { return `{"ok":true,"messages":[]}` },
 		"conversations.replies": func(url.Values) string { return replies },
+		"reactions.add":         func(url.Values) string { return `{"ok":true}` },
 		"reactions.remove":      func(url.Values) string { return `{"ok":true}` },
 	})
 	failed := &postedLedgerError{memState: state, ts: uncertain}
@@ -165,6 +201,7 @@ func TestSelfDMRootRequestCleanupSkipsNearLedgerCutoffThroughProductionMux(t *te
 		"conversations.replies": func(url.Values) string {
 			return `{"ok":true,"messages":[{"ts":"` + current + `","user":"U1"}]}`
 		},
+		"reactions.add":    func(url.Values) string { return `{"ok":true}` },
 		"reactions.remove": func(url.Values) string { return `{"ok":true}` },
 	})
 	state.markPosted(daemon)
