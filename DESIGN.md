@@ -284,7 +284,7 @@ rather than once per turn.
   after a successful compaction — which is what can summarize it away.
 - **Whether it is already installed is asked of the catalog**, not guessed from the
   session's name: `gw_list_sessions[].spawn["append-system-prompt"]` is searched for the
-  instruction's own marker (`(pi-chat instruction v2)`). A session created before this
+  instruction's own marker (`(pi-chat instruction v3)`). A session created before this
   instruction version has pi-chat's name and no current marker, and would otherwise never
   get the update. A catalog that cannot answer means it is sent — a repetition costs a few
   hundred tokens, while a session that never learns how its prompts are shaped misreads

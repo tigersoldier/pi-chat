@@ -312,7 +312,7 @@ for.
       builds for sessions we create, and prefix it to the first prompt we send in an
       adopted session inside `<slack-specific-instructions>` markers — re-sent after an
       observed `compaction_end`, never per turn
-      — built: `internal/bot/instruction.go` (the text, the `(pi-chat instruction v2)` marker
+      — built: `internal/bot/instruction.go` (the text, the `(pi-chat instruction v3)` marker
       that identifies it, and `appendSystemPrompt`, which coalesces the configured
       `pi_args` and the project's injected prompt into **one** flag instead of risking
       two), the catalog check for whether a session already carries it
