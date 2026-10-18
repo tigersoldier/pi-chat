@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -136,6 +137,103 @@ func TestResumeNoticeExplainsWhenChatToolsAreUnavailable(t *testing.T) {
 	active := b.resumeNoticeForSession(ctx, thread, row, false)
 	if strings.Contains(active.Text, "Chat tools are not available") {
 		t.Fatalf("an active session binding was reported unavailable: %q", active.Text)
+	}
+}
+
+func TestResumeOpeningMessageUsesTheHumanCandidateLabelAndLastResponse(t *testing.T) {
+	row := gwclient.SessionRow{
+		Name: "opaque-session-name", Title: "What broke in the test?",
+		ID:   "550e8400-e29b-41d4-a716-446655440000",
+		Path: "/sessions/550e8400-e29b-41d4-a716-446655440000.jsonl",
+		Cwd:  "/home/pi/code/thing",
+	}
+	response := "The test failed because the resumed session did not load its state."
+
+	got := resumeOpeningMessage(row, response)
+	want := "Resuming from session " + sessionLabel(row) + ".\n" +
+		"Here is the last agent response in that session:\n\n" + response
+	if got != want {
+		t.Fatalf("resume opening = %q, want %q", got, want)
+	}
+	for _, unwanted := range []string{row.ID, row.Path, filepath.Base(row.Path), row.Name, row.Cwd} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("resume opening leaked %q: %q", unwanted, got)
+		}
+	}
+}
+
+func TestResumeOpeningMessagePreservesMrkdwnAsPlainTextContent(t *testing.T) {
+	row := gwclient.SessionRow{Title: "Please use <!channel> *bold*", Cwd: "/work/repo"}
+	response := "Keep <!channel>, *bold*, `code`, and <https://example.test|link> as written."
+	got := resumeOpeningMessage(row, response)
+	for _, dynamic := range []string{row.Title, response} {
+		if !strings.Contains(got, dynamic) {
+			t.Errorf("opening changed dynamic plain text %q: %q", dynamic, got)
+		}
+	}
+}
+
+func TestResumeOpeningMessageOmitsResponsesWithSessionIdentifiers(t *testing.T) {
+	row := gwclient.SessionRow{
+		Title: "Fix the queue", ID: "opaque-session-id",
+		Path: "/sessions/opaque-session-id.jsonl", Cwd: "/work/queue",
+	}
+	for _, response := range []string{
+		"The session id is `opaque-session-id`.",
+		"The session id is opaque-*session*-id.",
+		"The source file is /sessions/opaque-session-id.jsonl.",
+		"The source file is /sessions/opaque-*session*-id.jsonl.",
+		"The agent found 550e8400-e29b-41d4-a716-446655440000 in the log.",
+		"The agent referenced another transcript.jsonl file.",
+	} {
+		t.Run(response, func(t *testing.T) {
+			got := resumeOpeningMessage(row, response)
+			if !strings.Contains(got, resumeResponseOmitted) {
+				t.Fatalf("unsafe response was not explained: %q", got)
+			}
+			if strings.Contains(got, response) {
+				t.Errorf("unsafe response was included: %q", got)
+			}
+			for _, unwanted := range []string{row.ID, row.Path, filepath.Base(row.Path), ".jsonl", "550e8400-e29b-41d4-a716-446655440000"} {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("opening leaked %q: %q", unwanted, got)
+				}
+			}
+		})
+	}
+}
+
+func TestResumeOpeningMessageBoundsOversizedResponseWithoutSplittingUTF8(t *testing.T) {
+	row := gwclient.SessionRow{Title: "Fix the queue", Cwd: "/work/queue"}
+	response := strings.Repeat("🧪", 12000)
+	got := resumeOpeningMessage(row, response)
+	if len(got) > resumeOpeningMaxBytes {
+		t.Fatalf("resume opening is %d bytes, max %d", len(got), resumeOpeningMaxBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("resume opening is not valid UTF-8 after truncation")
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("oversized response was not marked as truncated: %q", got[len(got)-12:])
+	}
+	if !strings.Contains(got, "Here is the last agent response in that session:\n\n") {
+		t.Fatalf("opening lost its response introduction: %q", got[:100])
+	}
+}
+
+func TestResumeOpeningMessageDegradesWithoutHumanLabelOrResponse(t *testing.T) {
+	row := gwclient.SessionRow{
+		ID:   "550e8400-e29b-41d4-a716-446655440000",
+		Path: "/sessions/550e8400-e29b-41d4-a716-446655440000.jsonl",
+	}
+	got := resumeOpeningMessage(row, " \n ")
+	if got != "Resuming a session." {
+		t.Fatalf("resume opening = %q, want a generic opening without a response", got)
+	}
+	for _, unwanted := range []string{row.ID, row.Path, filepath.Base(row.Path), ".jsonl"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("generic resume opening leaked %q: %q", unwanted, got)
+		}
 	}
 }
 

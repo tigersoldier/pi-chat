@@ -998,10 +998,19 @@ func (b *Bot) resumeSession(ctx context.Context, a Action) {
 		return
 	}
 
+	// Read the previous answer before opening the thread so it can be part of
+	// the root message. This read is only context for the new thread: failure or
+	// an empty session must not prevent adoption.
+	lastResponse, err := b.gw.LastAssistantText(ctx, chosen.Path)
+	if err != nil {
+		b.log.Debug("cannot read the last assistant response while adopting a session", "error", err)
+		lastResponse = ""
+	}
+
 	// A session lives in a thread and this command was not in one, so the
 	// thread has to be opened before it can be bound (DESIGN.md §5: picking a
 	// session opens a thread and binds it).
-	thread, err := b.plat.OpenThread(ctx, a.Channel, "Adopting the session `"+sessionName(*chosen)+"`")
+	thread, err := b.plat.OpenThread(ctx, a.Channel, resumeOpeningMessage(*chosen, lastResponse))
 	if err != nil {
 		b.answer(ctx, r, "I cannot open a thread for it: "+err.Error())
 		return
@@ -1136,8 +1145,10 @@ func (b *Bot) resumeRetiredSession(ctx context.Context, a Action) {
 // DM to mention the bot, or somebody in a channel to just type, leaves them
 // talking to a bot that is listening for something else (DESIGN.md §5).
 const (
-	continueInChannel = "Continue in this thread by mentioning me: `@pi <what to do>`."
-	continueInDM      = "This is a direct message: just type here to continue."
+	continueInChannel     = "Continue in this thread by mentioning me: `@pi <what to do>`."
+	continueInDM          = "This is a direct message: just type here to continue."
+	resumeOpeningMaxBytes = 38000 // Slack's practical text limit with room to spare.
+	resumeResponseOmitted = "The last agent response was omitted because it contained session identifiers."
 )
 
 // resumeNotice is what an adopted thread says. It carries the thread's channel as
@@ -1150,6 +1161,135 @@ func (b *Bot) resumeNoticeForSession(ctx context.Context, t Thread, row gwclient
 		notice.Text += "\n" + note
 	}
 	return notice
+}
+
+// resumeOpeningMessage is the adopted session's new thread root. The picker
+// label is useful here, but its last-resort filename/name fallbacks are not: an
+// adoption message must not turn an opaque session identifier into chat text.
+func resumeOpeningMessage(row gwclient.SessionRow, response string) string {
+	label := resumeSessionLabel(row)
+	opening := "Resuming a session."
+	if label != "" {
+		opening = "Resuming from session " + label + "."
+	}
+	if response = strings.TrimSpace(response); response != "" {
+		if exposesSessionIdentifier(response, row) {
+			return opening + "\n" + resumeResponseOmitted
+		}
+		prefix := "\nHere is the last agent response in that session:\n\n"
+		opening += prefix + truncateResumeResponse(response, resumeOpeningMaxBytes-len(opening)-len(prefix))
+	}
+	return opening
+}
+
+func truncateResumeResponse(response string, maxBytes int) string {
+	response = strings.ToValidUTF8(response, "\uFFFD")
+	if len(response) <= maxBytes {
+		return response
+	}
+	const ellipsis = "…"
+	budget := maxBytes - len(ellipsis)
+	if budget < 0 {
+		return ""
+	}
+	for budget > 0 && !utf8.RuneStart(response[budget]) {
+		budget--
+	}
+	return response[:budget] + ellipsis
+}
+
+func resumeSessionLabel(row gwclient.SessionRow) string {
+	// sessionLabel is also used for picker buttons. Only use its title/name
+	// fallback when that fallback is human-readable; never use its final file
+	// fallback as the identity of an adopted session.
+	title := firstSentence(row.Title)
+	if title == "" {
+		title = strings.TrimSpace(row.Name)
+	}
+	if title == "" || exposesSessionIdentifier(title, row) {
+		return ""
+	}
+	label := sessionLabel(row)
+	if exposesSessionIdentifier(label, row) {
+		return ""
+	}
+	return label
+}
+
+func exposesSessionIdentifier(text string, row gwclient.SessionRow) bool {
+	text = normalizeSlackMrkdwn(text)
+	if strings.Contains(strings.ToLower(text), ".jsonl") || containsUUID(text) {
+		return true
+	}
+	if id := normalizeSlackMrkdwn(row.ID); id != "" && containsIdentifierToken(text, id) {
+		return true
+	}
+	for _, identifier := range []string{row.Path, filepath.Base(row.Path)} {
+		identifier = normalizeSlackMrkdwn(identifier)
+		if identifier != "" && identifier != "." && strings.Contains(text, identifier) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSlackMrkdwn(text string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '*', '_', '~', '`', '<', '>', '|', '\\':
+			return -1
+		default:
+			return r
+		}
+	}, text)
+}
+
+func containsIdentifierToken(text, identifier string) bool {
+	for offset := 0; offset <= len(text)-len(identifier); {
+		index := strings.Index(text[offset:], identifier)
+		if index < 0 {
+			return false
+		}
+		start := offset + index
+		end := start + len(identifier)
+		if (start == 0 || !isIdentifierByte(text[start-1])) &&
+			(end == len(text) || !isIdentifierByte(text[end])) {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
+}
+
+func isIdentifierByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || c == '_' || c == '-'
+}
+
+func containsUUID(s string) bool {
+	for start := 0; start+36 <= len(s); start++ {
+		end := start + 36
+		if start > 0 && isHexDigit(s[start-1]) || end < len(s) && isHexDigit(s[end]) {
+			continue
+		}
+		valid := true
+		for i := start; i < end; i++ {
+			switch i - start {
+			case 8, 13, 18, 23:
+				valid = valid && s[i] == '-'
+			default:
+				valid = valid && isHexDigit(s[i])
+			}
+		}
+		if valid {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 func (b *Bot) chatToolsUnavailableNotice(ctx context.Context, sessionPath string) string {

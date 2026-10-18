@@ -34,6 +34,9 @@ const stopTimeout = 30 * time.Second
 type gateway interface {
 	// Sessions lists the session catalog, newest first.
 	Sessions(ctx context.Context) ([]gwclient.SessionRow, error)
+	// LastAssistantText reads the last assistant answer from a session without
+	// changing its history.
+	LastAssistantText(ctx context.Context, path string) (string, error)
 	// Status describes the daemon for /pi status.
 	Status(ctx context.Context) string
 }
@@ -133,6 +136,27 @@ func (c *connector) Sessions(ctx context.Context) ([]gwclient.SessionRow, error)
 		return nil, fmt.Errorf("read the session catalog: %w", err)
 	}
 	return rows, nil
+}
+
+// LastAssistantText reads a session's current last answer through a temporary
+// observe connection. It does not prompt or otherwise change the session.
+func (c *connector) LastAssistantText(ctx context.Context, path string) (string, error) {
+	client, err := c.connect(ctx, "resume preview")
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
+	defer cancel()
+	if _, err := client.SwitchSession(ctx, path); err != nil {
+		return "", fmt.Errorf("attach to the session for its last answer: %w", err)
+	}
+	text, err := client.GetLastAssistantText(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read the last assistant answer: %w", err)
+	}
+	return text, nil
 }
 
 // Status is the gateway half of /pi status: whether it answers, which pi it
