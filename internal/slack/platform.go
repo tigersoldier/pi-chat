@@ -311,6 +311,37 @@ const (
 	streamClosed
 )
 
+func streamStateName(state streamState) string {
+	switch state {
+	case streamNone:
+		return "none"
+	case streamActive:
+		return "active"
+	case streamUnknown:
+		return "unknown"
+	case streamClosed:
+		return "closed"
+	default:
+		return "invalid"
+	}
+}
+
+// setStreamState is called while r.mu is held and logs only actual transitions.
+func (r *renderer) setStreamState(next streamState, reason string) {
+	previous := r.streamState
+	if previous == next {
+		return
+	}
+	r.streamState = next
+	if r.log != nil {
+		r.log.Debug("Slack reply stream state changed",
+			"message_ts", r.ts,
+			"from", streamStateName(previous),
+			"to", streamStateName(next),
+			"reason", reason)
+	}
+}
+
 // renderer writes one turn into one thread. Streaming is preferred and patching
 // a message is the fallback, so a workspace or thread that refuses
 // chat.startStream still gets an answer (DESIGN.md §6).
@@ -344,7 +375,8 @@ func (r *renderer) Start(ctx context.Context) error {
 		r.streamAttempted = true
 		ts, err := r.startStream(ctx, nil)
 		if err == nil {
-			r.ts, r.streamState = ts, streamActive
+			r.ts = ts
+			r.setStreamState(streamActive, "start_stream")
 			return nil
 		}
 		r.log.Warn("cannot stream into this thread; patching one message instead", "error", err)
@@ -404,7 +436,8 @@ func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) 
 		if err != nil {
 			return fmt.Errorf("start task stream: %w", err)
 		}
-		r.ts, r.streamState = ts, streamActive
+		r.ts = ts
+		r.setStreamState(streamActive, "task_start_stream")
 		return nil
 	}
 	if r.streamState != streamActive {
@@ -467,7 +500,8 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 		if err := r.appendStream(ctx, text); err == nil {
 			return nil
 		} else {
-			r.log.Warn("streaming failed; deferring message fallback until closure", "error", err)
+			r.log.Warn("streaming failed; deferring message fallback until closure",
+				"message_ts", r.ts, "stream_state", streamStateName(r.streamState), "error", err)
 			r.streamTextIncomplete = true
 			r.noteAppendFailure(err)
 			if r.streamState != streamClosed {
@@ -512,6 +546,13 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 		r.text.WriteString(final)
 		return nil
 	}
+	if r.log != nil {
+		r.log.Debug("finishing Slack reply",
+			"message_ts", r.ts,
+			"stream_state", streamStateName(r.streamState),
+			"final_matches_streamed", final == streamed,
+			"stream_text_incomplete", r.streamTextIncomplete)
+	}
 	if r.streamMayBeActive() {
 		if err := r.stopStream(ctx); err != nil {
 			return fmt.Errorf("stop the stream before finishing the reply: %w", err)
@@ -532,6 +573,12 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 	defer r.mu.Unlock()
 
 	text := failureText(r.text.String(), cause)
+	if r.log != nil {
+		r.log.Debug("reporting Slack reply failure",
+			"message_ts", r.ts,
+			"stream_state", streamStateName(r.streamState),
+			"has_partial_text", r.text.Len() > 0)
+	}
 
 	if r.streamMayBeActive() {
 		if err := r.stopStream(ctx); err != nil {
@@ -599,10 +646,10 @@ func (r *renderer) appendStream(ctx context.Context, text string) error {
 // effect on Slack's stream state is unknown. Neither case discards the ts.
 func (r *renderer) noteAppendFailure(err error) {
 	if streamAlreadyStopped(err) {
-		r.streamState = streamClosed
+		r.setStreamState(streamClosed, "append_reported_already_stopped")
 		return
 	}
-	r.streamState = streamUnknown
+	r.setStreamState(streamUnknown, "append_outcome_unknown")
 }
 
 func (r *renderer) streamMayBeActive() bool {
@@ -622,14 +669,22 @@ func (r *renderer) stopStream(ctx context.Context) error {
 	if r.ts == "" || !r.streamMayBeActive() {
 		return nil
 	}
+	if r.log != nil {
+		r.log.Debug("stopping Slack reply stream",
+			"message_ts", r.ts, "stream_state", streamStateName(r.streamState))
+	}
 	if err := r.api.StopStream(ctx, r.channel, r.ts); err != nil {
 		if streamAlreadyStopped(err) {
-			r.streamState = streamClosed
+			r.setStreamState(streamClosed, "stop_reported_already_stopped")
 			return nil
+		}
+		if r.log != nil {
+			r.log.Warn("cannot confirm Slack reply stream closure",
+				"message_ts", r.ts, "stream_state", streamStateName(r.streamState), "error", err)
 		}
 		return err
 	}
-	r.streamState = streamClosed
+	r.setStreamState(streamClosed, "stop_succeeded")
 	return nil
 }
 
@@ -648,13 +703,29 @@ func (r *renderer) patch(ctx context.Context) error {
 	// The update response is authoritative evidence that the message is still
 	// streaming. Never post a second reply or retry the update until closure is
 	// confirmed.
-	r.streamState = streamUnknown
+	previousState := r.streamState
+	r.setStreamState(streamUnknown, "update_conflict")
+	if r.log != nil {
+		r.log.Warn("Slack message update conflicted with an active stream",
+			"message_ts", r.ts,
+			"stream_state_before", streamStateName(previousState),
+			"stream_state", streamStateName(r.streamState),
+			"error", err)
+	}
 	if stopErr := r.stopStream(ctx); stopErr != nil {
 		return fmt.Errorf("update conflicted with an active stream (%v); stop it before retrying: %w", err, stopErr)
 	}
 	if err := r.api.UpdateMessage(ctx, r.channel, r.ts, text); err != nil {
 		if IsCode(err, "streaming_state_conflict") {
-			r.streamState = streamUnknown
+			previousState := r.streamState
+			r.setStreamState(streamUnknown, "retry_update_conflict")
+			if r.log != nil {
+				r.log.Warn("Slack message update still conflicted after stopping its stream",
+					"message_ts", r.ts,
+					"stream_state_before", streamStateName(previousState),
+					"stream_state", streamStateName(r.streamState),
+					"error", err)
+			}
 		}
 		return fmt.Errorf("update the message after stopping its stream: %w", err)
 	}

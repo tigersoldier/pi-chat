@@ -1,6 +1,7 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -770,6 +771,51 @@ func TestUpdateConflictStopsBeforeRetryingFallback(t *testing.T) {
 	}
 	if stops != 2 || updates != 2 {
 		t.Fatalf("stops/updates = %d/%d, want 2/2", stops, updates)
+	}
+}
+
+func TestStreamStateTransitionLogsTrackRecoveryWithoutReplyText(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	updates := 0
+	stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+		if method == "chat.update" {
+			updates++
+			if updates == 1 {
+				return "streaming_state_conflict"
+			}
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	r.log = log
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "private partial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "private final"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := logs.String()
+	for _, want := range []string{
+		"Slack reply stream state changed",
+		"from=none", "to=active", "reason=start_stream",
+		"finishing Slack reply", "final_matches_streamed=false",
+		"stopping Slack reply stream", "reason=stop_succeeded",
+		"to=unknown", "reason=update_conflict",
+		"Slack message update conflicted with an active stream", "message_ts=",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("logs do not contain %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "private partial") || strings.Contains(got, "private final") {
+		t.Fatalf("logs exposed reply text: %s", got)
 	}
 }
 

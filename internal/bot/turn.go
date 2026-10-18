@@ -727,8 +727,6 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 					"type", request.NotifyTypeOrInfo(), "text", stripANSI(request.Text))
 				return true
 			}
-			log.Debug("extension notification ignored",
-				"method", request.Method, "status_key", request.StatusKey)
 			return true
 		}
 		// The owner presents blocking dialogs outside the gateway reader and
@@ -1551,8 +1549,10 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 				go th.revokeDeletedSessionBinding(context.Background(), sessionPath)
 			}
 		}
-		th.log.Debug("ignoring an event from a session this thread no longer owns",
-			"type", ev.Type, "session", sessionPath)
+		if shouldLogGatewayEvent(ev) {
+			th.log.Debug("ignoring an event from a session this thread no longer owns",
+				"type", ev.Type, "session", sessionPath)
+		}
 		return
 	}
 	if epoch != th.sessionEpoch.Load() || th.sessionChanging.Load() {
@@ -1627,14 +1627,20 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 	if cur == nil {
 		// Text and lifecycle events alone do not establish an unsolicited
 		// response; agent_start above is the boundary for a live wake.
-		th.log.Debug("gateway event outside a turn", "type", ev.Type)
+		if shouldLogGatewayEvent(ev) {
+			th.log.Debug("gateway event outside a turn", "type", ev.Type)
+		}
 		return
 	}
 	if !cur.renderable.Load() {
-		th.log.Debug("gateway event before the prompt; dropping it", "type", ev.Type)
+		if shouldLogGatewayEvent(ev) {
+			th.log.Debug("gateway event before the prompt; dropping it", "type", ev.Type)
+		}
 		return
 	}
-	th.log.Debug("gateway event", "type", ev.Type)
+	if shouldLogGatewayEvent(ev) {
+		th.log.Debug("gateway event", "type", ev.Type)
+	}
 	if !cur.feed(ev, th.log) {
 		return
 	}
@@ -1644,6 +1650,12 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 			Options: request.Options, Placeholder: request.Placeholder, Prefill: request.Prefill,
 		}, request.TimeoutMS)
 	}
+}
+
+// shouldLogGatewayEvent omits high-volume stream fragments and fire-and-forget
+// extension UI requests; their useful diagnostics are logged separately.
+func shouldLogGatewayEvent(ev gwclient.Event) bool {
+	return ev.Type != "message_update" && ev.Type != "extension_ui_request"
 }
 
 // flush renders accumulated text until the turn ends. It creates the reply on
