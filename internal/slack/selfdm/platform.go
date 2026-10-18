@@ -16,6 +16,8 @@ import (
 )
 
 const (
+	requestReactionHistoryPageSize = 200
+
 	// placeholder is the patch-mode reply state until its first text update.
 	placeholder = "_pi is working…_"
 
@@ -81,6 +83,179 @@ func (p *Platform) StartTurn(_ context.Context, m bot.Message) (bot.Renderer, er
 		channel:  m.Thread.Channel,
 		threadTS: m.Thread.ThreadTS,
 	}, nil
+}
+
+// AcknowledgeRequest reacts to the user's request through the self-DM token.
+func (p *Platform) AcknowledgeRequest(ctx context.Context, m bot.Message, allowed bool) error {
+	reaction := "shrug"
+	if allowed {
+		reaction = "eyes"
+	}
+	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, reaction)
+}
+
+// QueueRequest marks an accepted request while it waits behind an active turn.
+func (p *Platform) QueueRequest(ctx context.Context, m bot.Message) error {
+	return p.transitionRequestReaction(ctx, m, "eyes", "hourglass_flowing_sand")
+}
+
+// StartRequest promotes a queued request to eyes and removes this install's old
+// request reactions. The posted-message ledger is authoritative on this surface:
+// daemon messages are authored by the same Slack user, so cleanup only considers
+// messages younger than the ledger TTL minus its pruning safety grace.
+func (p *Platform) StartRequest(ctx context.Context, m bot.Message, queued bool) error {
+	var result error
+	if queued {
+		result = p.transitionRequestReaction(ctx, m, "hourglass_flowing_sand", "eyes")
+	}
+	if p.id.UserID == "" {
+		return result
+	}
+
+	found, err := p.api.WalkRepliesUntil(ctx, m.Thread.Channel, m.Thread.ThreadTS, m.TS, func(prior slack.Message) error {
+		if compareTS(prior.TS, m.TS) >= 0 {
+			return nil
+		}
+		if err := p.removePriorRequestReactions(ctx, m.Thread.Channel, prior); err != nil && result == nil {
+			result = err
+		}
+		return nil // a reaction or ledger failure must not stop a best-effort scan
+	})
+	if err != nil && result == nil {
+		result = fmt.Errorf("read the self-DM thread's request reactions: %w", err)
+	} else if err == nil && !found && result == nil {
+		result = fmt.Errorf("request %s was not in the self-DM thread reply scan", m.TS)
+	}
+
+	if m.Direct && m.TS == m.Thread.ThreadTS {
+		cursor := ""
+		for {
+			history, err := p.api.HistoryCursorPage(ctx, m.Thread.Channel, m.TS, cursor, requestReactionHistoryPageSize)
+			if err != nil {
+				if result == nil {
+					result = fmt.Errorf("read earlier self-DM request reactions: %w", err)
+				}
+				break
+			}
+			for _, prior := range history.Messages {
+				if compareTS(prior.TS, m.TS) >= 0 {
+					continue
+				}
+				if err := p.removePriorRequestReactions(ctx, m.Thread.Channel, prior); err != nil && result == nil {
+					result = err
+				}
+			}
+			if !history.HasMore || history.NextCursor == "" {
+				break
+			}
+			cursor = history.NextCursor
+		}
+	}
+	return result
+}
+
+// CompleteRequest replaces the in-progress marker with a check mark.
+func (p *Platform) CompleteRequest(ctx context.Context, m bot.Message) error {
+	return p.replaceRequestReaction(ctx, m, "white_check_mark")
+}
+
+// FailRequest replaces the in-progress marker with a warning.
+func (p *Platform) FailRequest(ctx context.Context, m bot.Message) error {
+	return p.replaceRequestReaction(ctx, m, "warning")
+}
+
+func (p *Platform) removePriorRequestReactions(ctx context.Context, channel string, prior slack.Message) error {
+	if prior.TS == "" || prior.User != p.id.UserID || prior.User == "" || prior.BotID != "" || prior.Subtype != "" {
+		return nil
+	}
+	hasRequestReaction := false
+	for _, reaction := range prior.Reactions {
+		if selfDMRequestReaction(reaction.Name) && containsSelfDMUser(reaction.Users, p.id.UserID) {
+			hasRequestReaction = true
+			break
+		}
+	}
+	if !hasRequestReaction {
+		return nil
+	}
+	postedAt, ok := selfDMTimestamp(prior.TS)
+	if !ok || postedAt.Before(time.Now().Add(-(postedTTL - postedLedgerSafetyGrace))) {
+		p.log.Debug("preserving reactions on a self-DM message outside the posted-ledger safety window", "ts", prior.TS)
+		return nil
+	}
+	posted, err := p.state.SurfacePosted(ctx, SurfaceName, prior.TS)
+	if err != nil {
+		p.log.Warn("cannot check whether a self-DM message was posted by this daemon; preserving its reactions",
+			"ts", prior.TS, "error", err)
+		return fmt.Errorf("check the self-DM posted-message ledger for %s: %w", prior.TS, err)
+	}
+	if posted {
+		return nil
+	}
+	var result error
+	for _, reaction := range prior.Reactions {
+		if !selfDMRequestReaction(reaction.Name) || !containsSelfDMUser(reaction.Users, p.id.UserID) {
+			continue
+		}
+		if err := p.api.RemoveReaction(ctx, channel, prior.TS, reaction.Name); err != nil && !slack.IsCode(err, "no_reaction") && result == nil {
+			result = fmt.Errorf("remove stale self-DM %s reaction from %s: %w", reaction.Name, prior.TS, err)
+		}
+	}
+	return result
+}
+
+func (p *Platform) replaceRequestReaction(ctx context.Context, m bot.Message, next string) error {
+	for _, reaction := range []string{"eyes", "hourglass_flowing_sand"} {
+		if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, reaction); err != nil && !slack.IsCode(err, "no_reaction") {
+			return fmt.Errorf("remove self-DM in-progress %s reaction: %w", reaction, err)
+		}
+	}
+	return p.api.AddReaction(ctx, m.Thread.Channel, m.TS, next)
+}
+
+func (p *Platform) transitionRequestReaction(ctx context.Context, m bot.Message, old, next string) error {
+	var result error
+	if err := p.api.RemoveReaction(ctx, m.Thread.Channel, m.TS, old); err != nil && !slack.IsCode(err, "no_reaction") {
+		result = fmt.Errorf("remove self-DM %s request reaction: %w", old, err)
+	}
+	if err := p.api.AddReaction(ctx, m.Thread.Channel, m.TS, next); err != nil && !slack.IsCode(err, "already_reacted") && result == nil {
+		result = fmt.Errorf("add self-DM %s request reaction: %w", next, err)
+	}
+	return result
+}
+
+func selfDMTimestamp(ts string) (time.Time, bool) {
+	seconds, fraction, ok := strings.Cut(ts, ".")
+	if !ok || seconds == "" || fraction == "" || len(fraction) > 9 {
+		return time.Time{}, false
+	}
+	unixSeconds, err := strconv.ParseInt(seconds, 10, 64)
+	if err != nil || unixSeconds < 0 {
+		return time.Time{}, false
+	}
+	nanoseconds, err := strconv.ParseInt(fraction+strings.Repeat("0", 9-len(fraction)), 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(unixSeconds, nanoseconds), true
+}
+
+func selfDMRequestReaction(name string) bool {
+	switch name {
+	case "eyes", "hourglass_flowing_sand", "white_check_mark", "warning", "shrug":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsSelfDMUser(users []string, userID string) bool {
+	for _, user := range users {
+		if user == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // Post posts a notice — a command answer, a refusal, a hint or a picker.

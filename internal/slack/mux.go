@@ -106,6 +106,32 @@ func (m *MultiPlatform) AcknowledgeRequest(ctx context.Context, msg bot.Message,
 	return reporter.AcknowledgeRequest(ctx, msg, allowed)
 }
 
+// QueueRequest marks the request through the surface that owns its channel.
+func (m *MultiPlatform) QueueRequest(ctx context.Context, msg bot.Message) error {
+	platform, err := m.forChannel(msg.Thread.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.RequestQueueReporter)
+	if !ok {
+		return nil
+	}
+	return reporter.QueueRequest(ctx, msg)
+}
+
+// StartRequest updates the request through the surface that owns its channel.
+func (m *MultiPlatform) StartRequest(ctx context.Context, msg bot.Message, queued bool) error {
+	platform, err := m.forChannel(msg.Thread.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.RequestStartReporter)
+	if !ok {
+		return nil
+	}
+	return reporter.StartRequest(ctx, msg, queued)
+}
+
 // CompleteRequest reacts to the original message through its owning surface.
 func (m *MultiPlatform) CompleteRequest(ctx context.Context, msg bot.Message) error {
 	platform, err := m.forChannel(msg.Thread.Channel)

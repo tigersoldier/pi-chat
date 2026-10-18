@@ -1241,6 +1241,49 @@ func TestFlushRendersPendingText(t *testing.T) {
 	stop()
 }
 
+func TestQueuedRequestIsMarkedQueuedThenStarted(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	message := newTestMessage("queued-request", "hello")
+	message.TS = "1700000000.000200"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	platform.mu.Lock()
+	platform.onStart = cancel
+	platform.queueError = errors.New("queue reaction failed")
+	platform.requestStartError = errors.New("start reaction failed")
+	platform.mu.Unlock()
+
+	active := newPromptTurnState()
+	th.cur.Store(active)
+	th.turnMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- th.runTurn(ctx, message, &recordingRenderer{}) }()
+
+	waitFor(t, "queued request reaction", func() bool { return len(platform.queuedRequests()) == 1 })
+	if got := platform.startedRequests(); len(got) != 0 {
+		t.Fatalf("request started before the active turn finished: %+v", got)
+	}
+	th.cur.CompareAndSwap(active, nil)
+	active.finish()
+	th.turnMu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil || strings.Contains(err.Error(), "reaction failed") {
+			t.Errorf("runTurn error = %v, want the gateway setup failure, not a reaction callback failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued turn did not return after its start callback")
+	}
+
+	if got := platform.queuedRequests(); len(got) != 1 || got[0].TS != message.TS {
+		t.Errorf("queued requests = %+v, want the waiting message", got)
+	}
+	if got := platform.startedRequests(); len(got) != 1 || got[0].message.TS != message.TS || !got[0].queued {
+		t.Errorf("started requests = %+v, want the queued message marked as started", got)
+	}
+}
+
 func TestCanceledTurnMarksOriginalRequestFailed(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := testThread(t, b, st)

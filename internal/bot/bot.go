@@ -714,6 +714,44 @@ func (b *Bot) acknowledgeRequest(ctx context.Context, m Message, allowed bool) {
 	}
 }
 
+// queueRequest marks an addressed prompt while it waits for the active turn.
+// Like acknowledgement, this reaction is best-effort and never holds up work.
+func (b *Bot) queueRequest(ctx context.Context, m Message) {
+	if !requestHasReaction(m) {
+		return
+	}
+	reporter, ok := b.plat.(RequestQueueReporter)
+	if !ok {
+		return
+	}
+	reactionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestReactionTimeout)
+	defer cancel()
+	if err := reporter.QueueRequest(reactionCtx, m); err != nil {
+		b.log.Warn("cannot mark the request queued", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
+	}
+}
+
+// startRequest updates the request after it has acquired the turn slot and
+// clears old in-progress markers from the conversation. It is best-effort.
+func (b *Bot) startRequest(ctx context.Context, m Message, queued bool) {
+	if !requestHasReaction(m) {
+		return
+	}
+	reporter, ok := b.plat.(RequestStartReporter)
+	if !ok {
+		return
+	}
+	reactionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), requestReactionTimeout)
+	defer cancel()
+	if err := reporter.StartRequest(reactionCtx, m, queued); err != nil {
+		b.log.Warn("cannot mark the request started", "channel", m.Thread.Channel, "ts", m.TS, "error", err)
+	}
+}
+
+func requestHasReaction(m Message) bool {
+	return m.TS != "" && (m.Mentioned || m.Direct)
+}
+
 // completeRequest marks a successfully completed prompt on its original
 // message. It is best-effort like the acknowledgement sent when work starts.
 func (b *Bot) completeRequest(ctx context.Context, m Message) {

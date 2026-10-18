@@ -216,6 +216,278 @@ func TestAcknowledgeRequestReactsToOriginalMessage(t *testing.T) {
 	}
 }
 
+func TestQueueRequestAddsQueueMarkerWhenEyesRemovalFails(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"reactions.remove": "missing_scope"}}
+	platform := newTestPlatform(t, stub, "patch")
+	message := testMessage()
+	message.TS = "1700000000.000200"
+
+	if err := platform.QueueRequest(context.Background(), message); !IsCode(err, "missing_scope") {
+		t.Fatalf("QueueRequest error = %v, want missing_scope", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[0].params["name"] != "eyes" ||
+		calls[1].method != "reactions.add" || calls[1].params["name"] != "hourglass_flowing_sand" {
+		t.Fatalf("calls = %+v, want queued marker attempt despite failed eyes removal", calls)
+	}
+}
+
+func TestQueuedRequestLifecycleCleansOwnStaleReactions(t *testing.T) {
+	const replies = `{"ok":true,"messages":[` +
+		`{"ts":"1700000000.000100","user":"U1","reactions":[` +
+		`{"name":"eyes","users":["UBOT","U2"]},` +
+		`{"name":"hourglass_flowing_sand","users":["UBOT"]},` +
+		`{"name":"shrug","users":["UBOT"]},` +
+		`{"name":"white_check_mark","users":["UBOT"]},` +
+		`{"name":"warning","users":["UBOT"]},` +
+		`{"name":"heart","users":["U2"]}]},` +
+		`{"ts":"1700000000.000150","user":"UBOT","bot_id":"BPI","reactions":[{"name":"eyes","users":["UBOT"]}]},` +
+		`{"ts":"1700000000.000200","user":"U2","reactions":[{"name":"eyes","users":["U2"]}]},` +
+		`{"ts":"1700000000.000300","user":"U1","reactions":[{"name":"hourglass_flowing_sand","users":["UBOT"]}]}]}`
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "conversations.replies" {
+			return replies
+		}
+		return ""
+	}}
+	cfg := config.Defaults()
+	platform := NewPlatform(newStubAPI(t, stub), cfg,
+		Identity{TeamID: "T1", UserID: "UBOT", BotID: "BPI"}, discardLogger())
+	message := testMessage()
+	message.TS = "1700000000.000300"
+
+	if err := platform.AcknowledgeRequest(context.Background(), message, true); err != nil {
+		t.Fatalf("AcknowledgeRequest: %v", err)
+	}
+	if err := platform.QueueRequest(context.Background(), message); err != nil {
+		t.Fatalf("QueueRequest: %v", err)
+	}
+	if err := platform.StartRequest(context.Background(), message, true); err != nil {
+		t.Fatalf("StartRequest: %v", err)
+	}
+	if err := platform.CompleteRequest(context.Background(), message); err != nil {
+		t.Fatalf("CompleteRequest: %v", err)
+	}
+
+	calls := stub.recorded()
+	want := []struct {
+		method string
+		name   string
+		ts     string
+	}{
+		{"reactions.add", "eyes", message.TS},
+		{"reactions.remove", "eyes", message.TS},
+		{"reactions.add", "hourglass_flowing_sand", message.TS},
+		{"reactions.remove", "hourglass_flowing_sand", message.TS},
+		{"reactions.add", "eyes", message.TS},
+		{"conversations.replies", "", ""},
+		{"reactions.remove", "eyes", "1700000000.000100"},
+		{"reactions.remove", "hourglass_flowing_sand", "1700000000.000100"},
+		{"reactions.remove", "shrug", "1700000000.000100"},
+		{"reactions.remove", "white_check_mark", "1700000000.000100"},
+		{"reactions.remove", "warning", "1700000000.000100"},
+		{"reactions.remove", "eyes", message.TS},
+		{"reactions.remove", "hourglass_flowing_sand", message.TS},
+		{"reactions.add", "white_check_mark", message.TS},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %+v, want %d lifecycle calls", calls, len(want))
+	}
+	for i, expected := range want {
+		if calls[i].method != expected.method {
+			t.Errorf("call %d method = %q, want %q", i, calls[i].method, expected.method)
+		}
+		params := calls[i].params
+		if expected.method == "conversations.replies" {
+			if params["channel"] != message.Thread.Channel || params["ts"] != message.Thread.ThreadTS {
+				t.Errorf("replies params = %+v, want the request's thread", params)
+			}
+			continue
+		}
+		if params["timestamp"] != expected.ts || params["name"] != expected.name {
+			t.Errorf("call %d params = %+v, want timestamp=%q name=%q", i, params, expected.ts, expected.name)
+		}
+	}
+}
+
+func TestStartRequestFindsAnchorBeyondTranscriptReplyCap(t *testing.T) {
+	pages := make(map[string]string)
+	for page := range 4 {
+		messages := make([]string, 0, replyPageSize)
+		first := page*replyPageSize + 1
+		last := min(first+replyPageSize-1, 605)
+		for i := first; i <= last; i++ {
+			ts := fmt.Sprintf("1700000000.%06d", i)
+			var reactions string
+			switch i {
+			case 2:
+				reactions = `,"reactions":[{"name":"eyes","users":["UBOT"]}]`
+			case 602:
+				reactions = `,"reactions":[{"name":"white_check_mark","users":["UBOT"]}]`
+			case 603:
+				reactions = `,"reactions":[{"name":"warning","users":["UBOT"]}]`
+			case 604:
+				reactions = `,"reactions":[{"name":"shrug","users":["UBOT"]}]`
+			case 605:
+				reactions = `,"reactions":[{"name":"warning","users":["UBOT"]}]`
+			}
+			messages = append(messages, fmt.Sprintf(`{"ts":%q,"user":"U1"%s}`, ts, reactions))
+		}
+		cursor := ""
+		if page > 0 {
+			cursor = fmt.Sprintf("page-%d", page)
+		}
+		nextCursor := ""
+		if page < 3 {
+			nextCursor = fmt.Sprintf("page-%d", page+1)
+		}
+		pages[cursor] = repliesBody(strings.Join(messages, ","), page < 3, nextCursor)
+	}
+	stub := &stubSlack{bodies: func(method string, params map[string]any) string {
+		if method != "conversations.replies" {
+			return ""
+		}
+		cursor, _ := params["cursor"].(string)
+		return pages[cursor]
+	}}
+	platform := testPlatformWithIdentity(t, stub, Identity{TeamID: "T1", UserID: "UBOT"})
+	message := testMessage()
+	message.Thread.ThreadTS = "1700000000.000001"
+	message.TS = "1700000000.000605"
+
+	if err := platform.StartRequest(context.Background(), message, false); err != nil {
+		t.Fatalf("StartRequest: %v", err)
+	}
+	calls := stub.recorded()
+	if got := callsTo(stub, "conversations.replies"); got != 4 {
+		t.Fatalf("conversations.replies calls = %d, want four pages through the current request", got)
+	}
+	want := []struct{ ts, name string }{
+		{"1700000000.000002", "eyes"},
+		{"1700000000.000602", "white_check_mark"},
+		{"1700000000.000603", "warning"},
+		{"1700000000.000604", "shrug"},
+	}
+	removals := 0
+	for _, call := range calls {
+		if call.method != "reactions.remove" {
+			continue
+		}
+		if removals >= len(want) {
+			t.Fatalf("unexpected removal: %+v", call)
+		}
+		if call.params["timestamp"] != want[removals].ts || call.params["name"] != want[removals].name {
+			t.Errorf("removal %d = %+v, want timestamp=%q name=%q", removals, call.params, want[removals].ts, want[removals].name)
+		}
+		removals++
+	}
+	if removals != len(want) {
+		t.Fatalf("reaction removals = %d, want %d", removals, len(want))
+	}
+}
+
+func TestStartRequestCleansDMRootsBeyondOneHistoryPage(t *testing.T) {
+	historyPages := make(map[string]string)
+	for page := range 3 {
+		messages := make([]string, 0, historyPageSize)
+		newest := 499 - page*historyPageSize
+		oldest := max(newest-historyPageSize+1, 1)
+		for i := newest; i >= oldest; i-- {
+			ts := fmt.Sprintf("1700000000.%06d", i)
+			user := "U1"
+			botID := ""
+			var reactions string
+			switch i {
+			case 475:
+				user, botID = "U2", "B2"
+				reactions = `,"reactions":[{"name":"warning","users":["UBOT"]}]`
+			case 450:
+				user, botID = "UBOT", "BPI"
+				reactions = `,"reactions":[{"name":"eyes","users":["UBOT"]}]`
+			case 250:
+				reactions = `,"reactions":[{"name":"white_check_mark","users":["UBOT"]}]`
+			case 50:
+				reactions = `,"reactions":[{"name":"warning","users":["UBOT"]}]`
+			case 25:
+				reactions = `,"reactions":[{"name":"shrug","users":["U2"]}]`
+			}
+			messages = append(messages, fmt.Sprintf(`{"ts":%q,"user":%q,"bot_id":%q%s}`, ts, user, botID, reactions))
+		}
+		cursor := ""
+		if page > 0 {
+			cursor = fmt.Sprintf("history-%d", page)
+		}
+		nextCursor := ""
+		if page < 2 {
+			nextCursor = fmt.Sprintf("history-%d", page+1)
+		}
+		historyPages[cursor] = fmt.Sprintf(`{"ok":true,"messages":[%s],"has_more":%t,"response_metadata":{"next_cursor":%q}}`,
+			strings.Join(messages, ","), page < 2, nextCursor)
+	}
+	stub := &stubSlack{bodies: func(method string, params map[string]any) string {
+		switch method {
+		case "conversations.replies":
+			return repliesBody(`{"ts":"1700000000.000500","user":"U1","reactions":[{"name":"warning","users":["UBOT"]}]}`, false, "")
+		case "conversations.history":
+			cursor, _ := params["cursor"].(string)
+			return historyPages[cursor]
+		}
+		return ""
+	}}
+	platform := testPlatformWithIdentity(t, stub, Identity{TeamID: "T1", UserID: "UBOT", BotID: "BPI"})
+	message := testMessage()
+	message.TS = "1700000000.000500"
+	message.Thread.ThreadTS = message.TS
+	message.Direct = true
+
+	if err := platform.StartRequest(context.Background(), message, false); err != nil {
+		t.Fatalf("StartRequest: %v", err)
+	}
+	calls := stub.recorded()
+	var historyCalls []stubCall
+	for _, call := range calls {
+		if call.method == "conversations.history" {
+			historyCalls = append(historyCalls, call)
+		}
+	}
+	if len(historyCalls) != 3 {
+		t.Fatalf("history pages = %d, want all three pages of earlier DM roots", len(historyCalls))
+	}
+	for i, call := range historyCalls {
+		if call.params["channel"] != message.Thread.Channel || call.params["latest"] != message.TS || call.params["limit"] != "200" {
+			t.Errorf("history page %d params = %+v, want the channel and current-message anchor", i, call.params)
+		}
+		wantCursor := ""
+		if i > 0 {
+			wantCursor = fmt.Sprintf("history-%d", i)
+		}
+		cursor, _ := call.params["cursor"].(string)
+		if cursor != wantCursor {
+			t.Errorf("history page %d cursor = %q, want %q", i, cursor, wantCursor)
+		}
+	}
+	want := []struct{ ts, name string }{
+		{"1700000000.000250", "white_check_mark"},
+		{"1700000000.000050", "warning"},
+	}
+	removals := 0
+	for _, call := range calls {
+		if call.method != "reactions.remove" {
+			continue
+		}
+		if removals >= len(want) {
+			t.Fatalf("unexpected reaction removal: %+v", call)
+		}
+		if call.params["timestamp"] != want[removals].ts || call.params["name"] != want[removals].name {
+			t.Errorf("removal %d = %+v, want timestamp=%q name=%q", removals, call.params, want[removals].ts, want[removals].name)
+		}
+		removals++
+	}
+	if removals != len(want) {
+		t.Fatalf("reaction removals = %d, want %d", removals, len(want))
+	}
+}
+
 func TestCompleteRequestReactsToOriginalMessage(t *testing.T) {
 	stub := &stubSlack{}
 	platform := newTestPlatform(t, stub, "patch")
@@ -226,10 +498,10 @@ func TestCompleteRequestReactsToOriginalMessage(t *testing.T) {
 		t.Fatalf("CompleteRequest: %v", err)
 	}
 	calls := stub.recorded()
-	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[1].method != "reactions.add" {
-		t.Fatalf("calls = %+v, want reactions.remove eyes followed by reactions.add checkmark", calls)
+	if len(calls) != 3 || calls[0].method != "reactions.remove" || calls[1].method != "reactions.remove" || calls[2].method != "reactions.add" {
+		t.Fatalf("calls = %+v, want removal of both in-progress reactions followed by checkmark", calls)
 	}
-	for i, want := range []string{"eyes", "white_check_mark"} {
+	for i, want := range []string{"eyes", "hourglass_flowing_sand", "white_check_mark"} {
 		params := calls[i].params
 		if params["channel"] != message.Thread.Channel || params["timestamp"] != message.TS || params["name"] != want {
 			t.Errorf("%s params = %+v, want channel=%q timestamp=%q name=%q",
@@ -248,8 +520,10 @@ func TestCompleteRequestAddsCheckWhenEyesAreAlreadyAbsent(t *testing.T) {
 		t.Fatalf("CompleteRequest without an eyes reaction: %v", err)
 	}
 	calls := stub.recorded()
-	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[1].method != "reactions.add" || calls[1].params["name"] != "white_check_mark" {
-		t.Fatalf("calls = %+v, want missing eyes tolerated before adding checkmark", calls)
+	if len(calls) != 3 || calls[0].method != "reactions.remove" || calls[0].params["name"] != "eyes" ||
+		calls[1].method != "reactions.remove" || calls[1].params["name"] != "hourglass_flowing_sand" ||
+		calls[2].method != "reactions.add" || calls[2].params["name"] != "white_check_mark" {
+		t.Fatalf("calls = %+v, want both absent in-progress reactions tolerated before adding checkmark", calls)
 	}
 }
 
@@ -279,9 +553,10 @@ func TestFailRequestReplacesEyesWithWarning(t *testing.T) {
 		t.Fatalf("FailRequest: %v", err)
 	}
 	calls := stub.recorded()
-	if len(calls) != 2 || calls[0].method != "reactions.remove" || calls[0].params["name"] != "eyes" ||
-		calls[1].method != "reactions.add" || calls[1].params["name"] != "warning" {
-		t.Fatalf("calls = %+v, want remove eyes before adding warning", calls)
+	if len(calls) != 3 || calls[0].method != "reactions.remove" || calls[0].params["name"] != "eyes" ||
+		calls[1].method != "reactions.remove" || calls[1].params["name"] != "hourglass_flowing_sand" ||
+		calls[2].method != "reactions.add" || calls[2].params["name"] != "warning" {
+		t.Fatalf("calls = %+v, want both in-progress reactions removed before adding warning", calls)
 	}
 }
 
