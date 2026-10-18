@@ -63,6 +63,36 @@ func (m *MultiPlatform) Post(ctx context.Context, n bot.Notice) error {
 	return platform.Post(ctx, n)
 }
 
+// PresentApproval posts a blocking UI prompt through the owning Slack surface.
+func (m *MultiPlatform) PresentApproval(ctx context.Context, thread bot.Thread, request bot.ApprovalRequest, buttons []bot.Button) (string, error) {
+	platform, err := m.forChannel(thread.Channel)
+	if err != nil {
+		return "", err
+	}
+	reporter, ok := platform.(bot.ApprovalReporter)
+	if !ok {
+		return "", fmt.Errorf("slack: surface for channel %s cannot present approvals", thread.Channel)
+	}
+	return reporter.PresentApproval(ctx, thread, request, buttons)
+}
+
+// OpenApprovalModal uses the interaction handle from the owning surface.
+func (m *MultiPlatform) OpenApprovalModal(ctx context.Context, thread bot.Thread, handle, routeID string, request bot.ApprovalRequest) error {
+	platform, err := m.forChannel(thread.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.ApprovalReporter)
+	if !ok {
+		return fmt.Errorf("slack: surface for channel %s cannot open approval modals", thread.Channel)
+	}
+	return reporter.OpenApprovalModal(ctx, thread, handle, routeID, request)
+}
+
+// MaxApprovalChoices returns the adapter's choice capacity. Both configured
+// surfaces use Slack's Block Kit message limits.
+func (m *MultiPlatform) MaxApprovalChoices() int { return approvalMaxChoices }
+
 // AcknowledgeRequest reacts to the message through the surface that owns it.
 func (m *MultiPlatform) AcknowledgeRequest(ctx context.Context, msg bot.Message, allowed bool) error {
 	platform, err := m.forChannel(msg.Thread.Channel)

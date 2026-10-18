@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 8
+const schemaVersion = 9
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -82,10 +82,14 @@ CREATE TABLE IF NOT EXISTS seen (
 );
 
 CREATE TABLE IF NOT EXISTS pending_ui (
-    dialog_id  TEXT PRIMARY KEY,
-    thread_key TEXT NOT NULL,
-    message_ts TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL
+    route_id    TEXT PRIMARY KEY,
+    request_id  TEXT NOT NULL,
+    thread_key  TEXT NOT NULL,
+    session_path TEXT NOT NULL DEFAULT '',
+    method      TEXT NOT NULL DEFAULT '',
+    message_ts  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS admissions (
@@ -226,6 +230,22 @@ var migrations = []struct {
 		`ALTER TABLE shutdown_pending ADD COLUMN notice_entry_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE shutdown_pending ADD COLUMN posted INTEGER NOT NULL DEFAULT 0 CHECK (posted IN (0, 1))`,
 	}},
+	{to: 9, stmt: []string{
+		`CREATE TABLE IF NOT EXISTS pending_ui (
+            dialog_id  TEXT PRIMARY KEY,
+            thread_key TEXT NOT NULL,
+            message_ts TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        )`,
+		`ALTER TABLE pending_ui RENAME COLUMN dialog_id TO route_id`,
+		`ALTER TABLE pending_ui ADD COLUMN request_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_ui ADD COLUMN session_path TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_ui ADD COLUMN method TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_ui ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE pending_ui SET request_id = route_id, expires_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE request_id = ''`,
+		`INSERT OR IGNORE INTO seen (event_id, received_at)
+            SELECT 'ui-route:' || route_id, created_at FROM pending_ui`,
+	}},
 }
 
 // Store is the open database.
@@ -362,6 +382,7 @@ var versionStatements = map[int]string{
 	6: "PRAGMA user_version = 6",
 	7: "PRAGMA user_version = 7",
 	8: "PRAGMA user_version = 8",
+	9: "PRAGMA user_version = 9",
 }
 
 // recordVersion stamps the schema version on the same executor as the schema

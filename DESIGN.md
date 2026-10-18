@@ -590,9 +590,11 @@ Constraints and behaviours:
     plain bot without the scope, or a workspace without the agent feature — is asked once
     and then left alone, exactly like the status.
 
-    **Still open:** `rename` titles, `suspended` while a turn waits for a human answer,
-    and `closed` on `/delete` — the first two land with phase 2's approvals, the third
-    with its delete.
+    **Approval status is implemented:** the core moves a turn to `waiting` while a human
+    response is outstanding, which Slack renders as `suspended`; a successful answer moves it
+    back to `processing`, and timeout or cancellation follows the turn's normal completion.
+
+    **Still open:** `rename` titles and `closed` on `/delete`.
 
     The scopes, precisely: `agents.sessions.setStatus` and `agents.sessions.rename` need
     **`chat:write` alone** — the agent surface is not what buys `assistant:write`.
@@ -613,10 +615,12 @@ Constraints and behaviours:
   - *Dialogs* — `select`, `confirm`, `input`, `editor` — need an answer and are routed
     to the **author of the running turn**, so the bot receives the ones it caused.
     `confirm`/`select` → Block Kit buttons carrying the dialog id; `input`/`editor` → a
-    modal via the interaction's `trigger_id`; `pending_ui` (§7) maps a click back to
-    `RespondUI`. If the same session is being driven from pilish, the dialog goes to
-    *that* author instead and the bot never sees it — so the bot must never assume it
-    owns approvals, and must treat `ui_stale` on a late response as normal.
+    modal via an adapter-owned interaction handle (`views.open` requires no extra OAuth
+    scope); `pending_ui` (§7) maps a click back to `RespondUI`. It stores routing metadata
+    only, not dialog text or choices. If the
+    same session is being driven from pilish, the dialog goes to *that* author instead and
+    the bot never sees it — so the bot must never assume it owns approvals, and must treat
+    `ui_stale` on a late response as normal.
   - *Fire-and-forget* — `notify`, `setStatus`, `setWidget`, `setTitle`,
     `set_editor_text` — are **broadcast and must never be answered**. Map `setStatus`
     and `setTitle` onto the Slack status/title; drop the rest. Phase 0 logs them at
@@ -629,8 +633,9 @@ Constraints and behaviours:
 - **Strip ANSI escapes** (and control characters) from every string a pi extension
   supplies before it reaches Slack — observed `setStatus.statusText` carries raw SGR
   sequences (`\x1b[38;5;241m…`), and Block Kit renders them literally.
-- An unanswered dialog eventually resolves through pi's own timeout; the bot marks it
-  expired rather than letting the thread stall silently.
+- A dialog with an explicit Pi timeout is retired at that deadline. Without one, the bot
+  does not invent a shorter local deadline: its route stays available until Pi accepts a
+  response or reports the request stale, so cleanup cannot strand Pi waiting.
 - **Admission notices** ("queued — waiting for a free slot") are posted in-thread; the
   Slack ack always happens inside 3 s, before any work.
 
@@ -653,7 +658,8 @@ threads(thread_key PK,            -- app: workspace:channel:thread_ts; self_dm: 
         created_at, last_active)
 
 seen(event_id PK, received_at)    -- inbound dedupe (TTL sweep); see the rule below
-pending_ui(dialog_id PK, thread_key, message_ts, created_at)
+pending_ui(route_id PK, request_id, thread_key, session_path, method,
+          message_ts, created_at, expires_at)
 admissions(id PK, thread_key, text, event_id, queued_at)
 retired(session_path PK,          -- a session /new replaced, kept resumable
         thread_key, session_name, project_dir, observed_ts, last_seq, leaf_id, retired_at)
@@ -665,9 +671,12 @@ session_tool_bindings(session_path PK, -- separate read-tool authority
 Rules:
 
 - **No conversation content is stored in SQLite** — no transcripts, assistant text or
-  tool output. `admissions` holds text only until dispatch. Chat-tool bindings store only
-  session/origin identity, capabilities and extension version. Pi's normal session file
-  remains the record of tool results.
+  tool output. `admissions` holds text only until dispatch. `pending_ui` stores only the
+  opaque route id, original gateway request id, owning thread/session, method, Slack message
+  timestamp and expiry — not dialog text, options or answers. The route id is derived from
+  the owning thread/session and gateway event sequence because gateway request ids are only
+  session-local. Chat-tool bindings store only session/origin identity, capabilities and
+  extension version. Pi's normal session file remains the record of tool results.
 - **The one exception is deliberate and bounded**: when a prompt had to drop or shorten
   part of a conversation, the whole of it is written to
   `<state dir>/threads/<session name>/observed-<ts>.md` and the prompt names the file.
@@ -677,11 +686,12 @@ Rules:
   text: the database stores how far the conversation has been read, never what it said.
 - **Persist before acking** anything that mutates state, so a crash cannot lose an acked
   message.
-- **`seen` is mandatory**, not an optimisation, and it holds two kinds of key: a
+- **`seen` is mandatory**, not an optimisation, and it holds three kinds of key: a
   **message's** identity — `msg:<workspace>:<channel>:<ts>`, which is what a turn is
-  claimed under — and, for input a message cannot identify (a slash command, a button,
-  an event the platform gave no timestamp), the event or envelope id. A message is the
-  unit of work, and one message can arrive as several events: Slack reports a mention
+  claimed under; for input a message cannot identify (a slash command, a button, an event
+  the platform gave no timestamp), the event or envelope id; and `ui-route:<route id>` to
+  prevent a replayed gateway dialog from resurrecting a completed approval for one day. A
+  message is the unit of work, and one message can arrive as several events: Slack reports a mention
   both as `app_mention` and as `message.channels`, with the same `ts` and two different
   `event_id`s. Claiming by event id spent two turns, and posted two answers, on one
   request. A failure to *write* the claim blocks the turn: running the prompt once, late,
@@ -692,11 +702,11 @@ Rules:
   writes a new message. The column is there so the recovery path is a change of
   policy rather than a migration.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
-- **The current schema writes `threads`, `seen`, and optional session-tool bindings.** A
+- **The current schema writes `threads`, `seen`, session-tool bindings, and pending UI routes.** A
   new tool-enabled session commits its thread row and binding in one transaction before
   the first prompt. `pending_ui` and `admissions` are created with the rest of the schema
   and are written when dialogs and queueing are enabled. The database carries a schema
-  version (currently 6) and refuses to open one written by a newer pi-chat.
+  version (currently 9) and refuses to open one written by a newer pi-chat.
 - **Schema changes are migrations**, not a new schema: `init` migrates a database whose
   `user_version` is behind, stamping each step's version only after its statements
   succeed, so a failure is retried on the next start rather than half-applied. A fresh

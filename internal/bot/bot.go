@@ -52,6 +52,10 @@ type Bot struct {
 	coldPollAfter  map[string]time.Time
 	coldPollCursor string
 	closed         bool
+
+	uiMu         sync.Mutex
+	uiRequests   map[string]ApprovalRequest
+	uiResponding map[string]struct{}
 }
 
 // New builds a Bot. The caller keeps ownership of cfg, log, plat and st, and
@@ -78,6 +82,8 @@ func New(cfg *config.Config, log *slog.Logger, plat Platform, st *store.Store, v
 		life:          conn,
 		threads:       make(map[string]*thread),
 		coldPollAfter: make(map[string]time.Time),
+		uiRequests:    make(map[string]ApprovalRequest),
+		uiResponding:  make(map[string]struct{}),
 	}
 }
 
@@ -211,6 +217,10 @@ func (b *Bot) HandleAction(ctx context.Context, a Action) {
 	if !b.claim(ctx, a.EventID) {
 		return
 	}
+	if isApprovalAction(a.ActionID) {
+		b.handleApprovalAction(ctx, a)
+		return
+	}
 	if !b.allowed(a.UserID, a.Channel) {
 		b.refuse(ctx, a.UserID, a.Channel, a.Thread, a.ReplyTo)
 		return
@@ -310,6 +320,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	defer sweep.Stop()
 	prune := time.NewTicker(pruneInterval)
 	defer prune.Stop()
+	b.expirePendingUI(ctx)
 
 	for {
 		select {
@@ -320,6 +331,7 @@ func (b *Bot) Run(ctx context.Context) error {
 			b.Close()
 			return ctx.Err()
 		case <-sweep.C:
+			b.expirePendingUI(ctx)
 			b.CheckShutdownResponses(ctx)
 			b.closeIdle(ctx)
 			b.pollColdSessions(ctx)

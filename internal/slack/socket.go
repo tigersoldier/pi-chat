@@ -23,6 +23,7 @@ var errLinkDisabled = errors.New("slack: socket mode is disabled for this app")
 // Envelope is one Socket Mode frame: an inbound payload plus the connection's
 // own control messages (`hello`, `disconnect`).
 type Envelope struct {
+	ReceivedAt             time.Time       `json:"-"`
 	EnvelopeID             string          `json:"envelope_id"`
 	Type                   string          `json:"type"`
 	Payload                json.RawMessage `json:"payload"`
@@ -157,6 +158,7 @@ func (s *Socket) session(ctx context.Context) error {
 			return fmt.Errorf("slack asked for a reconnect: %s", env.Reason)
 
 		default:
+			env.ReceivedAt = time.Now()
 			// Acknowledge before doing anything else: Slack retries an
 			// envelope it has not seen acknowledged within three seconds.
 			if err := ack(sessCtx, conn, env.EnvelopeID); err != nil {

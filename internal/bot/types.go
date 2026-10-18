@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/tigersoldier/pi-gateway/protocol"
 )
@@ -16,6 +17,15 @@ const platformName = "slack"
 const (
 	SurfaceApp    = "app"
 	SurfaceSelfDM = "self_dm"
+)
+
+const (
+	ActionUIConfirmYes = "ui_confirm_yes"
+	ActionUIConfirmNo  = "ui_confirm_no"
+	ActionUISelect     = "ui_select"
+	ActionUIOpenModal  = "ui_open_modal"
+	ActionUISubmit     = "ui_submit"
+	ActionUICancel     = "ui_cancel"
 )
 
 // Thread identifies one conversation. A session is always thread-scoped, so a
@@ -173,6 +183,31 @@ type Action struct {
 	// replace it instead of leaving a stale picker behind.
 	MessageTS string
 	ReplyTo   string
+	// ApprovalHandle is an adapter-owned, short-lived handle for opening a
+	// response form. ApprovalHandleExpiresAt is its conservative local deadline.
+	ApprovalHandle          string
+	ApprovalHandleExpiresAt time.Time
+	RouteID                 string // opaque pending-dialog route carried by buttons and modal state
+}
+
+// ApprovalRequest is one blocking UI request from a pi extension. Its content
+// is rendered for the user but is never persisted in SQLite.
+type ApprovalRequest struct {
+	ID          string // original pi gateway request id (session-local)
+	Method      string
+	Title       string
+	Message     string
+	Options     []string
+	Placeholder string
+	Prefill     string
+}
+
+// ApprovalReporter is implemented by surfaces that can present button-based
+// approvals and open the corresponding input modal.
+type ApprovalReporter interface {
+	PresentApproval(ctx context.Context, thread Thread, request ApprovalRequest, buttons []Button) (string, error)
+	OpenApprovalModal(ctx context.Context, thread Thread, handle, routeID string, request ApprovalRequest) error
+	MaxApprovalChoices() int
 }
 
 // Said is one message of a thread's conversation: something said by somebody

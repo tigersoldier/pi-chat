@@ -192,14 +192,14 @@ func TestPostSendsButtonsAsAnActionsBlock(t *testing.T) {
 }
 
 func TestBlocksForCapsButtons(t *testing.T) {
-	buttons := make([]bot.Button, buttonLimit+3)
+	buttons := make([]bot.Button, noticeButtonLimit+3)
 	for i := range buttons {
 		buttons[i] = bot.Button{ActionID: "x", Text: "b", Value: "v"}
 	}
 	blocks := blocksFor(buttons)
 	elements := blocks[0]["elements"].([]block)
-	if len(elements) != buttonLimit {
-		t.Fatalf("rendered %d buttons, want Slack's cap of %d", len(elements), buttonLimit)
+	if len(elements) != noticeButtonLimit {
+		t.Fatalf("rendered %d buttons, want the notice cap of %d", len(elements), noticeButtonLimit)
 	}
 	// A notice without buttons has no blocks: an empty actions block is
 	// rejected by Slack.
