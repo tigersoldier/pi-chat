@@ -921,23 +921,44 @@ func uiEvent(t *testing.T, body string) gwclient.Event {
 func TestFireAndForgetUINeedsNoAnswer(t *testing.T) {
 	// pi-lens emits setStatus on every turn, `--approve` does not silence it,
 	// and nothing waits for an answer. Warning about it would train the reader
-	// to ignore warnings.
+	// to ignore warnings, while per-request debug records add no useful signal.
 	log, logs := captureLogger()
+	th := &thread{log: log}
 	st := newTurnState()
-	st.feed(uiEvent(t, `"id":"1","method":"setStatus","statusKey":"pi-lens-lsp",`+
-		`"statusText":"\u001b[38;5;241mLSP Inactive\u001b[39m"`), log)
+	st.renderable.Store(true)
+	th.cur.Store(st)
+	th.onEvent(uiEvent(t, `"id":"1","method":"setStatus","statusKey":"pi-lens-lsp",`+
+		`"statusText":"\u001b[38;5;241mLSP Inactive\u001b[39m"`))
 
-	if strings.Contains(logs.String(), "level=WARN") {
-		t.Fatalf("a fire-and-forget request should not warn: %s", logs.String())
-	}
-	if !strings.Contains(logs.String(), "setStatus") {
-		t.Fatalf("it should still be visible at debug level: %s", logs.String())
+	if got := logs.String(); got != "" {
+		t.Fatalf("an ignored fire-and-forget request should not be logged: %s", got)
 	}
 	// It is not a turn boundary either.
 	select {
 	case <-st.doneCh:
 		t.Fatal("a notification must not end the turn")
 	default:
+	}
+}
+
+func TestMessageUpdateDebugRecordsAreSuppressed(t *testing.T) {
+	log, logs := captureLogger()
+	th := &thread{log: log}
+	st := newTurnState()
+	st.renderable.Store(true)
+	th.cur.Store(st)
+
+	th.onEvent(textDelta(t, "streamed answer"))
+	if got := st.text(); got != "streamed answer" {
+		t.Fatalf("message_update was not applied: %q", got)
+	}
+	if got := logs.String(); got != "" {
+		t.Fatalf("message_update emitted a debug record: %s", got)
+	}
+
+	th.onEvent(toolEvent(t, "tool_execution_start", "call-1", "bash", false))
+	if got := logs.String(); !strings.Contains(got, "gateway event") || !strings.Contains(got, "tool_execution_start") {
+		t.Fatalf("actionable tool lifecycle event should remain visible: %s", got)
 	}
 }
 
