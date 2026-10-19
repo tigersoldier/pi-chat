@@ -1,6 +1,6 @@
 ---
 name: investigate-pi-chat-slack-session
-description: Trace a Slack thread through pi-chatd to its bound Pi session and pi-gatewayd logs. Use when investigating missing, duplicated, delayed, or stuck Slack replies, stream-state errors, or session/restart behavior.
+description: Investigate pi-chat bugs from a supplied Slack message or thread by tracing its handling through pi-chatd to the corresponding Pi session and relevant pi-gatewayd logs.
 ---
 
 # Investigate a pi-chat Slack session
