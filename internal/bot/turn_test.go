@@ -81,8 +81,8 @@ func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 	st.feed(end, log)
 
 	updates := st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Running a command" || updates[0].Status != TaskInProgress {
-		t.Fatalf("in-progress task update = %+v", updates)
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Running a command" || updates[0].Status != TaskInProgress || updates[0].Details != "" {
+		t.Fatalf("in-progress task update = %+v, want no rolling details", updates)
 	}
 	if strings.Contains(updates[0].Title, "do-not-share") {
 		t.Fatal("tool arguments or output leaked into the progress title")
@@ -112,8 +112,8 @@ func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T)
 
 	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
 	updates := st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].Title != "Checking current service logs" || updates[0].Details != "Progress so far:\n• Checking current service logs" {
-		t.Fatalf("start updates = %+v, want concise title and safe expanded details", updates)
+	if len(updates) != 1 || updates[0].Title != "Checking current service logs" || updates[0].Details != "" {
+		t.Fatalf("start updates = %+v, want concise title without rolling details", updates)
 	}
 	if got := st.text(); strings.Contains(got, progressMarkerOpen) {
 		t.Fatalf("progress marker leaked into reply text %q", got)
@@ -257,8 +257,8 @@ func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
 		st := newTurnState()
 		st.feed(textDelta(t, "[[slack-progress: "+marker+"]]"), discardLogger())
 		st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
-		if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" || got[0].Details != "Progress so far:\n• Running a command" {
-			t.Fatalf("short-code marker %q was not safely replaced in title/details: %+v", marker, got)
+		if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" || got[0].Details != "" {
+			t.Fatalf("short-code marker %q was not safely replaced in title or leaked details: %+v", marker, got)
 		}
 	}
 }
@@ -533,8 +533,8 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	}
 
 	updates := st.takeTaskUpdates()
-	if len(updates) != 2 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Check step x" || updates[0].Status != TaskInProgress || updates[1].ID != turnProgressTaskID || updates[1].Title != "Check step "+strings.Repeat("x", 9) || updates[1].Status != TaskInProgress {
-		t.Fatalf("coalesced task updates = %+v, want first and latest in-progress titles", updates)
+	if len(updates) != 2 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Check step x" || updates[0].Status != TaskInProgress || updates[0].Details != "" || updates[1].ID != turnProgressTaskID || updates[1].Title != "Check step "+strings.Repeat("x", 9) || updates[1].Status != TaskInProgress || updates[1].Details != "" {
+		t.Fatalf("coalesced task updates = %+v, want first and latest in-progress titles without details", updates)
 	}
 	if len(st.activeTasks) != 1 || st.seenToolCalls.Len() != 9 {
 		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), st.seenToolCalls.Len())
