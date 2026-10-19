@@ -91,6 +91,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		active := th.cur.Load()
 		if active == nil {
 			st = newPromptTurnState()
+			st.requesterUserID = m.UserID
 			st.cancel = cancel
 			if th.cur.CompareAndSwap(nil, st) {
 				break
@@ -585,6 +586,7 @@ type turnState struct {
 	// promptReservation distinguishes a queued Slack prompt from an unsolicited
 	// turn so an early agent_start can be reserved and rendered separately.
 	promptReservation bool
+	requesterUserID   string // Slack user who started this prompt; empty for observed turns.
 
 	// firstTextCh wakes the renderer as soon as user-visible text arrives, so
 	// it can create a reply without showing an empty message during thinking.
@@ -1655,7 +1657,13 @@ func (th *thread) onSessionEventWithClient(sessionPath string, ev gwclient.Event
 		return
 	}
 	if request, ok := ev.UIRequest(); ok && request.Blocking {
-		go th.presentApproval(client, sessionPath, ev.Seq, ApprovalRequest{
+		if !cur.promptReservation {
+			// A session may also be driven by another client (for example pilish).
+			// Its dialog is not ours to cancel or route into Slack.
+			th.log.Debug("not routing a blocking dialog from a turn without a Slack requester", "method", request.Method)
+			return
+		}
+		go th.presentApproval(client, sessionPath, ev.Seq, cur.requesterUserID, ApprovalRequest{
 			ID: request.ID, Method: request.Method, Title: request.Title, Message: request.Message,
 			Options: request.Options, Placeholder: request.Placeholder, Prefill: request.Prefill,
 		}, request.TimeoutMS)

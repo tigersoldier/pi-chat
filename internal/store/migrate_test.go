@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,6 +66,38 @@ func writeV1Database(t *testing.T) string {
 	return path
 }
 
+func writeV9Database(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "state", "pi-chat.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create the directory: %v", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	defer db.Close()
+	v9Schema := strings.Replace(schema, "    requester_user_id TEXT NOT NULL DEFAULT '',\n", "", 1)
+	if v9Schema == schema {
+		t.Fatal("current schema does not contain the requester column")
+	}
+	if _, err := db.Exec(v9Schema); err != nil {
+		t.Fatalf("write the v9 schema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO pending_ui
+        (route_id, request_id, thread_key, session_path, method, message_ts, created_at, expires_at)
+        VALUES ('old-route', 'old-dialog', 'T1:C1:1.1', '/s/a.jsonl', 'input', '9.9', 1700000000, 0)`); err != nil {
+		t.Fatalf("insert v9 pending route: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO seen (event_id, received_at) VALUES ('ui-route:old-route', 1700000000)`); err != nil {
+		t.Fatalf("insert v9 route replay key: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 9"); err != nil {
+		t.Fatalf("stamp version 9: %v", err)
+	}
+	return path
+}
+
 // TestMigratesAVersionOneDatabase is the migration path's whole job: a database
 // written by an older build opens, keeps its rows, and gains the schema current
 // code reads and writes.
@@ -121,11 +154,46 @@ func TestMigratesAVersionOneDatabase(t *testing.T) {
 		t.Errorf("ObservedTS = %q, want the value just written", row.ObservedTS)
 	}
 	pending := PendingUI{
-		RouteID: "migrated-route", RequestID: "migrated-dialog", ThreadKey: row.ThreadKey, SessionPath: row.SessionPath,
+		RouteID: "migrated-route", RequestID: "migrated-dialog", ThreadKey: row.ThreadKey, RequesterUserID: "U1", SessionPath: row.SessionPath,
 		Method: "confirm", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
 	}
 	if inserted, err := s.PutPendingUI(ctx, pending); err != nil || !inserted {
 		t.Errorf("pending UI on a migrated v1 database = inserted %v, err %v", inserted, err)
+	}
+}
+
+func TestMigratesVersionNinePendingDialogsWithoutRequester(t *testing.T) {
+	ctx := context.Background()
+	path := writeV9Database(t)
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open a v9 database: %v", err)
+	}
+	defer s.Close()
+
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read the version: %v", err)
+	}
+	if version != 10 {
+		t.Fatalf("version after migration = %d, want 10", version)
+	}
+	legacy, found, err := s.PendingUI(ctx, "old-route")
+	if err != nil || !found {
+		t.Fatalf("legacy PendingUI = found %v, err %v", found, err)
+	}
+	if legacy.RequesterUserID != "" {
+		t.Fatalf("legacy requester = %q, want unknown", legacy.RequesterUserID)
+	}
+	unowned, err := s.UnownedPendingUI(ctx)
+	if err != nil || len(unowned) != 1 || unowned[0].RouteID != legacy.RouteID {
+		t.Fatalf("unowned pending routes = %+v, err %v", unowned, err)
+	}
+	if inserted, err := s.PutPendingUI(ctx, PendingUI{
+		RouteID: legacy.RouteID, RequestID: legacy.RequestID, ThreadKey: legacy.ThreadKey,
+		RequesterUserID: "U1", SessionPath: legacy.SessionPath, Method: legacy.Method,
+	}); err == nil || inserted {
+		t.Fatalf("legacy route was re-authorized: inserted=%v err=%v", inserted, err)
 	}
 }
 

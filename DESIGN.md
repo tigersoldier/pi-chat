@@ -617,8 +617,13 @@ Constraints and behaviours:
     to the **author of the running turn**, so the bot receives the ones it caused.
     `confirm`/`select` → Block Kit buttons carrying the dialog id; `input`/`editor` → a
     modal via an adapter-owned interaction handle (`views.open` requires no extra OAuth
-    scope); `pending_ui` (§7) maps a click back to `RespondUI`. It stores routing metadata
-    only, not dialog text or choices. If the
+    scope); `pending_ui` (§7) maps a click back to `RespondUI`. Each route is bound to the
+    Slack user who started the turn, and that identity is checked before opening a modal or
+    sending any response; another allowlisted thread member cannot answer it. The prompt
+    itself remains visible in the thread, but only its requester can open the input modal or
+    submit a response. Dialogs from a turn without a Slack requester are not routed into
+    Slack, and a requester-less prompt is canceled. The route stores routing metadata only,
+    not dialog text or choices. If the
     same session is being driven from pilish, the dialog goes to *that* author instead and
     the bot never sees it — so the bot must never assume it owns approvals, and must treat
     `ui_stale` on a late response as normal.
@@ -659,8 +664,8 @@ threads(thread_key PK,            -- app: workspace:channel:thread_ts; self_dm: 
         created_at, last_active)
 
 seen(event_id PK, received_at)    -- inbound dedupe (TTL sweep); see the rule below
-pending_ui(route_id PK, request_id, thread_key, session_path, method,
-          message_ts, created_at, expires_at)
+pending_ui(route_id PK, request_id, thread_key, requester_user_id,
+          session_path, method, message_ts, created_at, expires_at)
 admissions(id PK, thread_key, text, event_id, queued_at)
 retired(session_path PK,          -- a session /new replaced, kept resumable
         thread_key, session_name, project_dir, observed_ts, last_seq, leaf_id, retired_at)
@@ -673,10 +678,12 @@ Rules:
 
 - **No conversation content is stored in SQLite** — no transcripts, assistant text or
   tool output. `admissions` holds text only until dispatch. `pending_ui` stores only the
-  opaque route id, original gateway request id, owning thread/session, method, Slack message
-  timestamp and expiry — not dialog text, options or answers. The route id is derived from
-  the owning thread/session and gateway event sequence because gateway request ids are only
-  session-local. Chat-tool bindings store only session/origin identity, capabilities and
+  opaque route id, original gateway request id, owning thread/session, requester user ID,
+  method, Slack message timestamp and expiry — not dialog text, options or answers. The
+  requester ID is authorization metadata, not conversation content. Version-9 routes have
+  no recorded requester; the new build cancels them rather than guessing an owner. The route
+  id is derived from the owning thread/session and gateway event sequence because gateway
+  request ids are only session-local. Chat-tool bindings store only session/origin identity, capabilities and
   extension version. Pi's normal session file remains the record of tool results.
 - **The one exception is deliberate and bounded**: when a prompt had to drop or shorten
   part of a conversation, the whole of it is written to
@@ -707,7 +714,7 @@ Rules:
   new tool-enabled session commits its thread row and binding in one transaction before
   the first prompt. `pending_ui` and `admissions` are created with the rest of the schema
   and are written when dialogs and queueing are enabled. The database carries a schema
-  version (currently 9) and refuses to open one written by a newer pi-chat.
+  version (currently 10) and refuses to open one written by a newer pi-chat.
 - **Schema changes are migrations**, not a new schema: `init` migrates a database whose
   `user_version` is behind, stamping each step's version only after its statements
   succeed, so a failure is retried on the next start rather than half-applied. A fresh

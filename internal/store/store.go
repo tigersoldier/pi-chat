@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 9
+const schemaVersion = 10
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS pending_ui (
     route_id    TEXT PRIMARY KEY,
     request_id  TEXT NOT NULL,
     thread_key  TEXT NOT NULL,
+    requester_user_id TEXT NOT NULL DEFAULT '',
     session_path TEXT NOT NULL DEFAULT '',
     method      TEXT NOT NULL DEFAULT '',
     message_ts  TEXT NOT NULL DEFAULT '',
@@ -246,6 +247,12 @@ var migrations = []struct {
 		`INSERT OR IGNORE INTO seen (event_id, received_at)
             SELECT 'ui-route:' || route_id, created_at FROM pending_ui`,
 	}},
+	{to: 10, stmt: []string{
+		// Persist who initiated each blocking dialog so later Slack interactions
+		// remain requester-bound across daemon restarts. Legacy routes stay blank
+		// and are canceled by the bot rather than authorized to an unknown user.
+		`ALTER TABLE pending_ui ADD COLUMN requester_user_id TEXT NOT NULL DEFAULT ''`,
+	}},
 }
 
 // Store is the open database.
@@ -374,15 +381,16 @@ func (s *Store) migrate(ctx context.Context, from int) error {
 // of this package reviewable. TestVersionStatementsCoverEverySchema fails when a
 // new schema version forgets its entry.
 var versionStatements = map[int]string{
-	1: "PRAGMA user_version = 1",
-	2: "PRAGMA user_version = 2",
-	3: "PRAGMA user_version = 3",
-	4: "PRAGMA user_version = 4",
-	5: "PRAGMA user_version = 5",
-	6: "PRAGMA user_version = 6",
-	7: "PRAGMA user_version = 7",
-	8: "PRAGMA user_version = 8",
-	9: "PRAGMA user_version = 9",
+	1:  "PRAGMA user_version = 1",
+	2:  "PRAGMA user_version = 2",
+	3:  "PRAGMA user_version = 3",
+	4:  "PRAGMA user_version = 4",
+	5:  "PRAGMA user_version = 5",
+	6:  "PRAGMA user_version = 6",
+	7:  "PRAGMA user_version = 7",
+	8:  "PRAGMA user_version = 8",
+	9:  "PRAGMA user_version = 9",
+	10: "PRAGMA user_version = 10",
 }
 
 // recordVersion stamps the schema version on the same executor as the schema

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"strings"
 	"testing"
@@ -90,7 +91,7 @@ func TestPresentApprovalPersistsItsRouteAndSanitizesDisplayText(t *testing.T) {
 		ID: "dialog-1", Method: "confirm", Title: "\x1b[31mRun this?\x1b[0m",
 		Message: "Check\x1b[1m build output\x1b[0m", Options: []string{"one"},
 	}
-	th.presentApproval(client, "/sessions/approval.jsonl", 1, request, 60000)
+	th.presentApproval(client, "/sessions/approval.jsonl", 1, "U1", request, 60000)
 
 	if len(platform.prompts) != 1 {
 		t.Fatalf("presented %d prompts, want 1", len(platform.prompts))
@@ -107,7 +108,7 @@ func TestPresentApprovalPersistsItsRouteAndSanitizesDisplayText(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("PendingUI = found %v, err %v", found, err)
 	}
-	if pending.ThreadKey != th.key || pending.SessionPath != "/sessions/approval.jsonl" || pending.RequestID != request.ID ||
+	if pending.ThreadKey != th.key || pending.RequesterUserID != "U1" || pending.SessionPath != "/sessions/approval.jsonl" || pending.RequestID != request.ID ||
 		pending.Method != "confirm" || pending.MessageTS != "approval-message-ts" {
 		t.Errorf("pending route = %+v", pending)
 	}
@@ -122,10 +123,28 @@ func TestPresentApprovalPersistsItsRouteAndSanitizesDisplayText(t *testing.T) {
 	}
 }
 
+func TestPresentApprovalWithoutRequesterIsCanceledWithoutBeingShown(t *testing.T) {
+	_, platform, st, th := approvalTestBot(t)
+	client := &recordingUIResponder{}
+	request := ApprovalRequest{ID: "dialog-unowned", Method: "input"}
+	th.presentApproval(client, "/sessions/approval.jsonl", 20, "", request, 30000)
+
+	if len(platform.prompts) != 0 {
+		t.Fatalf("presented %d unowned dialogs, want none", len(platform.prompts))
+	}
+	if len(client.calls) != 1 || client.calls[0].id != request.ID || client.calls[0].response["cancelled"] != true {
+		t.Fatalf("RespondUI calls = %+v, want cancellation", client.calls)
+	}
+	routeID := approvalRouteID(th.key, "/sessions/approval.jsonl", 20, request.ID)
+	if _, found, err := st.PendingUI(context.Background(), routeID); err != nil || found {
+		t.Errorf("unowned dialog was persisted: found=%v err=%v", found, err)
+	}
+}
+
 func TestPresentApprovalWithoutPiTimeoutDoesNotSetLocalExpiry(t *testing.T) {
 	_, _, st, th := approvalTestBot(t)
 	request := ApprovalRequest{ID: "dialog-no-timeout", Method: "confirm"}
-	th.presentApproval(&recordingUIResponder{}, "/sessions/approval.jsonl", 21, request, 0)
+	th.presentApproval(&recordingUIResponder{}, "/sessions/approval.jsonl", 21, "U1", request, 0)
 	routeID := approvalRouteID(th.key, "/sessions/approval.jsonl", 21, request.ID)
 	pending, found, err := st.PendingUI(context.Background(), routeID)
 	if err != nil || !found {
@@ -141,7 +160,7 @@ func TestPresentApprovalCancelsWhenSlackCannotShowIt(t *testing.T) {
 	platform.presentErr = errors.New("missing_scope")
 	client := &recordingUIResponder{}
 	request := ApprovalRequest{ID: "dialog-2", Method: "input"}
-	th.presentApproval(client, "/sessions/approval.jsonl", 2, request, 30000)
+	th.presentApproval(client, "/sessions/approval.jsonl", 2, "U1", request, 30000)
 
 	if len(client.calls) != 1 || client.calls[0].id != request.ID || client.calls[0].response["cancelled"] != true {
 		t.Fatalf("RespondUI calls = %+v, want a cancellation", client.calls)
@@ -161,7 +180,7 @@ func TestApprovalButtonOpensModalWithoutConsumingDialog(t *testing.T) {
 	routeID := approvalRouteID(th.key, "/sessions/approval.jsonl", 3, request.ID)
 	b.rememberApproval(routeID, request)
 	pending := store.PendingUI{
-		RouteID: routeID, RequestID: request.ID, ThreadKey: th.key, SessionPath: "/sessions/approval.jsonl",
+		RouteID: routeID, RequestID: request.ID, ThreadKey: th.key, RequesterUserID: "U1", SessionPath: "/sessions/approval.jsonl",
 		Method: request.Method, MessageTS: "approval-message-ts",
 		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
 	}
@@ -188,6 +207,50 @@ func TestApprovalButtonOpensModalWithoutConsumingDialog(t *testing.T) {
 	}
 	if _, found, err := st.PendingUI(context.Background(), routeID); err != nil || !found {
 		t.Errorf("opening a form consumed the dialog: found=%v err=%v", found, err)
+	}
+}
+
+func TestApprovalActionIsRestrictedToTheInitiatingRequester(t *testing.T) {
+	b, platform, st, th := approvalTestBot(t)
+	b.cfg.Slack.Access.AllowedUsers = []string{"U1", "U2"}
+	for i, testCase := range []struct {
+		actionID string
+		method   string
+	}{
+		{ActionUIOpenModal, "input"},
+		{ActionUISubmit, "input"},
+		{ActionUIConfirmYes, "confirm"},
+	} {
+		routeID := fmt.Sprintf("requester-route-%d", i)
+		pending := store.PendingUI{
+			RouteID: routeID, RequestID: fmt.Sprintf("dialog-%d", i), ThreadKey: th.key,
+			RequesterUserID: "U1", SessionPath: "/sessions/approval.jsonl", Method: testCase.method,
+			CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+		}
+		if _, err := st.PutPendingUI(context.Background(), pending); err != nil {
+			t.Fatalf("PutPendingUI(%s): %v", routeID, err)
+		}
+		action := Action{
+			EventID: fmt.Sprintf("Ev-nonowner-%d", i), Channel: "C1", Thread: ptr(approvalTestThread()),
+			UserID: "U2", Workspace: "T1", ActionID: testCase.actionID, RouteID: routeID,
+			ApprovalHandle: "untrusted-trigger", Value: "SECRET-MUST-NOT-LEAK",
+		}
+		b.HandleAction(context.Background(), action)
+		if _, found, err := st.PendingUI(context.Background(), routeID); err != nil || !found {
+			t.Errorf("non-owner action %s consumed the route: found=%v err=%v", testCase.actionID, found, err)
+		}
+	}
+	if len(platform.modals) != 0 {
+		t.Errorf("non-requester opened %d modals", len(platform.modals))
+	}
+	if len(platform.notices) != 3 {
+		t.Fatalf("denial notices = %+v, want one ephemeral notice per unauthorized action", platform.notices)
+	}
+	for _, notice := range platform.notices {
+		if !notice.Ephemeral || notice.Text != "Only the person who started this request can respond." ||
+			strings.Contains(notice.Text, "SECRET-MUST-NOT-LEAK") {
+			t.Errorf("unauthorized response notice is not safe/ephemeral: %+v", notice)
+		}
 	}
 }
 
@@ -238,7 +301,7 @@ func TestPresentApprovalCancelsWhenChoicesExceedSurfaceLimit(t *testing.T) {
 	for i := range request.Options {
 		request.Options[i] = "choice"
 	}
-	th.presentApproval(client, "/sessions/approval.jsonl", 22, request, 60000)
+	th.presentApproval(client, "/sessions/approval.jsonl", 22, "U1", request, 60000)
 	if len(platform.prompts) != 0 {
 		t.Fatalf("presented %d partial-choice prompts; want cancellation", len(platform.prompts))
 	}
@@ -277,7 +340,7 @@ func TestApprovalDeliveryKeepsRouteUntilPiAcceptsResponse(t *testing.T) {
 	b, _, st, th := approvalTestBot(t)
 	ctx := context.Background()
 	pending := store.PendingUI{
-		RouteID: "route-delivery", RequestID: "dialog-delivery", ThreadKey: th.key,
+		RouteID: "route-delivery", RequestID: "dialog-delivery", ThreadKey: th.key, RequesterUserID: "U1",
 		SessionPath: "/sessions/approval.jsonl", Method: "confirm",
 		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
 	}
@@ -355,7 +418,7 @@ func TestExpirePendingUIUpdatesTheSlackMessage(t *testing.T) {
 	b, platform, st, th := approvalTestBot(t)
 	now := time.Now().UTC()
 	pending := store.PendingUI{
-		RouteID: "expired-route-1", RequestID: "expired-1", ThreadKey: th.key, SessionPath: "/sessions/approval.jsonl",
+		RouteID: "expired-route-1", RequestID: "expired-1", ThreadKey: th.key, RequesterUserID: "U1", SessionPath: "/sessions/approval.jsonl",
 		Method: "confirm", MessageTS: "expired-message", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(-time.Second),
 	}
 	if _, err := st.PutPendingUI(context.Background(), pending); err != nil {
