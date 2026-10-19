@@ -793,10 +793,9 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	}
 	s.rememberProgressTitleLocked(title)
 	update := TaskProgress{
-		ID:      turnProgressTaskID,
-		Title:   title,
-		Status:  TaskInProgress,
-		Details: progressDetails(s.progressActionTitles, s.progressActionCount, false),
+		ID:     turnProgressTaskID,
+		Title:  title,
+		Status: TaskInProgress,
 	}
 	s.activeTasks[turnProgressTaskID] = update
 	s.queueProgressUpdateLocked(update)
@@ -938,7 +937,7 @@ func (s *turnState) finalizeProgressLocked() bool {
 		update.Status = status
 		update.Title = summarizeProgressMetrics(status, s.progressCompletedActionCount, s.progressElapsed)
 		if status == TaskComplete {
-			update.Details = progressDetails(s.progressActionTitles, s.progressActionCount, true)
+			update.Details = progressDetails(s.progressActionTitles, s.progressActionCount)
 		}
 		if status == TaskError {
 			update.Details = "The turn ended before it completed."
@@ -1030,15 +1029,11 @@ func summarizeProgressMetrics(status TaskProgressStatus, actionCount int, elapse
 	return fmt.Sprintf("%s · %d %s · %s", label, actionCount, actionLabel, duration)
 }
 
-func progressDetails(titles []string, total int, completed bool) string {
+func progressDetails(titles []string, total int) string {
 	if len(titles) == 0 || total <= 0 {
 		return ""
 	}
-	heading := "Progress so far:"
-	if completed {
-		heading = "Completed actions:"
-	}
-	lines := []string{heading}
+	lines := []string{"Completed actions:"}
 	for _, title := range titles {
 		lines = append(lines, "• "+title)
 	}

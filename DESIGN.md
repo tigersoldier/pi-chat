@@ -510,8 +510,9 @@ it is ready.
     (or `error` if the turn is aborted or exits abnormally). Its final title reports the
     number of returned tool calls and elapsed time from the first observed agent/turn start
     (falling back to the first tool start); errored calls count as executed actions. The
-    expandable `details` lists up to six unique safe action titles (at most 600 characters),
-    refreshed as work starts and finalized on completion. Tool completion does not create or
+    expandable `details` lists up to six unique safe action titles (at most 600 characters)
+    and is sent once, when the task completes; active updates change only the title, avoiding
+    repeated cumulative detail snapshots in the stream. Tool completion does not create or
     recycle task IDs, so the timeline stays at one card;
     individual completed steps are never shown as separate cards. A valid
     `[[slack-progress: ...]]` assistant-text marker supplies a FIFO custom title for the
