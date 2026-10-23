@@ -916,6 +916,119 @@ func TestAppendFailureMidTurnDefersFallbackUntilSettlement(t *testing.T) {
 	}
 }
 
+func TestMessageTooLongAppendLogsSizeAndRepairsFinal(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	stub := &stubSlack{failed: map[string]string{"chat.appendStream": "msg_too_long"}}
+	r := newTestRenderer(t, stub, "stream")
+	r.log = log
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "private partial"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(stub.methods(), ","); got != "chat.startStream,chat.appendStream" {
+		t.Fatalf("calls before settlement = %v, want no unsafe update", got)
+	}
+	if err := r.Finish(ctx, "final answer"); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want stop then patch of the original reply", got)
+	}
+	calls := stub.recorded()
+	if got := calls[len(calls)-1].params["text"]; got != "final answer" {
+		t.Fatalf("patched text = %v, want authoritative final", got)
+	}
+
+	got := logs.String()
+	for _, field := range []string{
+		"append_text_bytes=15", "append_text_chars=15",
+		"stream_text_bytes=15", "stream_text_chars=15",
+		"append_chunk_index=1", "append_chunk_count=1", "append_chunk_bytes=15",
+		"repaired Slack reply after incomplete stream",
+	} {
+		if !strings.Contains(got, field) {
+			t.Errorf("logs do not contain %q: %s", field, got)
+		}
+	}
+	if strings.Contains(got, "private partial") || strings.Contains(got, "final answer") {
+		t.Fatalf("logs exposed reply text: %s", got)
+	}
+}
+
+func TestStreamTextBudgetDefersToBoundedFinalPatch(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	text := strings.Repeat("x", maxMessage+1)
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, text); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(stub.methods(), ","); got != "chat.startStream" {
+		t.Fatalf("calls before settlement = %v, want no append beyond budget", got)
+	}
+	if !r.streamTextIncomplete || r.streamState != streamActive {
+		t.Fatalf("budget overflow state = incomplete:%v stream:%v, want incomplete and active", r.streamTextIncomplete, r.streamState)
+	}
+	if err := r.Finish(ctx, text); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want stop then bounded patch", got)
+	}
+	calls := stub.recorded()
+	patched := calls[len(calls)-1].params["text"]
+	if patched != truncate(text, maxMessage) {
+		t.Fatalf("patched text length = %d, want bounded final length %d", len(patched.(string)), len(truncate(text, maxMessage)))
+	}
+}
+
+func TestTooLongFinalPatchUsesDeliveryNotice(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	stub := &stubSlack{policy: func(method string, params map[string]any) string {
+		if method == "chat.update" && params["text"] != replyTooLongNotice {
+			return "msg_too_long"
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	r.log = log
+	ctx := context.Background()
+	text := strings.Repeat("x", maxMessage+1)
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, text); err != nil {
+		t.Fatal(err)
+	}
+	want := "chat.startStream,chat.stopStream,chat.update,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want update then short notice on the same reply", got)
+	}
+	calls := stub.recorded()
+	if got := calls[len(calls)-1].params["text"]; got != replyTooLongNotice {
+		t.Fatalf("fallback text = %v, want delivery notice", got)
+	}
+	if strings.Contains(logs.String(), strings.Repeat("x", 100)) {
+		t.Fatalf("logs exposed the oversized reply")
+	}
+	if !strings.Contains(logs.String(), "Slack reply replaced with a size-limit notice") {
+		t.Fatalf("missing fallback outcome log: %s", logs.String())
+	}
+}
+
 func TestTerminalAppendFailureIsSafeForFinishAndFail(t *testing.T) {
 	for _, outcome := range []string{"finish", "failure"} {
 		t.Run(outcome, func(t *testing.T) {
