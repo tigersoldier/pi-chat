@@ -23,6 +23,8 @@ const (
 	// maxMessage is Slack's practical message text limit, with room to spare
 	// for the truncation notice.
 	maxMessage = 38000
+
+	replyTooLongNotice = "Slack rejected this reply as too long. Please ask for a shorter version."
 )
 
 // Identity is who this install is on Slack, from auth.test: the workspace, the
@@ -588,6 +590,13 @@ func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) 
 	}
 	if err := r.api.AppendStream(ctx, r.channel, r.ts, chunks); err != nil {
 		r.noteAppendFailure(err)
+		if r.log != nil {
+			r.log.Warn("Slack task progress append failed",
+				"message_ts", r.ts,
+				"task_update_chunks", len(chunks),
+				"task_update_text_bytes", taskUpdateTextBytes(chunks),
+				"error", err)
+		}
 		return fmt.Errorf("append task updates: %w", err)
 	}
 	return nil
@@ -607,6 +616,14 @@ func taskUpdateChunk(update bot.TaskProgress) (streamPayloadChunk, error) {
 		Title:   update.Title,
 		Status:  string(update.Status),
 		Details: update.Details}, nil
+}
+
+func taskUpdateTextBytes(chunks []streamPayloadChunk) int {
+	total := 0
+	for _, chunk := range chunks {
+		total = total + len(chunk.ID) + len(chunk.Title) + len(chunk.Status) + len(chunk.Details)
+	}
+	return total
 }
 
 // Progress names the message this renderer is writing into, so the core can
@@ -640,11 +657,41 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 	}
 	switch r.streamState {
 	case streamActive:
+		if r.streamTextIncomplete {
+			return nil
+		}
+		if r.text.Len() > maxMessage {
+			r.streamTextIncomplete = true
+			if r.log != nil {
+				r.log.Warn("Slack reply exceeded the streaming text budget; deferring completion until settlement",
+					"message_ts", r.ts,
+					"stream_text_bytes", r.text.Len(),
+					"stream_text_chars", utf8.RuneCountInString(r.text.String()),
+					"stream_text_byte_budget", maxMessage)
+			}
+			return nil
+		}
 		if err := r.appendStream(ctx, text); err == nil {
 			return nil
 		} else {
-			r.log.Warn("streaming failed; deferring message fallback until closure",
-				"message_ts", r.ts, "stream_state", streamStateName(r.streamState), "error", err)
+			attrs := []any{
+				"message_ts", r.ts,
+				"stream_state", streamStateName(r.streamState),
+				"append_text_bytes", len(text),
+				"append_text_chars", utf8.RuneCountInString(text),
+				"stream_text_bytes", r.text.Len(),
+				"stream_text_chars", utf8.RuneCountInString(r.text.String()),
+				"error", err,
+			}
+			if appendErr, ok := errors.AsType[*streamAppendError](err); ok {
+				attrs = append(attrs,
+					"append_chunk_index", appendErr.chunkIndex,
+					"append_chunk_count", appendErr.chunkCount,
+					"append_chunk_bytes", appendErr.chunkBytes)
+			}
+			if r.log != nil {
+				r.log.Warn("streaming failed; deferring message fallback until closure", attrs...)
+			}
 			r.streamTextIncomplete = true
 			r.noteAppendFailure(err)
 			if r.streamState != streamClosed {
@@ -694,6 +741,10 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 			"message_ts", r.ts,
 			"stream_state", streamStateName(r.streamState),
 			"final_matches_streamed", final == streamed,
+			"final_text_bytes", len(final),
+			"final_text_chars", utf8.RuneCountInString(final),
+			"stream_text_bytes", len(streamed),
+			"stream_text_chars", utf8.RuneCountInString(streamed),
 			"stream_text_incomplete", r.streamTextIncomplete)
 	}
 	if r.streamMayBeActive() {
@@ -706,7 +757,43 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 	}
 	r.text.Reset()
 	r.text.WriteString(final)
-	return r.patch(ctx)
+	patchText := truncate(final, maxMessage)
+	if err := r.patch(ctx); err != nil {
+		if IsCode(err, "msg_too_long") && !r.streamMayBeActive() {
+			if noticeErr := r.api.UpdateMessage(ctx, r.channel, r.ts, replyTooLongNotice); noticeErr == nil {
+				r.text.Reset()
+				r.text.WriteString(replyTooLongNotice)
+				if r.log != nil {
+					r.log.Warn("Slack reply replaced with a size-limit notice",
+						"message_ts", r.ts,
+						"final_text_bytes", len(final),
+						"patch_text_bytes", len(patchText),
+						"error", err)
+				}
+				return nil
+			} else {
+				err = errors.Join(err, fmt.Errorf("update size-limit notice: %w", noticeErr))
+			}
+		}
+		if r.log != nil {
+			r.log.Warn("Slack reply patch failed",
+				"message_ts", r.ts,
+				"stream_state", streamStateName(r.streamState),
+				"final_text_bytes", len(final),
+				"patch_text_bytes", len(patchText),
+				"final_text_truncated", len(final) > maxMessage,
+				"error", err)
+		}
+		return err
+	}
+	if r.streamTextIncomplete && r.log != nil {
+		r.log.Info("repaired Slack reply after incomplete stream",
+			"message_ts", r.ts,
+			"final_text_bytes", len(final),
+			"patch_text_bytes", len(patchText),
+			"final_text_truncated", len(final) > maxMessage)
+	}
+	return nil
 }
 
 // Fail reports a failed turn in the same message, keeping whatever partial
@@ -773,13 +860,27 @@ func failureText(partial string, cause error) string {
 	return partial + separator + failure
 }
 
+type streamAppendError struct {
+	chunkIndex int
+	chunkCount int
+	chunkBytes int
+	err        error
+}
+
+func (e *streamAppendError) Error() string {
+	return fmt.Sprintf("append markdown chunk %d/%d (%d bytes): %v", e.chunkIndex, e.chunkCount, e.chunkBytes, e.err)
+}
+
+func (e *streamAppendError) Unwrap() error { return e.err }
+
 // appendStream sends text in pieces Slack will accept, so one long delta
 // cannot fail as a whole.
 func (r *renderer) appendStream(ctx context.Context, text string) error {
-	for _, piece := range chunk(text, streamChunk) {
+	pieces := chunk(text, streamChunk)
+	for i, piece := range pieces {
 		chunk := streamPayloadChunk{Type: "markdown_text", Text: piece}
 		if err := r.api.AppendStream(ctx, r.channel, r.ts, []streamPayloadChunk{chunk}); err != nil {
-			return err
+			return &streamAppendError{chunkIndex: i + 1, chunkCount: len(pieces), chunkBytes: len(piece), err: err}
 		}
 	}
 	return nil
