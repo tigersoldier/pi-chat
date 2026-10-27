@@ -596,7 +596,36 @@ Constraints and behaviours:
     response is outstanding, which Slack renders as `suspended`; a successful answer moves it
     back to `processing`, and timeout or cancellation follows the turn's normal completion.
 
-    **Still open:** `rename` titles and `closed` on `/delete`.
+    **Current API gaps and product boundaries:**
+
+    - **Session titles:** [`agents.sessions.rename`](https://docs.slack.dev/reference/methods/agents.sessions.rename)
+      is not called and `agent_session_title_changed` is not handled. Slack-side renames work,
+      but pi-chat neither sets nor mirrors titles into Pi session metadata. `closed` on `/delete`
+      is implemented.
+    - **Slack context and search:** `app_context_changed` is declared but ignored; inbound
+      `app_context` and `action_token` are not propagated, and the adapter does not call
+      [`assistant.search.context`](https://docs.slack.dev/ai/developing-agents/#full-example).
+      The optional read-only chat tools support explicit thread/message/user references, not
+      workspace search or writes.
+    - **Progress and response UI:** native progress uses timeline `task_update` chunks;
+      there is no plan mode/`plan_update`, source/citation metadata, or per-answer feedback
+      (`feedback_buttons` or reaction collection). Agent answers are text streams rather
+      than result blocks/actions.
+    - **Slack Code:** there is no dedicated code-channel or Artifact-panel workflow;
+      coding stays in the local Pi session and Slack thread.
+    - **Long turns:** one stream is used per turn. There is no stream rotation or deliberate
+      long-job plan-message path; Slack's [`chat.startStream` limits](https://docs.slack.dev/reference/methods/chat.startStream#timeout)
+      (10 minutes and 12,000 text characters) can end live progress before Pi finishes.
+    - **Approval policy:** `approvals = "auto"` is the default and adds `--approve`; the
+      interactive Slack approval flow is available but must be configured. Slack's [agent
+      design guide](https://docs.slack.dev/concepts/agent-design/#confirmation-control)
+      recommends explicit confirmation for consequential actions.
+    - **Data retention:** thread context is sent to Pi; when messages must be omitted or
+      shortened to fit the prompt, pi-chat writes the full fetched transcript to a local
+      sidecar, bounded to 20 files per thread.
+      This deliberate retention exception is in tension with Slack's [data-retention
+      guidance](https://docs.slack.dev/concepts/agent-design/#data-retention); deployments
+      should account for it.
 
     The scopes, precisely: `agents.sessions.setStatus` and `agents.sessions.rename` need
     **`chat:write` alone** — the agent surface is not what buys `assistant:write`.
