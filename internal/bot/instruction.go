@@ -15,7 +15,7 @@ import (
 //
 // The first line of instructionText is this marker, so the text reads as prose
 // and is still findable.
-const instructionMarker = "(pi-chat instruction v3)"
+const instructionMarker = "(pi-chat instruction v4)"
 
 // instructionOpen and instructionClose wrap the instruction when it travels in a
 // message rather than in the system prompt, so the agent can tell the
@@ -65,8 +65,10 @@ worktree context available in this session. Do not choose a repository from a pl
 name alone. If multiple similar candidates exist, or the intended target is unclear, ask
 the user before modifying files.
 
-Slack renders a small Markdown: *bold*, _italic_, ` + "`code`" + `, and fenced
-code blocks. Headings, tables and images do not render.
+Slack replies use the markdown_text format for streaming and final updates. Write
+standard Markdown, not Slack mrkdwn: use **bold**, _italic_, ` + "`code`" + `, fenced code
+blocks, [label](URL) links and simple hyphen lists. Avoid headings, tables and images;
+keep each reply below 12,000 characters.
 
 Before each tool call, emit only a brief, user-facing progress marker as
 ordinary assistant text, for example [[slack-progress: Checking service logs]].

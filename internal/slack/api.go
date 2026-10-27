@@ -300,6 +300,23 @@ func (a *API) PostMessage(ctx context.Context, channel, threadTS, text string) (
 	return a.PostBlocks(ctx, channel, threadTS, text, nil)
 }
 
+// PostMarkdownMessage posts standard Markdown using Slack's markdown_text field
+// and returns the new message's timestamp. Slack forbids combining markdown_text
+// with text or blocks in this request.
+func (a *API) PostMarkdownMessage(ctx context.Context, channel, threadTS, markdownText string) (string, error) {
+	params := map[string]any{"channel": channel, "markdown_text": markdownText}
+	if threadTS != "" {
+		params["thread_ts"] = threadTS
+	}
+	var out struct {
+		TS string `json:"ts"`
+	}
+	if err := a.call(ctx, "chat.postMessage", params, &out); err != nil {
+		return "", err
+	}
+	return out.TS, nil
+}
+
 // PostPlainTextMessage posts text without Slack mrkdwn, mention, or automatic
 // link parsing and returns the message's timestamp.
 func (a *API) PostPlainTextMessage(ctx context.Context, channel, threadTS, text string) (string, error) {
@@ -381,6 +398,17 @@ func (a *API) PostEphemeral(ctx context.Context, channel, user, threadTS, text s
 // UpdateMessage replaces a posted message's text.
 func (a *API) UpdateMessage(ctx context.Context, channel, ts, text string) error {
 	return a.UpdateBlocks(ctx, channel, ts, text, nil)
+}
+
+// UpdateMarkdownMessage replaces a message using the same standard Markdown
+// format as streamed markdown_text chunks. Slack forbids combining markdown_text
+// with text or blocks in this request.
+func (a *API) UpdateMarkdownMessage(ctx context.Context, channel, ts, markdownText string) error {
+	return a.call(ctx, "chat.update", map[string]any{
+		"channel":       channel,
+		"ts":            ts,
+		"markdown_text": markdownText,
+	}, nil)
 }
 
 // UpdateBlocks replaces a posted message's text and blocks. Passing no blocks

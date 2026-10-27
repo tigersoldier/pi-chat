@@ -581,10 +581,31 @@ func TestFailRequestReplacesEyesWithWarning(t *testing.T) {
 	}
 }
 
+func TestFinalOnlyPostStaysWithinSlackMarkdownTextLimit(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	answer := strings.Repeat("x", maxMessage+1)
+
+	if err := r.Finish(context.Background(), answer); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	calls := stub.recorded()
+	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
+		t.Fatalf("calls = %+v, want one final post", calls)
+	}
+	markdownText := calls[0].params["markdown_text"].(string)
+	if got := utf8.RuneCountInString(markdownText); got > maxMessage {
+		t.Errorf("posted markdown_text has %d characters, exceeds Slack's %d-character limit", got, maxMessage)
+	}
+	if got := len(markdownText); got > maxMessage {
+		t.Errorf("posted markdown_text has %d bytes, exceeds the conservative %d-byte budget", got, maxMessage)
+	}
+}
+
 func TestFinishWithoutStartPostsTheReadyAnswer(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")
-	answer := "The answer is ready."
+	answer := "**The answer is ready.**\n\n[Documentation](https://example.com)"
 
 	if err := r.Finish(context.Background(), answer); err != nil {
 		t.Fatalf("Finish: %v", err)
@@ -594,8 +615,8 @@ func TestFinishWithoutStartPostsTheReadyAnswer(t *testing.T) {
 		t.Fatalf("calls = %+v, want one post only after final text is ready", calls)
 	}
 	params := calls[0].params
-	if params["channel"] != r.channel || params["thread_ts"] != r.threadTS || params["text"] != answer {
-		t.Errorf("posted answer params = %+v, want channel=%q thread_ts=%q text=%q",
+	if params["channel"] != r.channel || params["thread_ts"] != r.threadTS || params["markdown_text"] != answer || params["text"] != nil || params["blocks"] != nil {
+		t.Errorf("posted answer params = %+v, want channel=%q thread_ts=%q markdown_text=%q",
 			params, r.channel, r.threadTS, answer)
 	}
 	for _, call := range calls {
@@ -854,7 +875,7 @@ func TestFinishCorrectsADivergentAnswer(t *testing.T) {
 	if got != "chat.startStream,chat.appendStream,chat.stopStream,chat.update" {
 		t.Fatalf("calls = %v", got)
 	}
-	if text := stub.recorded()[3].params["text"]; text != "partial, with more" {
+	if text := stub.recorded()[3].params["markdown_text"]; text != "partial, with more" {
 		t.Fatalf("corrected text = %v", text)
 	}
 }
@@ -881,7 +902,7 @@ func TestStreamFailureFallsBackToPatching(t *testing.T) {
 	if got != want {
 		t.Fatalf("calls = %v, want %v", got, want)
 	}
-	if text := stub.recorded()[3].params["text"]; text != "hello" {
+	if text := stub.recorded()[3].params["markdown_text"]; text != "hello" {
 		t.Fatalf("patched text = %v, want \"hello\"", text)
 	}
 }
@@ -916,6 +937,45 @@ func TestAppendFailureMidTurnDefersFallbackUntilSettlement(t *testing.T) {
 	}
 }
 
+func TestClosedMarkdownStreamIsRepairedWithMarkdownText(t *testing.T) {
+	answer := "**What exists now:**\n\n- See [the guide](https://example.com)."
+	stub := &stubSlack{failed: map[string]string{"chat.appendStream": "message_not_in_streaming_state"}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, answer); err != nil {
+		t.Fatal(err)
+	}
+	if r.streamState != streamClosed || !r.streamTextIncomplete {
+		t.Fatalf("stream state = %v, incomplete = %v; want closed and incomplete", r.streamState, r.streamTextIncomplete)
+	}
+	if err := r.Finish(ctx, answer); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	if got, want := strings.Join(stub.methods(), ","), "chat.startStream,chat.appendStream,chat.update,chat.update"; got != want {
+		t.Fatalf("calls = %s, want %s", got, want)
+	}
+	for _, call := range calls {
+		if call.method != "chat.update" {
+			continue
+		}
+		if got := call.params["markdown_text"]; got != answer {
+			t.Errorf("repair markdown_text = %v, want the original Markdown", got)
+		}
+		if _, hasText := call.params["text"]; hasText {
+			t.Errorf("Markdown repair also sent the incompatible text field: %+v", call.params)
+		}
+		if _, hasBlocks := call.params["blocks"]; hasBlocks {
+			t.Errorf("Markdown repair also sent the incompatible blocks field: %+v", call.params)
+		}
+	}
+}
+
 func TestMessageTooLongAppendLogsSizeAndRepairsFinal(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -941,7 +1001,7 @@ func TestMessageTooLongAppendLogsSizeAndRepairsFinal(t *testing.T) {
 		t.Fatalf("calls = %v, want stop then patch of the original reply", got)
 	}
 	calls := stub.recorded()
-	if got := calls[len(calls)-1].params["text"]; got != "final answer" {
+	if got := calls[len(calls)-1].params["markdown_text"]; got != "final answer" {
 		t.Fatalf("patched text = %v, want authoritative final", got)
 	}
 
@@ -987,9 +1047,15 @@ func TestStreamTextBudgetDefersToBoundedFinalPatch(t *testing.T) {
 		t.Fatalf("calls = %v, want stop then bounded patch", got)
 	}
 	calls := stub.recorded()
-	patched := calls[len(calls)-1].params["text"]
+	patched := calls[len(calls)-1].params["markdown_text"].(string)
 	if patched != truncate(text, maxMessage) {
-		t.Fatalf("patched text length = %d, want bounded final length %d", len(patched.(string)), len(truncate(text, maxMessage)))
+		t.Fatalf("patched text length = %d, want bounded final length %d", len(patched), len(truncate(text, maxMessage)))
+	}
+	if got := utf8.RuneCountInString(patched); got > maxMessage {
+		t.Errorf("patched markdown_text has %d characters, exceeds Slack's %d-character limit", got, maxMessage)
+	}
+	if len(patched) > maxMessage {
+		t.Errorf("patched markdown_text has %d bytes, exceeds the conservative %d-byte budget", len(patched), maxMessage)
 	}
 }
 
@@ -997,7 +1063,7 @@ func TestTooLongFinalPatchUsesDeliveryNotice(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	stub := &stubSlack{policy: func(method string, params map[string]any) string {
-		if method == "chat.update" && params["text"] != replyTooLongNotice {
+		if method == "chat.update" && params["markdown_text"] != nil {
 			return "msg_too_long"
 		}
 		return ""
@@ -1069,7 +1135,7 @@ func TestTerminalAppendFailureIsSafeForFinishAndFail(t *testing.T) {
 			if last.method != "chat.update" {
 				t.Fatalf("last call = %s, want update of the original message", last.method)
 			}
-			got := last.params["text"].(string)
+			got := last.params["markdown_text"].(string)
 			if outcome == "finish" && got != "authoritative answer" {
 				t.Fatalf("final text = %q", got)
 			}
@@ -1344,7 +1410,7 @@ func TestEachTurnPostsANewReply(t *testing.T) {
 	for _, call := range stub.recorded() {
 		switch call.method {
 		case "chat.postMessage":
-			messages = append(messages, call.params["text"].(string))
+			messages = append(messages, call.params["markdown_text"].(string))
 		case "chat.update":
 			updated = append(updated, call.params["ts"].(string))
 		}
@@ -1377,7 +1443,7 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	text, _ := stub.recorded()[len(stub.recorded())-1].params["text"].(string)
+	text, _ := stub.recorded()[len(stub.recorded())-1].params["markdown_text"].(string)
 	if !strings.Contains(text, "half an answer") || !strings.Contains(text, "connection lost") {
 		t.Fatalf("failure text = %q, want the partial answer and the cause", text)
 	}
@@ -1398,7 +1464,7 @@ func TestFailKeepsCauseWhenPartialAnswerIsLong(t *testing.T) {
 	}
 
 	calls := stub.recorded()
-	text := calls[len(calls)-1].params["text"].(string)
+	text := calls[len(calls)-1].params["markdown_text"].(string)
 	if !strings.Contains(text, cause.Error()) {
 		t.Fatalf("failure text omitted cause %q", cause)
 	}
@@ -1427,7 +1493,7 @@ func TestFailBeforeStartPostsFailureInThread(t *testing.T) {
 	if got := calls[0].params["thread_ts"]; got != testMessage().Thread.ThreadTS {
 		t.Errorf("thread_ts = %v, want %q", got, testMessage().Thread.ThreadTS)
 	}
-	if got := calls[0].params["text"]; got != ":warning: pi-chat: "+cause {
+	if got := calls[0].params["markdown_text"]; got != ":warning: pi-chat: "+cause {
 		t.Errorf("failure text = %v, want the full cause", got)
 	}
 }
@@ -1451,7 +1517,7 @@ func TestFailPreservesTextWhenNoReplyWasStarted(t *testing.T) {
 	if len(calls) != 1 || calls[0].method != "chat.postMessage" {
 		t.Fatalf("calls = %+v, want a failure message posted after buffering", calls)
 	}
-	text := calls[0].params["text"].(string)
+	text := calls[0].params["markdown_text"].(string)
 	if !strings.Contains(text, "partial answer") || !strings.Contains(text, cause.Error()) {
 		t.Errorf("failure text = %q, want partial answer and cause", text)
 	}
@@ -1482,7 +1548,7 @@ func TestFailDeletedMessagePostsFailureInThread(t *testing.T) {
 	if got := last.params["thread_ts"]; got != testMessage().Thread.ThreadTS {
 		t.Errorf("fallback thread_ts = %v, want %q", got, testMessage().Thread.ThreadTS)
 	}
-	text := last.params["text"].(string)
+	text := last.params["markdown_text"].(string)
 	if !strings.Contains(text, cause.Error()) || !strings.Contains(text, "truncated") {
 		t.Errorf("fallback text = %q, want truncated partial answer and full cause", text)
 	}
@@ -1554,7 +1620,7 @@ func TestTruncateMarksAndBounds(t *testing.T) {
 	if !strings.Contains(got, "truncated") {
 		t.Fatalf("truncate did not mark the cut: %q", got)
 	}
-	if len(got) > 100+len("\n\n… _(truncated)_") {
+	if len(got) > 100 {
 		t.Fatalf("truncate returned %d bytes, want it bounded", len(got))
 	}
 	if !utf8.ValidString(truncate(strings.Repeat("é", 100), 101)) {

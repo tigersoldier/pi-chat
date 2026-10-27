@@ -166,6 +166,21 @@ func TestASessionThatAlreadyCarriesTheInstructionIsNotToldTwice(t *testing.T) {
 	}
 }
 
+func TestASessionWithAnOlderInstructionGetsTheNewFormattingRules(t *testing.T) {
+	b, _, st := newTestBot(t)
+	th := testThread(t, b, st)
+	adoptedRow(t, th)
+	b.gw = &fakeGateway{rows: []gwclient.SessionRow{{
+		Path:  "/sessions/adopted.jsonl",
+		Spawn: map[string][]string{"append-system-prompt": {"(pi-chat instruction v3) old Slack formatting rules"}},
+	}}}
+
+	got := th.neededInstruction(context.Background())
+	if !strings.Contains(got, instructionMarker) || !strings.Contains(got, "markdown_text") {
+		t.Fatalf("older session did not receive the updated formatting instruction: %q", got)
+	}
+}
+
 func TestASessionWeCreatedCarriesTheInstructionPermanently(t *testing.T) {
 	b, _, st := newTestBot(t)
 	th := testThread(t, b, st)
@@ -218,6 +233,15 @@ func TestTheInstructionExplainsTheTranscript(t *testing.T) {
 	} {
 		if !strings.Contains(instructionText, want) {
 			t.Errorf("the instruction no longer mentions %q", want)
+		}
+	}
+}
+
+func TestTheInstructionSpecifiesSlackMarkdownTextFormatting(t *testing.T) {
+	text := strings.Join(strings.Fields(instructionText), " ")
+	for _, want := range []string{"markdown_text", "standard Markdown, not Slack mrkdwn", "**bold**", "[label](URL)", "12,000 characters"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the instruction does not specify %q", want)
 		}
 	}
 }
