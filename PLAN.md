@@ -15,13 +15,13 @@ approvals. Live Slack and chat-tools validation remain pending.
 
 | Item | State |
 |---|---|
-| Design | **Settled.** All 14 questions answered; `DESIGN.md` rewritten for the pi-gateway-based, Slack-first scope |
+| Design | Core Slack-first design settled; M7/M8 Slack Agent experience options and policy decisions remain |
 | M0 — gateway running | **Done and verified** (see M0 below) |
 | M1 — Slack app | **Done for phase 0, verified live** (see M1 below): Socket Mode socket opens, bot token authenticates, phase-0 scopes granted. The remaining history, files and reactions scopes still need one reinstall |
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
 | M3 — phase-0 vertical slice | **Done and verified end-to-end** on 2026-09-27: a mention in a Slack thread streamed a real pi answer back into it (see M3 below) |
 | M4 — phase-1 MVP | **Done and verified live** on 2026-09-28: commands, allowlist refusals, SQLite thread state, provisioned project directories, cold/resume, startup GC (see M4 below) |
-| M5 — phase 2 | **In progress.** `/abort`, `/model`, `/stop`, and interactive approvals are implemented; warm-session eviction/queueing, title/closed status updates, and stream fallback hardening remain |
+| M5 — phase 2 | **In progress.** `/abort`, `/model`, `/stop`, interactive approvals, and `closed` status on delete are implemented; warm-session eviction/queueing, title updates, and stream fallback hardening remain |
 | Chat tools v1 | **Implemented, Go/race-tested, and loaded by the installed Pi RPC runtime; live Slack validation pending.** Opt-in extension, private UDS broker, durable session bindings, bounded read-only Slack tools |
 | Code | `internal/config`, `internal/store` (SQLite), `internal/workspace` (provisioning + git cleanup), `internal/bot` (core), `internal/slack` (adapter), `internal/chattools` (broker/extension), `cmd/pi-chatd`; tests in each package |
 | `pi-chatd` | Existing systemd user service is recorded as enabled at boot; this feature worktree has not been installed or live-tested |
@@ -33,8 +33,8 @@ approvals. Live Slack and chat-tools validation remain pending.
 live Slack and restart verification remain pending. M5 has non-forcing `/abort`, `/model`,
 `/stop`, and interactive approval dialogs. This worktree persists approval routing metadata
 and handles buttons/modals through `RespondUI`; remaining work includes warm-session eviction
-and queueing, title/closed status updates, and streaming fallback hardening. `/delete` is
-already implemented.**
+and queueing, title updates, and streaming fallback hardening. `/delete` and its `closed`
+status are implemented.**
 
 ---
 
@@ -287,8 +287,8 @@ worth fixing before M5 builds `/delete` on top of this base.
 **Exit:** the status appears in Slack and the stop button stops the turn.
 **Depends on:** M4.
 
-Not built here, because each belongs with the thing that needs it: `agents.sessions.rename`
-titles, `suspended` while a turn waits for an approval (M5), `closed` on `/delete` (M5).
+Not built in M4.6: Slack session titles via `agents.sessions.rename` (planned for M7).
+M5 implements `suspended` while waiting for approval and `closed` on `/delete`.
 
 ### M4.7 — the thread conversation, and the instruction that explains it
 
@@ -561,7 +561,8 @@ once, not per turn.
       method and expiry; buttons and modal submissions answer through `RespondUI`. Expired and stale dialogs are
       retired without replying to a successor session. Slack's current `views.open` reference requires no additional OAuth scope.
 - [x] Status `suspended` while a turn waits for an answer.
-- [ ] Status `closed` on delete; titles via `agents.sessions.rename`
+- [x] Status `closed` on delete
+- [ ] Slack session titles via `agents.sessions.rename` (M7)
 - [ ] Warm-session cap (default 8) with evict-idle → bounded queue → refuse; never force;
       skip attached sessions (DESIGN §8)
 - [ ] Streaming → patch fallback hardening
@@ -577,6 +578,37 @@ once, not per turn.
       Regression coverage includes the actual gateway wire frame, private downloads,
       unsafe redirects, scope errors, thread filtering and size limits.
 - [ ] General attachment passthrough; `/pi resume` picker polish; metrics
+
+### M7 — Context-aware agent sessions
+
+- [ ] Decide the context/permission/retention contract: per-message `app_context` snapshot
+      versus an event-maintained cache, and whether `assistant.search.context` is allowed
+      for explicit retrieval. Choose source-link and prompt-injection handling before adding
+      workspace search.
+- [ ] Add concise Slack session titles on creation, handle user renames with
+      `agents.sessions.rename` and `agent_session_title_changed`; keep Slack titles separate
+      from local Pi session names.
+- [ ] Implement the selected context path with bounded results and source links; keep
+      read-only access explicit and scoped.
+
+**Exit:** the selected context model and retention contract are documented, titles survive
+user renames, and tests cover event parsing, search boundaries and source rendering.
+
+### M8 — Long-task progress and user controls
+
+- [ ] Choose and implement the long-job pattern: rotate streams or switch to a plan message
+      with throttled `chat.update`; handle Slack's 10-minute/12,000-character stream limits,
+      keep the session `processing`, and preserve stop/cancel behavior.
+- [ ] Use timeline task cards for short work and plan mode for multi-step work; expose only
+      safe task details and approved source metadata, and throttle `chat.update` to Slack's
+      documented cadence.
+- [ ] Add answer-level feedback controls and handle submissions without retaining response
+      content by default.
+- [ ] Make interactive approval the default for consequential tool actions; retain automatic
+      approval only as an explicit opt-in.
+
+**Exit:** long turns retain truthful status/progress, stop remains reliable across transitions,
+and feedback/approval flows have focused tests.
 
 ### Parallel — upstream fix (user, in the pi-gateway repo)
 
@@ -658,8 +690,9 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 
 1. Local validation passes: `go test ./...`, `go test -race ./...`, and `go vet ./...`.
    This worktree implements `/abort`, `/model [provider/model]`, and a non-forcing `/stop`.
-2. Continue M5 with warm-session eviction/queueing and streaming fallback hardening; title
-   updates and `closed` status on delete also remain. Interactive approvals are implemented,
+2. Continue M5 with warm-session eviction/queueing and streaming fallback hardening. M7
+   plans session-title and context work; M8 plans long-task progress, feedback, and approval
+   defaults. Interactive approvals are implemented,
    but need live Slack acceptance; they require no additional `views.open` scope.
 3. In the deployment environment, enable `[chat_tools]`, install/build the pinned
    pi-gateway revision, and verify bounded Slack reads, missing scopes, cancellation, cold
