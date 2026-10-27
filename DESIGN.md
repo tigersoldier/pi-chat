@@ -502,8 +502,9 @@ than an empty reply. A turn with no streamed deltas posts its final answer direc
 it is ready.
 
 - `chat.startStream` uses timeline task display; `chat.appendStream` sends `chunks`:
-  - `markdown_text` chunks for assistant text (standard markdown passes through — **no
-    mrkdwn conversion table**),
+  - `markdown_text` chunks for assistant text; final-only `chat.postMessage` replies and
+    repair `chat.update` calls use their `markdown_text` field too, so every path preserves
+    the same standard-Markdown syntax instead of switching to `mrkdwn`,
   - `task_update` chunks represent one logical progress task for the whole reply. The
     task gets a unique ID for this stream, starts as `in_progress` on the first tool call,
     updates its title as later tools start, and becomes `complete` when the agent settles
@@ -532,9 +533,11 @@ Constraints and behaviours:
   of `markdown_text` and `chunks` request parameters.
 - Streaming to a channel requires `recipient_user_id` + `recipient_team_id`; thread
   replies use `thread_ts`.
-- **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, degrade to
-  `chat.postMessage` + `chat.update` for that turn. The adapter seam has one method per
-  operation so the fallback stays inside the Slack adapter.
+- **Fallback:** on `channel_type_not_supported`, `access_denied` or similar, post a
+  `markdown_text` placeholder and replace it with `chat.update` using the same field.
+  Final-only replies also use `markdown_text`. All assistant reply paths stay within
+  Slack's 12,000-character Markdown-text limit; the adapter seam keeps the fallback
+  inside the Slack adapter.
 - **The recipient fields are sent defensively.** Slack documents
   `recipient_user_id`/`recipient_team_id` as required "when streaming to channels",
   while pi-chat always streams into a thread. The first attempt sends them, and a

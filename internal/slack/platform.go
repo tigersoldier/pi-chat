@@ -20,9 +20,9 @@ const (
 	// streamChunk is the largest piece sent in one chat.appendStream call,
 	// well under Slack's per-request markdown_text limit.
 	streamChunk = 3000
-	// maxMessage is Slack's practical message text limit, with room to spare
-	// for the truncation notice.
-	maxMessage = 38000
+	// maxMessage is a conservative byte budget within Slack's 12,000-character
+	// markdown_text limit, leaving room for the truncation marker.
+	maxMessage = 12_000
 
 	replyTooLongNotice = "Slack rejected this reply as too long. Please ask for a shorter version."
 )
@@ -526,7 +526,7 @@ func (r *renderer) Start(ctx context.Context) error {
 		}
 		r.log.Warn("cannot stream into this thread; patching one message instead", "error", err)
 	}
-	ts, err := r.api.PostMessage(ctx, r.channel, r.threadTS, placeholder)
+	ts, err := r.api.PostMarkdownMessage(ctx, r.channel, r.threadTS, placeholder)
 	if err != nil {
 		return err
 	}
@@ -727,7 +727,7 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 		if final == "" {
 			return nil
 		}
-		ts, err := r.api.PostMessage(ctx, r.channel, r.threadTS, truncate(final, maxMessage))
+		ts, err := r.api.PostMarkdownMessage(ctx, r.channel, r.threadTS, truncate(final, maxMessage))
 		if err != nil {
 			return fmt.Errorf("post the final answer: %w", err)
 		}
@@ -823,7 +823,7 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 		}
 	}
 
-	ts, err := r.api.PostMessage(ctx, r.channel, r.threadTS, truncate(r.text.String(), maxMessage))
+	ts, err := r.api.PostMarkdownMessage(ctx, r.channel, r.threadTS, truncate(r.text.String(), maxMessage))
 	if err != nil {
 		return fmt.Errorf("post failure message: %w", err)
 	}
@@ -936,7 +936,7 @@ func (r *renderer) stopStream(ctx context.Context) error {
 // Slack reports a live stream, stop it and retry once before falling back.
 func (r *renderer) patch(ctx context.Context) error {
 	text := truncate(r.text.String(), maxMessage)
-	err := r.api.UpdateMessage(ctx, r.channel, r.ts, text)
+	err := r.api.UpdateMarkdownMessage(ctx, r.channel, r.ts, text)
 	if err == nil {
 		return nil
 	}
@@ -959,7 +959,7 @@ func (r *renderer) patch(ctx context.Context) error {
 	if stopErr := r.stopStream(ctx); stopErr != nil {
 		return fmt.Errorf("update conflicted with an active stream (%v); stop it before retrying: %w", err, stopErr)
 	}
-	if err := r.api.UpdateMessage(ctx, r.channel, r.ts, text); err != nil {
+	if err := r.api.UpdateMarkdownMessage(ctx, r.channel, r.ts, text); err != nil {
 		if IsCode(err, "streaming_state_conflict") {
 			previousState := r.streamState
 			r.setStreamState(streamUnknown, "retry_update_conflict")
@@ -992,10 +992,17 @@ func chunk(s string, n int) []string {
 
 // truncate bounds text to what Slack accepts, marking that it was cut.
 func truncate(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
 	if len(s) <= max {
 		return s
 	}
-	return s[:cutAtRune(s, max)] + "\n\n… _(truncated)_"
+	const marker = "\n\n… _(truncated)_"
+	if max <= len(marker) {
+		return s[:cutAtRune(s, max)]
+	}
+	return s[:cutAtRune(s, max-len(marker))] + marker
 }
 
 // cutAtRune returns the largest cut at or below n that does not split a rune.
