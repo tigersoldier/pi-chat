@@ -592,40 +592,42 @@ Constraints and behaviours:
     plain bot without the scope, or a workspace without the agent feature — is asked once
     and then left alone, exactly like the status.
 
-    **Approval status is implemented:** the core moves a turn to `waiting` while a human
-    response is outstanding, which Slack renders as `suspended`; a successful answer moves it
-    back to `processing`, and timeout or cancellation follows the turn's normal completion.
+    **Approval lifecycle:** While a human decision is outstanding, the Slack session should
+    display `suspended`; accepting the response returns it to `processing`. Timeout,
+    cancellation, or session stop should reach the turn's terminal status without leaving a
+    stale session status.
 
-    **Current API gaps and product boundaries:**
+    **Target design for a fuller Slack Agent experience:**
 
-    - **Session titles:** [`agents.sessions.rename`](https://docs.slack.dev/reference/methods/agents.sessions.rename)
-      is not called and `agent_session_title_changed` is not handled. Slack-side renames work,
-      but pi-chat neither sets nor mirrors titles into Pi session metadata. `closed` on `/delete`
-      is implemented.
-    - **Slack context and search:** `app_context_changed` is declared but ignored; inbound
-      `app_context` and `action_token` are not propagated, and the adapter does not call
-      [`assistant.search.context`](https://docs.slack.dev/ai/developing-agents/#full-example).
-      The optional read-only chat tools support explicit thread/message/user references, not
-      workspace search or writes.
-    - **Progress and response UI:** native progress uses timeline `task_update` chunks;
-      there is no plan mode/`plan_update`, source/citation metadata, or per-answer feedback
-      (`feedback_buttons` or reaction collection). Agent answers are text streams rather
-      than result blocks/actions.
-    - **Slack Code:** there is no dedicated code-channel or Artifact-panel workflow;
-      coding stays in the local Pi session and Slack thread.
-    - **Long turns:** one stream is used per turn. There is no stream rotation or deliberate
-      long-job plan-message path; Slack's [`chat.startStream` limits](https://docs.slack.dev/reference/methods/chat.startStream#timeout)
-      (10 minutes and 12,000 text characters) can end live progress before Pi finishes.
-    - **Approval policy:** `approvals = "auto"` is the default and adds `--approve`; the
-      interactive Slack approval flow is available but must be configured. Slack's [agent
-      design guide](https://docs.slack.dev/concepts/agent-design/#confirmation-control)
-      recommends explicit confirmation for consequential actions.
-    - **Data retention:** thread context is sent to Pi; when messages must be omitted or
-      shortened to fit the prompt, pi-chat writes the full fetched transcript to a local
-      sidecar, bounded to 20 files per thread.
-      This deliberate retention exception is in tension with Slack's [data-retention
-      guidance](https://docs.slack.dev/concepts/agent-design/#data-retention); deployments
-      should account for it.
+    - **Session names:** A Slack session should receive a concise initial title and honor
+      user renames. Option A keeps titles adapter-owned, using the initial `title` on
+      [`agents.sessions.setStatus`](https://docs.slack.dev/reference/methods/agents.sessions.setStatus),
+      [`agents.sessions.rename`](https://docs.slack.dev/reference/methods/agents.sessions.rename),
+      and `agent_session_title_changed`. Option B mirrors titles into Pi/Gateway metadata,
+      which needs ownership and conflict rules. Prefer Slack-owned titles; do not rename local
+      Pi sessions implicitly.
+    - **Context and retrieval:** Use the message's `app_context` snapshot for the view the
+      user is acting on. For cross-channel retrieval, option A keeps context thread-only
+      (least privilege); option B calls
+      [`assistant.search.context`](https://docs.slack.dev/ai/developing-agents/#full-example)
+      for explicit search requests, passes `action_token`, constrains content types, and
+      returns source links. Decide permission and retention rules before enabling search;
+      treat retrieved content as untrusted input.
+    - **Progress:** Use timeline task cards for simple actions and a plan for multi-step
+      work. For work that may cross Slack's [10-minute or 12,000-character stream limits](https://docs.slack.dev/reference/methods/chat.startStream#timeout),
+      compare (A) rotating streams with `session_status: processing` and (B) `chat.postMessage`
+      with a plan block and rate-limited `chat.update`; keep stop/status lifecycle continuous.
+    - **Feedback and approvals:** Add answer-level feedback controls such as
+      `feedback_buttons`. Default consequential write/execute actions to human confirmation;
+      make automatic approval explicit opt-in, following Slack's [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
+    - **Data retention:** Before expanding context, decide whether Slack-derived content may
+      enter persisted Pi histories or local sidecars. Prefer minimal retention; any opt-in
+      storage needs clear retention and deletion behavior, consistent with Slack's
+      [data-retention guidance](https://docs.slack.dev/concepts/agent-design/#data-retention).
+    - **Not planned:** Slack Code channels and Artifact panels are outside this product
+      scope. pi-chat's session/worktree identity is one Slack thread to one local Pi session;
+      a channel-per-task model and artifact publisher need a separate ownership contract.
+      Revisit only for a concrete collaboration use case.
 
     The scopes, precisely: `agents.sessions.setStatus` and `agents.sessions.rename` need
     **`chat:write` alone** — the agent surface is not what buys `assistant:write`.
