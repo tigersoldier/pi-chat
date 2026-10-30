@@ -672,12 +672,18 @@ Constraints and behaviours:
       for explicit search requests, passes `action_token`, constrains content types, and
       returns source links. Decide permission and retention rules before enabling search;
       treat retrieved content as untrusted input.
-    - **Progress:** Use timeline task cards for simple actions and a plan for multi-step
-      work. Long turns already rotate their stream before Slack's [10-minute stream
-      limit](https://docs.slack.dev/reference/methods/chat.startStream#timeout) (see above)
-      and keep the session `processing`; the separate 12,000-character budget still falls
-      back to a bounded final patch at settlement. A plan message with rate-limited
-      `chat.update` remains an option for multi-step work.
+    - **Progress (chosen):** Keep the timeline stream for simple work, and rotate it before
+      Slack's [10-minute stream limit](https://docs.slack.dev/reference/methods/chat.startStream#timeout)
+      so a long turn keeps its task timeline and stop control. When a second distinct tool
+      step is observed, stop the stream with `session_status: processing` and promote the same
+      message to a plan; if Slack has already closed a single-task stream, replace it with a
+      task card. Keep at most 40 observed steps plus one aggregate row, expose safe
+      titles/status only, and coalesce `chat.update` to Slack's three-second cadence with a
+      fresh `block_id` per plan update. Post the final answer separately so the report remains
+      visible. Renew `processing`/`suspended` status before Slack's one-hour lease expires,
+      preserving the stop control. On startup, use the persisted message handle to mark an
+      unfinished report interrupted before ingress; a process cannot resume a stream it did
+      not hold.
     - **Feedback and approvals:** Add answer-level feedback controls such as
       `feedback_buttons`. Default consequential write/execute actions to human confirmation;
       make automatic approval explicit opt-in, following Slack's [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
@@ -752,7 +758,7 @@ threads(thread_key PK,            -- app: workspace:channel:thread_ts; self_dm: 
         session_name, session_path, session_id, cwd, project_dir,
         state,                    -- warm | cold | deleted
         last_seq, leaf_id,        -- replay cursor (persist on settle and periodically)
-        progress_ts,              -- Slack message being streamed/patched
+        progress_ts,              -- in-flight Slack reply/report handle
         observed_ts,              -- newest message a prompt has already carried
         created_at, last_active)
 
@@ -797,11 +803,12 @@ Rules:
   `event_id`s. Claiming by event id spent two turns, and posted two answers, on one
   request. A failure to *write* the claim blocks the turn: running the prompt once, late,
   beats running it twice.
-- **`progress_ts` is persisted** (with the reply's timestamp) so that a later phase
-  can recognize the message a restart left half-written. Nothing reads it back yet:
-  a restarted process cannot resume a stream it was not holding, so the next turn
-  writes a new message. The column is there so the recovery path is a change of
-  policy rather than a migration.
+- **`progress_ts` is persisted only while a reply is in flight.** A successful terminal
+  render clears the matching handle. Before ingress starts, recovery stops any leftover
+  stream, replaces its blocks with a generic interruption notice, restores the session to
+  `active`, and clears the handle only after Slack accepts the update. This does not resume
+  a stream the new process never held; subsequent Pi output may start a new reply. Only the
+  message timestamp is stored, never progress titles, tool arguments or output.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
 - **The current schema writes `threads`, `seen`, session-tool bindings, and pending UI routes.** A
   new tool-enabled session commits its thread row and binding in one transaction before
@@ -1221,3 +1228,4 @@ drive the adapter without a workspace.
 | 15 | Two optional surfaces in one daemon, routed by channel; the app surface is disabled by a missing token, the self-DM is opt-in and strict about configuration | One store, one warm cap, one place to reason about senders; the seam already routes by thread, and the channel is part of a thread's key. Missing app tokens are a switch rather than a fault; a self-DM that cannot start is disabled with an error log while the app can still serve, and is fatal only when it is the only surface — a stale cookie must not take the app down or flap under systemd. |
 | 16 | The self-DM is polled, not websocketed, and its interactivity is numbered replies | Polling needs no undocumented client endpoints; the surface has no notification (Slack never marks your own message unread) and no response URL, so text is the honest interface. The costs — an account-wide credential and Slack's documented detection of non-official clients — are why the surface is off by default and documented rather than recommended. |
 | 17 | Self-DM credentials come in two modes, with a per-person OAuth broker as the team shape | The session mode needs no app and stays the single-machine default; the user-token mode is scoped, revocable and one-per-person, which is what lets one app serve many people. The broker is a separate tiny binary because it is the only part that must be reachable from the internet; each daemon still polls its own token, because Socket Mode's fan-out cannot be partitioned per authorization. |
+| 18 | Use timeline progress for simple work and promote observed multi-step work to a bounded plan | Short turns stay lightweight; plans reflect only observed tool events, safe titles and statuses—not guessed plans, arguments, output or private reasoning. The final answer remains separate, while processing status and stop remain continuous. |

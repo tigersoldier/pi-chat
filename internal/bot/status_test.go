@@ -2,7 +2,9 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/tigersoldier/pi-chat/internal/store"
 )
@@ -82,6 +84,75 @@ func TestStopForAnUnknownThreadIsIgnored(t *testing.T) {
 
 // TestStopFromAStrangerIsRefused: the stop button is a way to interrupt
 // someone's work, so it goes through the same allowlist as everything else.
+func TestStatusKeepaliveRenewsTheCurrentState(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := seedStopThread(t, b, st)
+	platform.mu.Lock()
+	platform.statusRefreshInterval = 5 * time.Millisecond
+	platform.mu.Unlock()
+
+	b.setStatus(context.Background(), th, StatusBusy)
+	stopRefresh := b.startStatusKeepalive(context.Background(), th)
+	waitFor(t, "a busy status refresh", func() bool { return len(platform.reportedStatuses()) >= 2 })
+
+	beforeWaiting := len(platform.reportedStatuses())
+	b.setStatus(context.Background(), th, StatusWaiting)
+	waitFor(t, "a waiting status refresh", func() bool { return len(platform.reportedStatuses()) >= beforeWaiting+2 })
+	stopRefresh()
+	b.setStatus(context.Background(), th, StatusIdle)
+
+	got := platform.reportedStatuses()
+	seenWaiting := false
+	for _, status := range got {
+		if status == StatusWaiting {
+			seenWaiting = true
+		}
+		if seenWaiting && status == StatusBusy {
+			t.Fatalf("a stale busy heartbeat followed the waiting transition: %v", got)
+		}
+	}
+	if len(got) == 0 || got[len(got)-1] != StatusIdle {
+		t.Fatalf("last status = %v, want idle after stopping the heartbeat", got)
+	}
+}
+
+func TestRecoverProgressClearsOnlyAfterReporterSucceeds(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	thread := Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1700000000.000100"}
+	row := store.ThreadRow{
+		ThreadKey: thread.Key(), WorkspaceID: thread.Workspace, ChannelID: thread.Channel,
+		ThreadTS: thread.ThreadTS, ProgressTS: "1700000000.000200",
+	}
+	seedThread(t, st, row)
+
+	platform.mu.Lock()
+	platform.recoveryError = errors.New("Slack unavailable")
+	platform.mu.Unlock()
+	b.recoverProgress(context.Background())
+	stored, ok, err := st.Thread(context.Background(), row.ThreadKey)
+	if err != nil || !ok {
+		t.Fatalf("read thread after failed recovery: ok=%v err=%v", ok, err)
+	}
+	if stored.ProgressTS != row.ProgressTS {
+		t.Fatalf("failed recovery cleared handle %q", row.ProgressTS)
+	}
+
+	platform.mu.Lock()
+	platform.recoveryError = nil
+	platform.mu.Unlock()
+	b.recoverProgress(context.Background())
+	stored, ok, err = st.Thread(context.Background(), row.ThreadKey)
+	if err != nil || !ok || stored.ProgressTS != "" {
+		t.Fatalf("successful recovery state = %+v ok=%v err=%v", stored, ok, err)
+	}
+	platform.mu.Lock()
+	recoveries := append([]progressRecoveryRecord(nil), platform.recoveries...)
+	platform.mu.Unlock()
+	if len(recoveries) != 2 || recoveries[0].ts != row.ProgressTS || recoveries[0].thread.Key() != thread.Key() {
+		t.Fatalf("recovery calls = %+v, want the persisted handle retried", recoveries)
+	}
+}
+
 func TestStopFromAStrangerIsRefused(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := seedStopThread(t, b, st)

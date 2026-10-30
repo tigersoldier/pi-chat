@@ -132,6 +132,20 @@ func TestSetThreadStateAndCursor(t *testing.T) {
 	if got.ProgressTS != "1700000000.000300" {
 		t.Errorf("progress ts = %q", got.ProgressTS)
 	}
+	if err := s.ClearProgressTS(ctx, row.ThreadKey, "older-handle"); err != nil {
+		t.Fatalf("ClearProgressTS with a stale handle: %v", err)
+	}
+	got, _, err = s.Thread(ctx, row.ThreadKey)
+	if err != nil || got.ProgressTS != "1700000000.000300" {
+		t.Fatalf("stale cleanup changed the current handle: row=%+v err=%v", got, err)
+	}
+	if err := s.ClearProgressTS(ctx, row.ThreadKey, "1700000000.000300"); err != nil {
+		t.Fatalf("ClearProgressTS: %v", err)
+	}
+	got, _, err = s.Thread(ctx, row.ThreadKey)
+	if err != nil || got.ProgressTS != "" {
+		t.Fatalf("cleared progress handle = %q, err=%v", got.ProgressTS, err)
+	}
 	if !got.LastActive.After(row.LastActive) {
 		t.Errorf("a state change should count as activity: %v", got.LastActive)
 	}

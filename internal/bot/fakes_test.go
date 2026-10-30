@@ -41,24 +41,32 @@ type requestStartRecord struct {
 	queued  bool
 }
 
+type progressRecoveryRecord struct {
+	thread Thread
+	ts     string
+}
+
 // fakePlatform records what the core asks a platform to do.
 type fakePlatform struct {
-	mu                sync.Mutex
-	turns             []Message
-	notices           []Notice
-	acks              []requestAck
-	queued            []Message
-	started           []requestStartRecord
-	completed         []Message
-	failed            []requestFailureRecord
-	onStart           func()
-	opened            []string // the text of each thread the core asked for
-	thread            Thread   // what OpenThread returns; zero means a stand-in
-	renderer          *recordingRenderer
-	startErr          error
-	queueError        error
-	requestStartError error
-	statuses          []Status // lifecycle states, in the order the core asked for them
+	mu                    sync.Mutex
+	turns                 []Message
+	notices               []Notice
+	acks                  []requestAck
+	queued                []Message
+	started               []requestStartRecord
+	completed             []Message
+	failed                []requestFailureRecord
+	onStart               func()
+	opened                []string // the text of each thread the core asked for
+	thread                Thread   // what OpenThread returns; zero means a stand-in
+	renderer              *recordingRenderer
+	startErr              error
+	queueError            error
+	requestStartError     error
+	statuses              []Status // lifecycle states, in the order the core asked for them
+	statusRefreshInterval time.Duration
+	recoveries            []progressRecoveryRecord
+	recoveryError         error
 
 	prompts        []Suggestion
 	promptsChannel string
@@ -208,6 +216,19 @@ func (p *fakePlatform) SetStatus(_ context.Context, _ Thread, s Status) error {
 	defer p.mu.Unlock()
 	p.statuses = append(p.statuses, s)
 	return nil
+}
+
+func (p *fakePlatform) StatusRefreshInterval() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.statusRefreshInterval
+}
+
+func (p *fakePlatform) RecoverInterruptedProgress(_ context.Context, thread Thread, ts string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recoveries = append(p.recoveries, progressRecoveryRecord{thread: thread, ts: ts})
+	return p.recoveryError
 }
 
 // reportedStatuses returns the states the core asked for, in order.

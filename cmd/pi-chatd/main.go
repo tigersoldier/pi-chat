@@ -139,6 +139,9 @@ func run(cfg *config.Config) error {
 
 	core := bot.New(cfg, log, sl.mux, st, version)
 	defer core.Close()
+	// Finalize any Slack progress handles left by a prior process before
+	// Socket Mode or the self-DM poller can start a new turn in that thread.
+	core.RecoverProgress(ctx)
 	checkCtx, cancelCheck := context.WithTimeout(ctx, 5*time.Second)
 	core.CheckShutdownResponses(checkCtx)
 	cancelCheck()

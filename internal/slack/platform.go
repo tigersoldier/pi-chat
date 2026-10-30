@@ -24,6 +24,9 @@ const (
 	// maxMessage is a conservative byte budget within Slack's 12,000-character
 	// markdown_text limit, leaving room for the truncation marker.
 	maxMessage = 12_000
+	// Slack recommends pacing chat.update to at most one update per message per
+	// three seconds. Progress state is coalesced between those writes.
+	progressReportUpdateInterval = 3 * time.Second
 
 	// streamRotateAfter is how long one Slack stream stays open. Slack
 	// documents a 10-minute lifetime measured from chat.startStream, and appends
@@ -425,6 +428,27 @@ func (p *Platform) SetStatus(ctx context.Context, t bot.Thread, s bot.Status) er
 	return nil
 }
 
+// StatusRefreshInterval renews Slack's one-hour agent-session status lease with
+// enough margin for a delayed or rate-limited request.
+func (p *Platform) StatusRefreshInterval() time.Duration { return 45 * time.Minute }
+
+// RecoverInterruptedProgress closes a stream left by a previous process and
+// replaces its task UI with an explicit interruption notice. The message handle
+// is durable; task content remains solely in Slack.
+func (p *Platform) RecoverInterruptedProgress(ctx context.Context, t bot.Thread, ts string) error {
+	if err := p.api.StopStream(ctx, t.Channel, ts, "active"); err != nil && !IsCode(err, "message_not_in_streaming_state") {
+		return fmt.Errorf("stop the interrupted Slack stream: %w", err)
+	}
+	if err := p.api.UpdateBlocks(ctx, t.Channel, ts,
+		"pi-chat restarted while this reply was in progress.", nil); err != nil {
+		return fmt.Errorf("mark the Slack reply interrupted: %w", err)
+	}
+	if err := p.SetStatus(ctx, t, bot.StatusIdle); err != nil && p.log != nil {
+		p.log.Debug("cannot clear recovered Slack session status", "error", err)
+	}
+	return nil
+}
+
 // SetSuggestedPrompts offers prompts in Slack's agent surface, best-effort by
 // contract (bot.PromptReporter).
 func (p *Platform) SetSuggestedPrompts(ctx context.Context, channel, title string, suggestions []bot.Suggestion) error {
@@ -510,9 +534,9 @@ func (r *renderer) setStreamState(next streamState, reason string) {
 	}
 }
 
-// renderer writes one turn into one thread. Streaming is preferred and patching
-// a message is the fallback, so a workspace or thread that refuses
-// chat.startStream still gets an answer (DESIGN.md §6).
+// renderer writes one turn into one thread. Streaming is preferred for short
+// work, with a Block Kit task/plan report for multi-step or stream-closed work;
+// patching remains the fallback for ordinary answers (DESIGN.md §6).
 type renderer struct {
 	platform *Platform
 	api      *API
@@ -524,13 +548,21 @@ type renderer struct {
 	recipientTeam string
 	wantStream    bool
 
-	mu                   sync.Mutex
-	ts                   string
-	streamState          streamState
-	streamAttempted      bool
-	streamStartedAt      time.Time
-	streamTextIncomplete bool
-	text                 strings.Builder
+	mu                       sync.Mutex
+	ts                       string
+	streamState              streamState
+	streamAttempted          bool
+	streamStartedAt          time.Time
+	streamTextIncomplete     bool
+	progressTasks            map[string]bot.TaskProgress
+	progressTaskOrder        []string
+	progressSummary          bot.TaskProgress
+	hasProgressSummary       bool
+	progressReport           bool
+	progressReportDirty      bool
+	progressReportVersion    int
+	lastProgressReportUpdate time.Time
+	text                     strings.Builder
 
 	// tasks keeps the latest state of every task card so a rotated stream can
 	// start with the timeline the previous message was showing instead of an
@@ -582,27 +614,84 @@ func (r *renderer) startStream(ctx context.Context, chunks []streamPayloadChunk)
 	return ts, err
 }
 
-// UpdateTasks sends structured progress through Slack's native task timeline.
-// A task may start the stream before the agent has produced visible text; the
-// task card itself is meaningful progress, so this does not create an empty
-// reply. Batching updates keeps fast tool activity from generating an API call
-// per event. If streaming is disabled or refused, task updates are best-effort
-// and the ordinary text fallback remains unchanged.
+// UpdateTasks sends simple progress through Slack's native task timeline and
+// promotes observed multi-step work to a Block Kit report. A task may start the
+// stream before visible text, and multi-step work may post a report without an
+// answer placeholder. Batching and the report's update cadence coalesce fast
+// tool activity; progress failures never prevent the ordinary final answer.
 func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) error {
-	if !r.wantStream || len(updates) == 0 {
+	if len(updates) == 0 {
 		return nil
 	}
-	chunks := make([]streamPayloadChunk, 0, len(updates))
 	for _, update := range updates {
+		if _, err := taskUpdateChunk(update); err != nil {
+			return err
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.progressTasks == nil {
+		r.progressTasks = make(map[string]bot.TaskProgress)
+	}
+	changed := false
+	for _, update := range updates {
+		if update.ID == botProgressSummaryID {
+			if !r.hasProgressSummary || r.progressSummary != update {
+				changed = true
+			}
+			r.progressSummary = update
+			r.hasProgressSummary = true
+			continue
+		}
+		previous, exists := r.progressTasks[update.ID]
+		if !exists {
+			r.progressTaskOrder = append(r.progressTaskOrder, update.ID)
+			changed = true
+		} else if previous != update {
+			changed = true
+		}
+		r.progressTasks[update.ID] = update
+	}
+
+	if r.progressReport {
+		r.progressReportDirty = r.progressReportDirty || changed
+		return r.updateProgressReportLocked(ctx, false)
+	}
+	if len(r.progressTasks) >= 2 {
+		return r.promoteProgressReportLocked(ctx)
+	}
+	if r.streamState == streamClosed || r.streamState == streamUnknown {
+		return r.promoteProgressReportLocked(ctx)
+	}
+	if !r.wantStream {
+		return nil
+	}
+
+	var timeline []bot.TaskProgress
+	for _, update := range updates {
+		if update.ID == botProgressSummaryID {
+			timeline = append(timeline, update)
+		}
+	}
+	if !r.hasProgressSummary && len(r.progressTasks) == 1 {
+		for _, update := range updates {
+			if update.ID != botProgressSummaryID {
+				timeline = append(timeline, update)
+			}
+		}
+	}
+	if len(timeline) == 0 {
+		return nil
+	}
+	chunks := make([]streamPayloadChunk, 0, len(timeline))
+	for _, update := range timeline {
 		chunk, err := taskUpdateChunk(update)
 		if err != nil {
 			return err
 		}
 		chunks = append(chunks, chunk)
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.ts == "" {
 		if r.streamAttempted {
 			return nil
@@ -636,6 +725,9 @@ func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) 
 				"task_update_chunks", len(chunks),
 				"task_update_text_bytes", taskUpdateTextBytes(chunks),
 				"error", err)
+		}
+		if r.streamState == streamClosed {
+			return r.promoteProgressReportLocked(ctx)
 		}
 		return fmt.Errorf("append task updates: %w", err)
 	}
@@ -738,6 +830,79 @@ func (r *renderer) rotate(ctx context.Context) error {
 	return nil
 }
 
+const botProgressSummaryID = "turn-progress"
+
+func (r *renderer) progressReportTasksLocked() []bot.TaskProgress {
+	if len(r.progressTaskOrder) == 0 {
+		if r.hasProgressSummary {
+			return []bot.TaskProgress{r.progressSummary}
+		}
+		return nil
+	}
+	tasks := make([]bot.TaskProgress, 0, len(r.progressTaskOrder))
+	for _, id := range r.progressTaskOrder {
+		if task, ok := r.progressTasks[id]; ok {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+func (r *renderer) progressReportTitleLocked() string {
+	if r.hasProgressSummary && r.progressSummary.Status != bot.TaskInProgress && r.progressSummary.Title != "" {
+		return r.progressSummary.Title
+	}
+	return "Work in progress"
+}
+
+func (r *renderer) progressReportFallbackLocked() string {
+	return r.progressReportTitleLocked()
+}
+
+// promoteProgressReport stops streaming into the reply and replaces it with a
+// durable task card or plan. The final answer is posted separately so the
+// report remains visible after the work finishes.
+func (r *renderer) promoteProgressReportLocked(ctx context.Context) error {
+	if r.progressReport {
+		return nil
+	}
+	tasks := r.progressReportTasksLocked()
+	if len(tasks) == 0 {
+		return nil
+	}
+	blockID := fmt.Sprintf("pi-progress-%d", r.progressReportVersion+1)
+	blocks := progressBlocks(blockID, r.progressReportTitleLocked(), tasks)
+	fallback := r.progressReportFallbackLocked()
+
+	if r.ts == "" {
+		ts, err := r.api.PostBlocks(ctx, r.channel, r.threadTS, fallback, blocks)
+		if err != nil {
+			return fmt.Errorf("post progress report: %w", err)
+		}
+		r.ts = ts
+	} else {
+		if r.streamMayBeActive() {
+			if err := r.stopStreamWithStatus(ctx, "processing"); err != nil {
+				return fmt.Errorf("stop the reply stream before promoting progress: %w", err)
+			}
+		}
+		if err := r.api.UpdateBlocks(ctx, r.channel, r.ts, fallback, blocks); err != nil {
+			return fmt.Errorf("promote the reply to a progress report: %w", err)
+		}
+	}
+	// The reply is no longer a stream: it is a Block Kit message updated in
+	// place. Disable rotation so Tick does not try to rotate it.
+	r.wantStream = false
+	r.progressReport = true
+	r.progressReportDirty = false
+	r.progressReportVersion++
+	r.lastProgressReportUpdate = time.Now()
+	if err := r.platform.SetStatus(ctx, bot.Thread{Channel: r.channel, ThreadTS: r.threadTS}, bot.StatusBusy); err != nil && r.log != nil {
+		r.log.Debug("cannot keep the promoted progress report processing", "error", err)
+	}
+	return nil
+}
+
 // closeOldTasks marks the current segment's open task cards complete before
 // its stream is stopped. The task cache is deliberately left unchanged: the
 // replacement stream replays the live in-progress cards from taskChunks().
@@ -797,6 +962,40 @@ func (r *renderer) taskChunks() []streamPayloadChunk {
 	return out
 }
 
+// updateProgressReportLocked coalesces task churn and honors Slack's per-message
+// chat.update pacing. A forced terminal update waits only for the remaining
+// interval; callers may still deliver the final answer if that update fails.
+func (r *renderer) updateProgressReportLocked(ctx context.Context, force bool) error {
+	if !r.progressReport || !r.progressReportDirty {
+		return nil
+	}
+	if !r.lastProgressReportUpdate.IsZero() {
+		wait := progressReportUpdateInterval - time.Since(r.lastProgressReportUpdate)
+		if wait > 0 {
+			if !force {
+				return nil
+			}
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	blocks := progressBlocks(
+		fmt.Sprintf("pi-progress-%d", r.progressReportVersion+1),
+		r.progressReportTitleLocked(), r.progressReportTasksLocked())
+	if err := r.api.UpdateBlocks(ctx, r.channel, r.ts, r.progressReportFallbackLocked(), blocks); err != nil {
+		return fmt.Errorf("update progress report: %w", err)
+	}
+	r.progressReportVersion++
+	r.lastProgressReportUpdate = time.Now()
+	r.progressReportDirty = false
+	return nil
+}
+
 func taskUpdateChunk(update bot.TaskProgress) (streamPayloadChunk, error) {
 	if update.ID == "" || update.Title == "" {
 		return streamPayloadChunk{}, errors.New("task update requires an ID and title")
@@ -854,6 +1053,9 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 		}
 	}
 	r.text.WriteString(text)
+	if r.progressReport {
+		return nil // The report stays stable; the authoritative answer is posted separately.
+	}
 	if r.ts == "" {
 		// Start may fail before a message handle exists. Retain the partial
 		// answer for Finish or Fail without attempting to patch an empty ts.
@@ -915,10 +1117,9 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 	return r.patch(ctx)
 }
 
-// Finish presents the authoritative answer. The streamed text usually is the
-// answer already, in which case finishing the stream is all that is left; when
-// they differ (a dropped append, or a turn that produced several messages) the
-// message is corrected rather than left wrong.
+// Finish presents the authoritative answer. In timeline mode the streamed
+// message is corrected when necessary; after promotion to a report, the answer
+// is posted separately so the task/plan remains visible.
 func (r *renderer) Finish(ctx context.Context, final string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -926,6 +1127,21 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 	streamed := r.text.String()
 	if final == "" {
 		final = streamed
+	}
+	if r.progressReport {
+		if err := r.updateProgressReportLocked(ctx, true); err != nil && r.log != nil {
+			r.log.Warn("cannot finalize Slack progress report", "message_ts", r.ts, "error", err)
+		}
+		if final == "" {
+			return nil
+		}
+		_, err := r.api.PostMarkdownMessage(ctx, r.channel, r.threadTS, truncate(final, maxMessage))
+		if err != nil {
+			return fmt.Errorf("post the final answer after progress report: %w", err)
+		}
+		r.text.Reset()
+		r.text.WriteString(final)
+		return nil
 	}
 	if r.ts == "" {
 		if final == "" {
@@ -1000,8 +1216,8 @@ func (r *renderer) Finish(ctx context.Context, final string) error {
 	return nil
 }
 
-// Fail reports a failed turn in the same message, keeping whatever partial
-// answer arrived first.
+// Fail reports a failed turn. Timeline mode keeps partial text in the same
+// message; report mode preserves the task report and posts the failure separately.
 func (r *renderer) Fail(ctx context.Context, cause error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1012,6 +1228,18 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 			"message_ts", r.ts,
 			"stream_state", streamStateName(r.streamState),
 			"has_partial_text", r.text.Len() > 0)
+	}
+	if r.progressReport {
+		if err := r.updateProgressReportLocked(ctx, true); err != nil && r.log != nil {
+			r.log.Warn("cannot finalize Slack progress report after failure", "message_ts", r.ts, "error", err)
+		}
+		_, err := r.api.PostMarkdownMessage(ctx, r.channel, r.threadTS, truncate(text, maxMessage))
+		if err != nil {
+			return fmt.Errorf("post failure after progress report: %w", err)
+		}
+		r.text.Reset()
+		r.text.WriteString(text)
+		return nil
 	}
 
 	if r.streamMayBeActive() {
@@ -1114,6 +1342,10 @@ func streamAlreadyStopped(err error) bool {
 // stopStream records closure only after Slack confirms it, either through a
 // successful stop or its explicit already-stopped response.
 func (r *renderer) stopStream(ctx context.Context) error {
+	return r.stopStreamWithStatus(ctx, "")
+}
+
+func (r *renderer) stopStreamWithStatus(ctx context.Context, sessionStatus string) error {
 	if r.ts == "" || !r.streamMayBeActive() {
 		return nil
 	}
@@ -1121,7 +1353,7 @@ func (r *renderer) stopStream(ctx context.Context) error {
 		r.log.Debug("stopping Slack reply stream",
 			"message_ts", r.ts, "stream_state", streamStateName(r.streamState))
 	}
-	if err := r.api.StopStream(ctx, r.channel, r.ts, ""); err != nil {
+	if err := r.api.StopStream(ctx, r.channel, r.ts, sessionStatus); err != nil {
 		if streamAlreadyStopped(err) {
 			r.setStreamState(streamClosed, "stop_reported_already_stopped")
 			return nil

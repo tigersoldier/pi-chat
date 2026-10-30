@@ -88,6 +88,17 @@ func gatewayEvent(t *testing.T, typ string, fields map[string]any) gwclient.Even
 	return gwclient.Event{Type: typ, Raw: raw}
 }
 
+func lastProgressTask(updates []TaskProgress, id string) (TaskProgress, bool) {
+	var last TaskProgress
+	found := false
+	for _, update := range updates {
+		if update.ID == id {
+			last, found = update, true
+		}
+	}
+	return last, found
+}
+
 func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
@@ -1049,21 +1060,32 @@ func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
 		id := "call-" + string(rune('1'+i))
 		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
 		updates := st.takeTaskUpdates()
-		if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != title || updates[0].Status != TaskInProgress {
-			t.Fatalf("tool %d progress = %+v, want title %q on one stable task", i+1, updates, title)
+		if i == 0 {
+			if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != title || updates[0].Status != TaskInProgress {
+				t.Fatalf("first tool progress = %+v, want the compact rolling task", updates)
+			}
+		} else if step, ok := lastProgressTask(updates, "tool-step-"+string(rune('1'+i))); !ok || step.Title != title || step.Status != TaskInProgress {
+			t.Fatalf("tool %d progress = %+v, want ordered in-progress step %q", i+1, updates, title)
 		}
 		st.feed(toolEvent(t, "tool_execution_end", id, "bash", false), log)
 	}
-	if len(st.activeTasks) != 1 {
-		t.Fatalf("active tasks = %d, want one task for the entire turn", len(st.activeTasks))
+	if len(st.activeTasks) != len(titles)+1 || len(st.progressTaskOrder) != len(titles) {
+		t.Fatalf("active tasks=%d report rows=%d, want summary plus %d ordered steps", len(st.activeTasks), len(st.progressTaskOrder), len(titles))
 	}
 
 	st.finishProgressTaskAt(TaskComplete, startedAt.Add(2*time.Minute))
 	updates := st.takeTaskUpdates()
 	wantSummary := "Completed · 4 actions · 2m0s"
 	wantDetails := "Completed actions:\n• Check first task\n• Check second task\n• Check third task\n• Check fourth task"
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != wantSummary || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
+	summary, ok := lastProgressTask(updates, turnProgressTaskID)
+	if !ok || summary.Title != wantSummary || summary.Details != wantDetails || summary.Status != TaskComplete {
 		t.Fatalf("turn completion = %+v", updates)
+	}
+	for i, title := range titles {
+		step, ok := lastProgressTask(updates, "tool-step-"+string(rune('1'+i)))
+		if !ok || step.Title != title || step.Status != TaskComplete {
+			t.Fatalf("completed step %d = %+v, want %q complete", i+1, step, title)
+		}
 	}
 }
 
@@ -1302,8 +1324,15 @@ func TestReplayedEventsDoNotDuplicateProgressMarkers(t *testing.T) {
 	nextStart.Seq = 13
 	st.feed(nextMarker, log)
 	st.feed(nextStart, log)
-	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Second action" {
-		t.Fatalf("second action = %+v, want no stale replayed title", got)
+	got := st.takeTaskUpdates()
+	if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Second action" {
+		t.Fatalf("second action summary = %+v, want no stale replayed title", got)
+	}
+	if first, ok := lastProgressTask(got, "tool-step-1"); !ok || first.Title != "First action" {
+		t.Fatalf("first plan step = %+v, want the original observed title", first)
+	}
+	if second, ok := lastProgressTask(got, "tool-step-2"); !ok || second.Title != "Second action" {
+		t.Fatalf("second plan step = %+v, want the next marker", second)
 	}
 }
 
@@ -1383,7 +1412,7 @@ func TestOversizedProgressMarkerIsOnlyRemovedWhenItIsTheWholeMessage(t *testing.
 	}
 }
 
-func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
+func TestProgressTaskUsesBoundedPlanRowsForTheTurn(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
 	startedAt := time.Unix(4_000, 0)
@@ -1399,21 +1428,29 @@ func TestProgressTaskUsesOneStableIDForTheTurn(t *testing.T) {
 	}
 
 	updates := st.takeTaskUpdates()
-	if len(updates) != 2 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Check step x" || updates[0].Status != TaskInProgress || updates[0].Details != "" || updates[1].ID != turnProgressTaskID || updates[1].Title != "Check step "+strings.Repeat("x", 9) || updates[1].Status != TaskInProgress || updates[1].Details != "" {
-		t.Fatalf("coalesced task updates = %+v, want first and latest in-progress titles without details", updates)
+	summaryStart, ok := lastProgressTask(updates, turnProgressTaskID)
+	if !ok || summaryStart.Title != "Check step "+strings.Repeat("x", 9) || summaryStart.Status != TaskInProgress {
+		t.Fatalf("coalesced summary update = %+v", summaryStart)
 	}
-	if len(st.activeTasks) != 1 || st.seenToolCalls.Len() != 9 {
-		t.Fatalf("active tasks=%d seen calls=%d, want one task and nine calls", len(st.activeTasks), st.seenToolCalls.Len())
+	if len(updates) > maxPendingTaskUpdates || len(st.activeTasks) != 10 || st.seenToolCalls.Len() != 9 {
+		t.Fatalf("updates=%d active tasks=%d seen calls=%d, want bounded rows for nine calls", len(updates), len(st.activeTasks), st.seenToolCalls.Len())
 	}
-	if len(st.progressActionTitles) != maxProgressDetailTitles {
-		t.Fatalf("retained action titles = %d, want bounded cap %d", len(st.progressActionTitles), maxProgressDetailTitles)
+	if len(st.progressActionTitles) != maxProgressDetailTitles || len(st.progressTaskOrder) != 9 {
+		t.Fatalf("retained titles=%d report rows=%d, want %d titles and nine steps", len(st.progressActionTitles), len(st.progressTaskOrder), maxProgressDetailTitles)
 	}
 
 	st.finishProgressTaskAt(TaskComplete, startedAt.Add(45*time.Second))
 	updates = st.takeTaskUpdates()
 	wantDetails := "Completed actions:\n• Check step x\n• Check step xx\n• Check step xxx\n• Check step xxxx\n• Check step xxxxx\n• Check step xxxxxx\n• 3 additional action(s) not listed"
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 9 actions · 45s" || updates[0].Details != wantDetails || updates[0].Status != TaskComplete {
-		t.Fatalf("completed task update = %+v", updates)
+	summary, ok := lastProgressTask(updates, turnProgressTaskID)
+	if !ok || summary.Title != "Completed · 9 actions · 45s" || summary.Details != wantDetails || summary.Status != TaskComplete {
+		t.Fatalf("completed summary = %+v", summary)
+	}
+	for i := range 9 {
+		step, ok := lastProgressTask(updates, "tool-step-"+string(rune('1'+i)))
+		if !ok || step.Status != TaskComplete {
+			t.Fatalf("completed step %d = %+v, want complete", i+1, step)
+		}
 	}
 
 	st.feed(gwclient.Event{Type: "agent_settled"}, log)
@@ -1465,8 +1502,12 @@ func TestCompletedActionCountUsesUniqueToolEnds(t *testing.T) {
 	st.finishProgressTaskAt(TaskComplete, startedAt.Add(125*time.Second))
 
 	updates := st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].Title != "Completed · 2 actions · 2m5s" {
+	summary, ok := lastProgressTask(updates, turnProgressTaskID)
+	if !ok || summary.Title != "Completed · 2 actions · 2m5s" {
 		t.Fatalf("completion summary = %+v, want two returned calls and elapsed time", updates)
+	}
+	if step, ok := lastProgressTask(updates, "tool-step-2"); !ok || step.Status != TaskError {
+		t.Fatalf("failed tool step = %+v, want error status", step)
 	}
 }
 
@@ -1522,8 +1563,15 @@ func TestDuplicateToolStartDoesNotConsumeNextProgressTitle(t *testing.T) {
 	}
 
 	st.feed(toolEvent(t, "tool_execution_start", "call-2", "bash", false), log)
-	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Second action" {
-		t.Fatalf("second action = %+v, want marker preserved for next call", got)
+	got := st.takeTaskUpdates()
+	if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Second action" {
+		t.Fatalf("second action summary = %+v, want marker preserved for next call", got)
+	}
+	if first, ok := lastProgressTask(got, "tool-step-1"); !ok || first.Title != "First action" {
+		t.Fatalf("first plan step = %+v, want original marker", first)
+	}
+	if second, ok := lastProgressTask(got, "tool-step-2"); !ok || second.Title != "Second action" {
+		t.Fatalf("second plan step = %+v, want next marker", second)
 	}
 }
 
@@ -1555,13 +1603,18 @@ func TestProgressMarkerBoundariesAndTitleQueueAreBounded(t *testing.T) {
 	for i := range maxPendingProgressTitles {
 		id := "queued-" + strings.Repeat("x", i+1)
 		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
-		if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Check service" {
+		got := st.takeTaskUpdates()
+		if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Check service" {
 			t.Fatalf("queued progress %d = %+v", i, got)
 		}
 	}
 	st.feed(toolEvent(t, "tool_execution_start", "overflow", "bash", false), log)
-	if got := st.takeTaskUpdates(); len(got) != 1 || got[0].Title != "Running a command" {
+	got := st.takeTaskUpdates()
+	if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Running a command" {
 		t.Fatalf("overflow should use the generic title: %+v", got)
+	}
+	if len(st.progressTaskOrder) != maxProgressReportTasks || st.activeTasks[progressOverflowTaskID].Title == "" {
+		t.Fatalf("visible steps=%d overflow=%+v, want %d steps and one aggregate", len(st.progressTaskOrder), st.activeTasks[progressOverflowTaskID], maxProgressReportTasks)
 	}
 	if st.seenToolCalls.Len() != maxSeenToolCallIDs {
 		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", st.seenToolCalls.Len(), maxSeenToolCallIDs)

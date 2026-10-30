@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS threads (
     state        TEXT NOT NULL DEFAULT 'cold',   -- warm | cold | deleted
     last_seq     INTEGER NOT NULL DEFAULT 0,     -- replay cursor
     leaf_id      TEXT NOT NULL DEFAULT '',
-    progress_ts  TEXT NOT NULL DEFAULT '',       -- reply being streamed/patched
+    progress_ts  TEXT NOT NULL DEFAULT '',       -- in-flight Slack reply/report handle
     observed_ts  TEXT NOT NULL DEFAULT '',       -- observation watermark
     created_at   INTEGER NOT NULL,
     last_active  INTEGER NOT NULL

@@ -47,6 +47,11 @@ type thread struct {
 	// running turn.
 	turnMu sync.Mutex
 
+	// statusMu serializes user-visible status transitions with lease refreshes,
+	// so a late heartbeat cannot restore a stale processing state after idle.
+	statusMu sync.Mutex
+	status   Status
+
 	// connMu guards the bound connection. It is held while dialing, binding
 	// and closing — never for the duration of a turn.
 	connMu sync.Mutex
@@ -1079,7 +1084,34 @@ func (th *thread) noteProgress(ctx context.Context, r Renderer) {
 		th.log.Warn("cannot record the reply handle", "error", err)
 		return
 	}
-	th.update(func(row *store.ThreadRow) { row.ProgressTS = ts })
+	th.rowMu.Lock()
+	th.row.ProgressTS = ts
+	th.rowMu.Unlock()
+}
+
+// clearProgress forgets the handle only after the renderer has reached a
+// terminal Slack state. A failed terminal write leaves the handle for startup
+// recovery.
+func (th *thread) clearProgress(ctx context.Context, r Renderer) {
+	reporter, ok := r.(ProgressReporter)
+	if !ok {
+		return
+	}
+	ts := reporter.Progress()
+	if ts == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
+	defer cancel()
+	if err := th.b.store.ClearProgressTS(ctx, th.key, ts); err != nil {
+		th.log.Warn("cannot clear the completed reply handle", "error", err)
+		return
+	}
+	th.rowMu.Lock()
+	if th.row.ProgressTS == ts {
+		th.row.ProgressTS = ""
+	}
+	th.rowMu.Unlock()
 }
 
 // close ends the thread's connection and leaves the session alone: the session

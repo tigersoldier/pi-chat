@@ -342,6 +342,64 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 }
 
+// RecoverProgress marks messages left in flight by a prior process. Call it
+// before starting ingress so recovery cannot reset a new turn's status.
+func (b *Bot) RecoverProgress(ctx context.Context) { b.recoverProgress(ctx) }
+
+// recoverProgress marks messages left in flight by a prior process and clears
+// only the matching stored handle. The timestamp is enough to find the Slack
+// message; the progress content itself remains in Slack rather than SQLite.
+func (b *Bot) recoverProgress(ctx context.Context) {
+	reporter, ok := b.plat.(ProgressRecoveryReporter)
+	if !ok {
+		return
+	}
+	listCtx, cancelList := context.WithTimeout(ctx, storeTimeout)
+	rows, err := b.store.Threads(listCtx)
+	cancelList()
+	if err != nil {
+		b.log.Warn("cannot list threads for progress recovery", "error", err)
+		return
+	}
+	for _, row := range rows {
+		if row.ProgressTS == "" || row.Surface == SurfaceSelfDM {
+			continue
+		}
+		thread := Thread{
+			Workspace: row.WorkspaceID,
+			Channel:   row.ChannelID,
+			ThreadTS:  row.ThreadTS,
+			Surface:   row.Surface,
+		}
+		recoveryCtx, cancelRecovery := context.WithTimeout(ctx, renderTerminalTimeout)
+		recoveryErr := reporter.RecoverInterruptedProgress(recoveryCtx, thread, row.ProgressTS)
+		cancelRecovery()
+		if recoveryErr != nil {
+			b.log.Warn("cannot recover an interrupted progress message",
+				"thread", row.ThreadKey, "message_ts", row.ProgressTS, "error", recoveryErr)
+			continue
+		}
+		clearCtx, cancelClear := context.WithTimeout(ctx, storeTimeout)
+		clearErr := b.store.ClearProgressTS(clearCtx, row.ThreadKey, row.ProgressTS)
+		cancelClear()
+		if clearErr != nil {
+			b.log.Warn("cannot clear recovered progress handle",
+				"thread", row.ThreadKey, "message_ts", row.ProgressTS, "error", clearErr)
+			continue
+		}
+		b.mu.Lock()
+		th := b.threads[row.ThreadKey]
+		b.mu.Unlock()
+		if th != nil {
+			th.rowMu.Lock()
+			if th.row.ProgressTS == row.ProgressTS {
+				th.row.ProgressTS = ""
+			}
+			th.rowMu.Unlock()
+		}
+	}
+}
+
 // Close ends every gateway connection. Sessions are left running: they are
 // pi's own state, and an idle one hibernates by itself.
 func (b *Bot) Close() {
@@ -650,7 +708,9 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 		// A refused request never owned the turn, so another turn may still be
 		// running: lowering the indicator here would report it idle.
 		busy := false
+		stopStatusRefresh := b.startStatusKeepalive(ctx, th)
 		defer func() {
+			stopStatusRefresh()
 			if !busy {
 				b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
 			}
@@ -672,6 +732,8 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 				fallbackCtx, fallbackCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 				b.reply(fallbackCtx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: ":warning: pi-chat: " + PublicMessage(err)})
 				fallbackCancel()
+			} else {
+				th.clearProgress(terminalCtx, r)
 			}
 			cancel()
 			b.failRequest(ctx, m)
@@ -694,12 +756,66 @@ func (b *Bot) queueWait() time.Duration {
 // display one. It never fails a turn: a missing indicator is a cosmetic loss,
 // and the adapter is the one that decides whether to try again.
 func (b *Bot) setStatus(ctx context.Context, th *thread, s Status) {
+	th.statusMu.Lock()
+	defer th.statusMu.Unlock()
+	th.status = s
 	reporter, ok := b.plat.(StatusReporter)
 	if !ok {
 		return
 	}
 	if err := reporter.SetStatus(ctx, th.t, s); err != nil {
 		b.log.Debug("cannot show the session status", "thread", th.key, "status", s, "error", err)
+	}
+}
+
+// startStatusKeepalive renews the thread's current status for platforms whose
+// processing/suspended indicator expires. Its refresh path is serialized with
+// ordinary transitions so it cannot resurrect an old state after turn cleanup.
+func (b *Bot) startStatusKeepalive(ctx context.Context, th *thread) func() {
+	lease, ok := b.plat.(StatusRefreshReporter)
+	if !ok {
+		return func() {}
+	}
+	interval := lease.StatusRefreshInterval()
+	if interval <= 0 {
+		return func() {}
+	}
+	refreshCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-ticker.C:
+				b.refreshStatus(refreshCtx, th)
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func (b *Bot) refreshStatus(ctx context.Context, th *thread) {
+	reporter, ok := b.plat.(StatusReporter)
+	if !ok {
+		return
+	}
+	th.statusMu.Lock()
+	defer th.statusMu.Unlock()
+	if th.status != StatusBusy && th.status != StatusWaiting {
+		return
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, renderTerminalTimeout)
+	defer cancel()
+	if err := reporter.SetStatus(refreshCtx, th.t, th.status); err != nil {
+		b.log.Debug("cannot refresh the session status", "thread", th.key,
+			"status", th.status, "error", err)
 	}
 }
 
