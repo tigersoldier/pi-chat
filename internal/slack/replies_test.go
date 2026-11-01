@@ -162,6 +162,42 @@ func TestConversationLabelsPeopleAndMarksTheBotsOwnMessages(t *testing.T) {
 	}
 }
 
+func TestConversationMarksOnlyMessagesThatMentionTheBot(t *testing.T) {
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		switch method {
+		case "conversations.replies":
+			return repliesBody(strings.Join([]string{
+				replyJSON("1.1", "U2", "<@U0> /model x"),
+				replyJSON("1.2", "U2", "<@U9> /model y"),
+				replyJSON("1.3", "U2", "no mention"),
+				`{"ts":"1.4","user":"U7","bot_id":"B2","text":"<@U0> /status"}`,
+			}, ","), false, "")
+		case "users.info":
+			return `{"ok":true,"user":{"name":"alice","profile":{"display_name":"Alice"}}}`
+		}
+		return ""
+	}}
+	platform := testPlatformWithIdentity(t, stub, Identity{TeamID: "T1", UserID: "U0", BotID: "B1"})
+
+	said, err := platform.Conversation(context.Background(),
+		bot.Thread{Workspace: "T1", Channel: "C1", ThreadTS: "1.1"}, "")
+	if err != nil {
+		t.Fatalf("Conversation: %v", err)
+	}
+	if len(said) != 4 {
+		t.Fatalf("said = %d messages, want 4", len(said))
+	}
+	if !said[0].Mentioned {
+		t.Errorf("the bot's mention was not marked: %+v", said[0])
+	}
+	if said[1].Mentioned || said[2].Mentioned {
+		t.Errorf("a mention of someone else or no mention was marked as the bot's: %+v", said[1:])
+	}
+	if said[3].Mentioned {
+		t.Errorf("another app's mention was marked as the bot's: %+v", said[3])
+	}
+}
+
 func TestConversationFallsBackToIDsWithoutTheUsersScope(t *testing.T) {
 	stub := &stubSlack{
 		failed: map[string]string{"users.info": "missing_scope"},

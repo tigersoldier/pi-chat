@@ -164,6 +164,18 @@ func controls() map[string]control {
 	}
 }
 
+// controlNames reports the words pi-chat answers itself as a set. The
+// observation path checks every conversation line against it; the table itself
+// is a function, so the set is built per call.
+func controlNames() map[string]struct{} {
+	table := controls()
+	names := make(map[string]struct{}, len(table))
+	for name := range table {
+		names[name] = struct{}{}
+	}
+	return names
+}
+
 // cmdHelp answers /pi help and @pi /help.
 func (b *Bot) cmdHelp(ctx context.Context, r request, _ string) error {
 	b.answer(ctx, r, b.helpText(ctx, r))

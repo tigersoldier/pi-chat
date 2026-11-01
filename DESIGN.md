@@ -227,12 +227,19 @@ and puts it in front of the request.
   instruction installed once (§3, and the milestone that adds it) is what tells the agent
   that only the text after the block is addressed to it.
 - **Bounded to ~10k characters, newest kept**, with a single message cut at ~2k. Every
-  message the block dropped or shortened is in the file the block names:
+  conversation message the block dropped or shortened for space is in the file the block names:
   `<state dir>/threads/<session name>/observed-<ts>.md`, at most 20 of them per thread (§7).
 - **The bot's own messages are left out** (its history already has them) and the trigger is
   not repeated as somebody's remark. A message that arrives while a turn is running is
   covered by the next turn's fetch, because the watermark only ever reaches what a prompt
   actually carried.
+- **Thread commands are not conversation.** A message pi-chat answers itself (`@pi /model`,
+  `@pi /status`, `@pi /new`, and the rest of §5's table) is addressed to the bot, not a
+  remark for the agent, so the block leaves it out and does not write it to the sidecar.
+  The watermark still advances past it. A bare slash message that was not addressed to the
+  bot is a prompt or an ordinary remark and stays. Commands forwarded to pi (`@pi /compact`,
+  skills, templates) are not filtered: they are the turn's own prompt, and a failed attempt
+  is useful context.
 - **Names need `users:read`** and are resolved lazily, one `users.info` per person per
   process, cached both ways. Without the scope the transcript falls back to bare IDs —
   which is what the mention form `<@U123>` is built from, so the agent can still address

@@ -89,7 +89,15 @@ func (p *Platform) Conversation(ctx context.Context, t bot.Thread, oldest string
 		}
 		// An edited message arrives as its current text with no subtype, so it is
 		// simply the newest version of something already in the transcript.
-		said := bot.Said{TS: r.TS, UserID: r.User, Text: r.Text, Files: attachments(r.Files)}
+		said := bot.Said{
+			TS:     r.TS,
+			UserID: r.User,
+			Text:   r.Text,
+			Files:  attachments(r.Files),
+			// Only a human message can be a prompt: dispatch rejects every bot post,
+			// so another app's mention of the bot is not a handled command.
+			Mentioned: r.BotID == "" && stripMention(r.Text, p.id.UserID) != r.Text,
+		}
 		switch {
 		case r.User != "" && r.User == p.id.UserID, r.BotID != "" && r.BotID == p.id.BotID:
 			said.FromBot = true
