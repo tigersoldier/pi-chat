@@ -117,6 +117,7 @@ func (th *thread) compose(said []Said, triggerTS string) observation {
 	full := make([]string, 0, len(ordered))
 	truncated := false
 	messages := make([]Said, 0, len(ordered))
+	controls := controlNames()
 	for _, s := range ordered {
 		if compareTS(s.TS, watermark) > 0 {
 			watermark = s.TS
@@ -125,6 +126,11 @@ func (th *thread) compose(said []Said, triggerTS string) observation {
 		case s.FromBot, s.TS == triggerTS:
 			// The agent's own answers are already in its history, and the
 			// trigger is the prompt: neither is news.
+			continue
+		case isControlCommand(s, controls):
+			// A thread command is addressed to pi-chat and answered by it, not a
+			// remark for the agent. Leaving it in makes the next prompt look like
+			// the user asked the agent to run a command that was already handled.
 			continue
 		case strings.TrimSpace(s.Text) == "" && len(s.Files) == 0:
 			continue
@@ -184,6 +190,31 @@ func (th *thread) compose(said []Said, triggerTS string) observation {
 		}
 	}
 	return obs
+}
+
+// isControlCommand reports whether a conversation line is one of pi-chat's own
+// thread commands. Only a human message that addressed the bot itself counts: a
+// command aimed at somebody else was never handled by dispatch, and neither was
+// another app's post. A bare `/model` (a prompt in a DM, a remark elsewhere) is
+// conversation too.
+func isControlCommand(s Said, names map[string]struct{}) bool {
+	if !s.Mentioned || s.UserID == "" {
+		return false
+	}
+	text := strings.TrimSpace(s.Text)
+	if !strings.HasPrefix(text, "<@") {
+		return false
+	}
+	end := strings.IndexByte(text, '>')
+	if end < 0 {
+		return false
+	}
+	name, _ := splitCommand(strings.TrimSpace(text[end+1:]))
+	if name == "" {
+		return false
+	}
+	_, ok := names[name]
+	return ok
 }
 
 // transcriptBlock renders the section that goes in front of a prompt.

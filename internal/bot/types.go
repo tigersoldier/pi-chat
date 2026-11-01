@@ -220,6 +220,10 @@ type Said struct {
 	Name   string // display name, empty when the platform cannot resolve one
 	Text   string
 	Files  []Attachment
+	// Mentioned marks a message that addressed the bot itself. Only the adapter
+	// can tell, and the core uses it to keep a handled command out of the
+	// transcript without dropping a command addressed to somebody else.
+	Mentioned bool
 	// FromBot marks pi-chat's own message. The core leaves them out of a
 	// transcript — the agent has them in its own history — and only the adapter
 	// can tell which messages are its own.

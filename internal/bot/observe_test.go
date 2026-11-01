@@ -91,6 +91,72 @@ func TestConversationRidesInFrontOfThePrompt(t *testing.T) {
 	}
 }
 
+func TestAHandledThreadCommandIsNotConversation(t *testing.T) {
+	b, plat, st := newTestBot(t)
+	th := testThread(t, b, st)
+	plat.said = []Said{
+		{TS: "1700000000.000100", UserID: "U2", Name: "Alice", Text: "the tests are failing since the merge"},
+		{TS: "1700000000.000200", UserID: "U1", Name: "Dana", Text: "<@U0BOT> /model deepseek/deepseek-flash", Mentioned: true},
+		{TS: "1700000000.000250", UserID: "U1", Name: "Dana", Text: "<@U0BOT|pi> /status", Mentioned: true},
+		{TS: "1700000000.000300", UserID: "U1", Name: "Dana", Text: "<@U0BOT> /status", Mentioned: true},
+		{TS: "1700000000.000400", UserID: "U1", Name: "Dana", Text: "continue"},
+		// A command can arrive while the turn for an older trigger is being
+		// prepared. It is still not conversation, but the watermark must move
+		// past it rather than leaving it for the next prompt.
+		{TS: "1700000000.000500", UserID: "U1", Name: "Dana", Text: "<@U0BOT> /model deepseek/deepseek-flash", Mentioned: true},
+	}
+
+	obs := th.observe(context.Background(), Message{TS: "1700000000.000400", Text: "continue"})
+	prompt := obs.prompt("continue")
+
+	for _, unwanted := range []string{"/model", "/status"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Errorf("the handled command %q leaked into the next prompt:\n%s", unwanted, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "the tests are failing since the merge") {
+		t.Errorf("the prompt dropped the actual conversation:\n%s", prompt)
+	}
+	if want := "1700000000.000500"; obs.ts != want {
+		t.Errorf("watermark = %q, want the newest message %q (the filtered command)", obs.ts, want)
+	}
+}
+
+func TestACommandAddressedElsewhereIsConversation(t *testing.T) {
+	b, plat, st := newTestBot(t)
+	th := testThread(t, b, st)
+	plat.said = []Said{
+		// Addressed to another user, not the bot: dispatch never handled it.
+		{TS: "1700000000.000100", UserID: "U2", Name: "Alice", Text: "<@UOTHER> /status is green"},
+		// Another app is not a prompt source either, even when it mentions the bot.
+		{TS: "1700000000.000300", Name: "bot B2", Text: "<@U0BOT> /status", Mentioned: true},
+		// A pi command forwarded as the turn's prompt is not a pi-chat control.
+		{TS: "1700000000.000200", UserID: "U1", Name: "Dana", Text: "<@U0BOT> /compact", Mentioned: true},
+		{TS: "1700000000.000400", UserID: "U1", Name: "Dana", Text: "continue"},
+	}
+
+	obs := th.observe(context.Background(), Message{TS: "1700000000.000400", Text: "continue"})
+	for _, want := range []string{"<@UOTHER> /status is green", "[bot B2] <@U0BOT> /status", "/compact"} {
+		if !strings.Contains(obs.block, want) {
+			t.Errorf("the prompt dropped %q, which is not a handled control command:\n%s", want, obs.block)
+		}
+	}
+}
+
+func TestAMentionlessSlashMessageRemainsConversation(t *testing.T) {
+	b, plat, st := newTestBot(t)
+	th := testThread(t, b, st)
+	plat.said = []Said{
+		{TS: "1700000000.000100", UserID: "U2", Name: "Alice", Text: "/model is the command to use"},
+		{TS: "1700000000.000400", UserID: "U1", Name: "Dana", Text: "continue"},
+	}
+
+	obs := th.observe(context.Background(), Message{TS: "1700000000.000400", Text: "continue"})
+	if !strings.Contains(obs.block, "/model is the command to use") {
+		t.Errorf("a mentionless slash message is conversation and was dropped:\n%s", obs.block)
+	}
+}
+
 func TestNoConversationMeansThePromptIsJustTheRequest(t *testing.T) {
 	b, plat, st := newTestBot(t)
 	th := testThread(t, b, st)
@@ -146,6 +212,12 @@ func TestLongConversationsDropTheOldestAndKeepThemInAFile(t *testing.T) {
 			Text:   fmt.Sprintf("message-%02d ", i) + strings.Repeat("x", 1000),
 		})
 	}
+	// A handled command is not conversation, so it belongs to neither the block
+	// nor the sidecar that carries what the block omitted for space.
+	plat.said = append(plat.said, Said{
+		TS: "1700000000.000150", UserID: "U1", Name: "Dana",
+		Text: "<@U0BOT> /model secret-reference", Mentioned: true,
+	})
 	// The newest message is the trigger, which is the prompt rather than part of
 	// the transcript.
 	plat.said = append(plat.said, Said{TS: "1700000000.000999", UserID: "U1", Name: "Dana", Text: "summarize"})
@@ -178,6 +250,9 @@ func TestLongConversationsDropTheOldestAndKeepThemInAFile(t *testing.T) {
 		if !strings.Contains(string(whole), want) {
 			t.Errorf("the transcript on disk is missing %q", want)
 		}
+	}
+	if strings.Contains(string(whole), "/model secret-reference") {
+		t.Error("a handled command was written to the transcript sidecar")
 	}
 	if !strings.Contains(obs.block, files[0]) {
 		t.Errorf("the block does not name the file it refers to:\n%s", obs.block)
