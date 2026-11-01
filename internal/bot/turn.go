@@ -34,6 +34,7 @@ const (
 	maxToolNameBytes          = 256
 	maxProgressDetailTitles   = 6
 	maxProgressDetailsRunes   = 600
+	maxTurnErrorRunes         = 400
 	turnProgressTaskID        = "turn-progress"
 )
 
@@ -265,7 +266,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.rememberAssistant(final)
 	}
 	if final == "" || (final == before && !st.sawWork()) {
-		return errors.New("the agent produced no answer")
+		return st.noAnswerError()
 	}
 
 	st.finishOpenTasks()
@@ -579,6 +580,12 @@ type turnState struct {
 	discardingProgressClose bool
 	pendingProgress         []string
 
+	// lastAssistantStop and lastAssistantError remember how the last assistant
+	// message ended. A provider failure carries no text, so this is the only
+	// place its explanation reaches the turn's failure path.
+	lastAssistantStop  string
+	lastAssistantError string
+
 	messages       []string        // completed assistant messages with visible text
 	currentMessage strings.Builder // visible text in the current assistant message
 	shown          strings.Builder // text already handed to a renderer
@@ -675,6 +682,11 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 	case "message_start":
 		s.startMessage()
 		s.markWork()
+
+	case "message_end":
+		// message_end carries the authoritative final message, including the
+		// stopReason and errorMessage of an assistant message that failed.
+		s.recordAssistantEnd(ev)
 
 	case "turn_start", "agent_start":
 		s.markProgressStarted()
@@ -1366,11 +1378,71 @@ func (s *turnState) markWork() {
 	s.workOnce.Do(func() { close(s.workCh) })
 }
 
+// recordAssistantEnd remembers how the last assistant message ended. Pi's
+// get_last_assistant_text is text-only, so a failed assistant message has no
+// text to read back; its stopReason and errorMessage are the only explanation
+// available to the turn.
+func (s *turnState) recordAssistantEnd(ev gwclient.Event) {
+	var end struct {
+		Message struct {
+			Role         string `json:"role"`
+			StopReason   string `json:"stopReason"`
+			ErrorMessage string `json:"errorMessage"`
+		} `json:"message"`
+	}
+	if err := ev.Unmarshal(&end); err != nil || end.Message.Role != "assistant" {
+		return
+	}
+	detail := compactTurnError(end.Message.ErrorMessage)
+	s.mu.Lock()
+	s.lastAssistantStop = end.Message.StopReason
+	s.lastAssistantError = detail
+	s.mu.Unlock()
+}
+
+// compactTurnError keeps a provider's explanation to one line and a bounded
+// length; it is shown in Slack, not logged, so ANSI and whitespace are noise.
+func compactTurnError(text string) string {
+	text = strings.Join(strings.Fields(stripANSI(text)), " ")
+	if runes := []rune(text); len(runes) > maxTurnErrorRunes {
+		return string(runes[:maxTurnErrorRunes-1]) + "…"
+	}
+	return text
+}
+
+// noAnswerError explains a turn that produced no visible answer. When the last
+// assistant message failed, the provider's own message is the useful cause;
+// otherwise the generic "no answer" remains accurate.
+func (s *turnState) noAnswerError() error {
+	s.mu.Lock()
+	stop, detail := s.lastAssistantStop, s.lastAssistantError
+	s.mu.Unlock()
+	if stop == "error" {
+		if detail != "" {
+			return fmt.Errorf("the model request failed: %s", detail)
+		}
+		return errors.New("the model request failed")
+	}
+	return errors.New("the agent produced no answer")
+}
+
+// doneProgressStatus is how the task card ends. A provider error with no
+// streamed answer is a failure; partial text still counts as an answer because
+// the reply will carry it.
+func (s *turnState) doneProgressStatus() TaskProgressStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastAssistantStop == "error" && strings.TrimSpace(s.streamedText()) == "" {
+		return TaskError
+	}
+	return TaskComplete
+}
+
 func (s *turnState) markDone() {
 	s.mu.Lock()
 	s.eventDone = true
 	s.mu.Unlock()
-	s.finishProgressTask(TaskComplete)
+	s.finishProgressTask(s.doneProgressStatus())
 	s.flushProgressMarker()
 	s.mu.Lock()
 	s.pendingProgress = nil

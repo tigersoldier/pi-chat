@@ -1,19 +1,23 @@
 package bot
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/tigersoldier/pi-chat/internal/config"
+	"github.com/tigersoldier/pi-chat/internal/store"
 	"github.com/tigersoldier/pi-gateway/gwclient"
+	"github.com/tigersoldier/pi-gateway/protocol"
 )
 
 // discardLogger keeps test output quiet.
@@ -44,6 +48,30 @@ func toolEvent(t *testing.T, typ, callID, name string, isError bool) gwclient.Ev
 		t.Fatal(err)
 	}
 	return gwclient.Event{Type: typ, Raw: raw}
+}
+
+// messageEnd builds the message_end pi sends for a completed message of any
+// role, including the stop reason and error text.
+func messageEnd(t *testing.T, role, stopReason, errorMessage string) gwclient.Event {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         role,
+			"content":      []any{},
+			"stopReason":   stopReason,
+			"errorMessage": errorMessage,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gwclient.Event{Type: "message_end", Raw: raw}
+}
+
+func assistantMessageEnd(t *testing.T, stopReason, errorMessage string) gwclient.Event {
+	t.Helper()
+	return messageEnd(t, "assistant", stopReason, errorMessage)
 }
 
 func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
@@ -96,6 +124,187 @@ func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 1 action · 42s" || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion update = %+v", updates)
 	}
+}
+
+func TestProviderFailureReplacesTheGenericNoAnswerError(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(assistantMessageEnd(t, "error", "Codex error: The usage limit has been reached"), log)
+
+	err := st.noAnswerError()
+	if err == nil || !strings.Contains(err.Error(), "usage limit") {
+		t.Fatalf("noAnswerError = %v, want the provider's own message", err)
+	}
+	if strings.Contains(err.Error(), "produced no answer") {
+		t.Fatalf("the generic no-answer text hid the provider failure: %v", err)
+	}
+
+	// A later successful assistant message means a retry succeeded; the stale
+	// error must not describe the turn.
+	st.feed(assistantMessageEnd(t, "stop", ""), log)
+	if err := st.noAnswerError(); !strings.Contains(err.Error(), "produced no answer") {
+		t.Fatalf("after a successful message noAnswerError = %v, want the generic text", err)
+	}
+
+	// An error with no provider text still says the request failed; it does not
+	// pretend the agent simply had nothing to say.
+	bare := newTurnState()
+	bare.feed(assistantMessageEnd(t, "error", ""), log)
+	if got := bare.noAnswerError().Error(); got != "the model request failed" {
+		t.Fatalf("noAnswerError without detail = %q, want the request failure", got)
+	}
+}
+
+func TestFailedProviderTurnEndsTheTaskAsIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stopReason string
+		errorText  string
+		streamText string
+		want       TaskProgressStatus
+	}{
+		{"provider error", "error", "Codex error: The usage limit has been reached", "", TaskError},
+		{"answer", "stop", "", "", TaskComplete},
+		// Partial text still reaches the reply as its answer, so the card is not
+		// marked incomplete for it.
+		{"provider error after text", "error", "Codex error: The usage limit has been reached", "I started on it", TaskComplete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTurnState()
+			log := discardLogger()
+			st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+			if updates := st.takeTaskUpdates(); len(updates) != 1 || updates[0].Status != TaskInProgress {
+				t.Fatalf("in-progress updates = %+v", updates)
+			}
+			if tc.streamText != "" {
+				st.feed(textDelta(t, tc.streamText), log)
+			}
+
+			st.feed(assistantMessageEnd(t, tc.stopReason, tc.errorText), log)
+			st.feed(gwclient.Event{Type: "agent_settled"}, log)
+
+			updates := st.takeTaskUpdates()
+			if len(updates) != 1 || updates[0].Status != tc.want {
+				t.Fatalf("terminal updates = %+v, want status %q", updates, tc.want)
+			}
+			if tc.want == TaskError && !strings.Contains(updates[0].Title, "Incomplete") {
+				t.Fatalf("terminal title = %q, want an incomplete task", updates[0].Title)
+			}
+		})
+	}
+}
+
+func TestProviderFailureTextIsCompacted(t *testing.T) {
+	st := newTurnState()
+	detail := "\x1b[31mCodex error:\nusage limit\x1b[0m " + strings.Repeat("x", maxTurnErrorRunes+50)
+	st.feed(assistantMessageEnd(t, "error", detail), discardLogger())
+
+	got := st.noAnswerError().Error()
+	if strings.ContainsAny(got, "\x1b\n") {
+		t.Fatalf("failure text kept ANSI or a newline: %q", got)
+	}
+	if want := len([]rune("the model request failed: ")) + maxTurnErrorRunes; len([]rune(got)) > want {
+		t.Fatalf("failure text is %d runes, want at most %d", len([]rune(got)), want)
+	}
+}
+
+func TestNonAssistantMessageEndDoesNotClobberTheFailure(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(assistantMessageEnd(t, "error", "Codex error: The usage limit has been reached"), log)
+	st.feed(messageEnd(t, "toolResult", "error", "the tool failed"), log)
+
+	if got := st.noAnswerError().Error(); !strings.Contains(got, "usage limit") {
+		t.Fatalf("noAnswerError = %q, want the assistant failure", got)
+	}
+}
+
+// TestRunTurnSurfacesTheProviderFailure exercises the production path from the
+// gateway event to the error startTurn reports, not just the helper.
+func TestRunTurnSurfacesTheProviderFailure(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	client := startTurnGateway(t, th, func(enc *json.Encoder) {
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role":         "assistant",
+				"content":      []any{},
+				"stopReason":   "error",
+				"errorMessage": "Codex error: The usage limit has been reached",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
+	if err == nil || !strings.Contains(err.Error(), "usage limit") {
+		t.Fatalf("runTurn error = %v, want the provider's message", err)
+	}
+	if strings.Contains(err.Error(), "produced no answer") {
+		t.Fatalf("runTurn kept the generic no-answer text: %v", err)
+	}
+	if completed := platform.completedRequests(); len(completed) != 0 {
+		t.Errorf("completed requests = %+v, want none after a failed turn", completed)
+	}
+}
+
+// startTurnGateway serves one in-process gateway connection. onPrompt emits the
+// events the fake pi would emit; every command gets an empty successful response.
+func startTurnGateway(t *testing.T, th *thread, onPrompt func(*json.Encoder)) *gwclient.Client {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		enc, dec := json.NewEncoder(conn), json.NewDecoder(bufio.NewReader(conn))
+		var hello json.RawMessage
+		if dec.Decode(&hello) != nil {
+			return
+		}
+		_ = enc.Encode(protocol.Welcome{Type: "gw_welcome", Protocol: protocol.Version,
+			ClientID: "turn-test", Concurrency: "queue",
+			Session: &protocol.SessionRef{Path: "/test-session.jsonl"}})
+		for {
+			var raw json.RawMessage
+			if dec.Decode(&raw) != nil {
+				return
+			}
+			var command struct{ Type, ID string }
+			_ = json.Unmarshal(raw, &command)
+			if command.Type == "prompt" {
+				onPrompt(enc)
+			}
+			_ = enc.Encode(map[string]any{
+				"type": "response", "id": command.ID, "command": command.Type,
+				"success": true, "data": map[string]any{},
+			})
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	client, err := gwclient.Dial(ctx, gwclient.Config{
+		Addr: ln.Addr().String(), Token: "test", OnEvent: th.onEvent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(); <-done })
+	return client
 }
 
 func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T) {
