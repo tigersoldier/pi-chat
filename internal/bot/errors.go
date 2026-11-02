@@ -54,6 +54,9 @@ func PublicMessage(err error) string {
 		if msg := strings.TrimSpace(public.PublicMessage()); msg != "" {
 			return msg
 		}
+		// A PublicError with no public text must not fall back to Error(): that
+		// would put its cause back into chat, which is what the type prevents.
+		return "the request failed"
 	}
 	return err.Error()
 }

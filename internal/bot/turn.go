@@ -132,6 +132,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 
 	client, err := th.ensure(ctx, m.Text)
 	if err != nil {
+		if st.hardSessionFailure() {
+			return st.turnFailure(true)
+		}
 		return turnSetupError(err)
 	}
 	sessionPath := th.snapshot().SessionPath
@@ -172,6 +175,11 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// it in front of the first prompt of the conversation (DESIGN.md §4).
 	instruction := th.neededInstruction(ctx)
 
+	if st.hardSessionFailure() {
+		th.close(ctx)
+		return st.turnFailure(true)
+	}
+
 	// A live agent_start during preparation temporarily replaces this prompt
 	// reservation. Yield the lock so its observed reply can render first, then
 	// restore this reservation before sending the prompt.
@@ -204,6 +212,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.b.setStatus(ctx, th, StatusBusy)
 		client, err = th.ensure(ctx, m.Text)
 		if err != nil {
+			if st.hardSessionFailure() {
+				return st.turnFailure(true)
+			}
 			return turnSetupError(err)
 		}
 		if latest, readErr := client.GetLastAssistantText(ctx); readErr == nil {
@@ -230,12 +241,24 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.instructionSent()
 	}
 	if err := st.waitStarted(ctx, startGrace); err != nil {
+		if failure := st.abortFailure(); failure != nil {
+			return failure
+		}
+		if errors.Is(err, context.Canceled) {
+			return publicError("the turn was canceled", err)
+		}
 		return err
 	}
-	if err := client.AwaitSettled(ctx); err != nil {
+	if err := awaitSettledOrDone(ctx, client, st); err != nil {
 		if st.sessionDeleted() {
 			th.forgetSessionForPath(ctx, sessionPath)
 			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
+		}
+		if failure := st.abortFailure(); failure != nil {
+			return failure
+		}
+		if errors.Is(err, context.Canceled) {
+			return publicError("the turn was canceled", err)
 		}
 		return publicError("the gateway connection was lost while the agent was working", err)
 	}
@@ -251,6 +274,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if st.sessionDeleted() {
 		th.forgetSessionForPath(ctx, sessionPath)
 		return publicError("this session was deleted outside pi-chat; the next message starts a new one", errSessionGone)
+	}
+	if st.hardSessionFailure() {
+		th.close(ctx)
+		return st.turnFailure(true)
 	}
 	th.saveCursorAfterActivity(ctx, client)
 
@@ -284,6 +311,25 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	th.touch()
 	th.b.completeRequest(ctx, m)
 	return nil
+}
+
+// awaitSettledOrDone waits for pi to settle, but also stops when the turn has
+// already observed a terminal session state. A crashed or stopped session does
+// not produce gw_turn settled, and waiting only on the gateway latch would hold
+// the thread until shutdown.
+func awaitSettledOrDone(ctx context.Context, client *gwclient.Client, st *turnState) error {
+	settled := make(chan error, 1)
+	go func() {
+		settled <- client.AwaitSettled(ctx)
+	}()
+	select {
+	case err := <-settled:
+		return err
+	case <-st.doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // renderObservedTurn renders a turn the session started without a Slack
@@ -371,11 +417,16 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 				reconcile()
 				if st.text() == "" && !st.hasPendingTaskUpdates() {
 					if failure := st.terminalFailure(false); failure != nil {
+						th.log.Warn("asynchronous turn failed", "thread", th.key, "error", failure)
 						noticeCtx, noticeCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 						th.b.reply(noticeCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(failure)})
 						noticeCancel()
 					}
-					if client != nil && !st.sessionDeleted() {
+					if st.hardSessionFailure() {
+						if !st.sessionDeleted() {
+							th.close(ctx)
+						}
+					} else if client != nil && !st.sessionDeleted() {
 						th.saveCursorAfterActivity(ctx, client)
 					}
 					return
@@ -442,15 +493,23 @@ waitForCompletion:
 	st.finishOpenTasks()
 	stopFlush()
 	if waitErr == nil {
-		reconcile()
-		if failure := st.terminalFailure(st.text() != ""); failure != nil {
-			waitErr = failure
+		if st.hardSessionFailure() {
+			waitErr = st.turnFailure(st.text() != "")
+		} else {
+			reconcile()
+			if failure := st.terminalFailure(st.text() != ""); failure != nil {
+				waitErr = failure
+			}
 		}
+	}
+	if st.hardSessionFailure() && !st.sessionDeleted() {
+		th.close(ctx)
 	}
 
 	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 	defer cancel()
 	if waitErr != nil {
+		th.log.Warn("asynchronous turn failed", "thread", th.key, "error", waitErr)
 		if err := r.Fail(terminalCtx, waitErr); err != nil {
 			th.log.Error("cannot report the asynchronous reply failure", "error", err)
 			fallbackCtx, fallbackCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
@@ -759,13 +818,20 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 	case "gw_session_state":
 		s.recordSessionState(ev)
 		state, err := ev.SessionState()
-		if err == nil && state.State == protocol.SessionStateDeleted {
-			// The session file is gone: the thread has to stop pointing at it
-			// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
-			// because the read goroutine must not write to the database.
-			s.deleted.Store(true)
-			s.finishProgressTask(TaskError)
-			s.markDone()
+		if err == nil {
+			if state.State == protocol.SessionStateDeleted {
+				// The session file is gone: the thread has to stop pointing at it
+				// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
+				// because the read goroutine must not write to the database.
+				s.deleted.Store(true)
+				s.finishProgressTask(TaskError)
+				s.markDone()
+			} else if sessionStateEndsTurn(state.State) {
+				// A crash never publishes gw_turn settled; a stop may publish it
+				// only after the client stopped waiting. End the local turn now
+				// so runTurn can report the session failure instead of hanging.
+				s.markDone()
+			}
 		}
 
 	case "gw_error":

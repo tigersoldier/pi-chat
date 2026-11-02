@@ -250,8 +250,15 @@ func TestTurnOutcomeReportsASessionCrash(t *testing.T) {
 	st.feed(assistantMessageEnd(t, "stop", ""), log)
 	st.feed(gatewayEvent(t, "agent_settled", nil), log)
 
-	if err := st.turnFailure(true); err == nil || !strings.Contains(err.Error(), "crashed") {
+	err := st.turnFailure(true)
+	if err == nil || !strings.Contains(err.Error(), "crashed") {
 		t.Fatalf("turnFailure = %v, want the session crash", err)
+	}
+	if got := PublicMessage(err); got != "the session process crashed while this turn was running" {
+		t.Fatalf("public message = %q, want the crash without its cause", got)
+	}
+	if strings.Contains(PublicMessage(err), "exit code") || !strings.Contains(err.Error(), "exit code 2") {
+		t.Fatalf("cause visibility = %q, want exit code only in the log-facing error", err)
 	}
 	if got := st.doneProgressStatus(); got != TaskError {
 		t.Fatalf("task status = %q, want incomplete", got)
@@ -285,8 +292,12 @@ func TestTurnOutcomeFallsBackToExtensionError(t *testing.T) {
 	st.markWork()
 	st.feed(gatewayEvent(t, "extension_error", map[string]any{"event": "tool_call", "error": "boom"}), discardLogger())
 
-	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "extension failed") || !strings.Contains(err.Error(), "boom") {
+	err := st.turnFailure(false)
+	if err == nil || !strings.Contains(err.Error(), "extension failed") || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("turnFailure = %v, want the extension failure", err)
+	}
+	if got := PublicMessage(err); got != "an extension failed during this turn" {
+		t.Fatalf("public message = %q, want the extension detail out of chat", got)
 	}
 }
 
@@ -297,6 +308,35 @@ func TestTurnOutcomeFallsBackToGatewayError(t *testing.T) {
 
 	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "gateway") || !strings.Contains(err.Error(), "pi died") {
 		t.Fatalf("turnFailure = %v, want the gateway failure", err)
+	}
+}
+
+func TestGatewayErrorWithARequestIDIsIgnored(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	st.feed(gatewayEvent(t, "gw_error", map[string]any{
+		"code": "bad_request", "message": "not this turn", "id": "r_1",
+	}), discardLogger())
+
+	if err := st.turnFailure(false); !strings.Contains(err.Error(), "produced no answer") {
+		t.Fatalf("turnFailure = %v, want the request-scoped gw_error ignored", err)
+	}
+}
+
+func TestSessionCrashCauseSurvivesLaterSessionStates(t *testing.T) {
+	st := newTurnState()
+	st.feed(gatewayEvent(t, "gw_session_state", map[string]any{
+		"state": "crashed", "reason": "exit", "exitCode": 2,
+	}), discardLogger())
+	st.feed(gatewayEvent(t, "gw_session_state", map[string]any{"state": "restarting"}), discardLogger())
+	st.feed(gatewayEvent(t, "gw_session_state", map[string]any{"state": "stopped"}), discardLogger())
+
+	err := st.turnFailure(false)
+	if err == nil || PublicMessage(err) != "the session process crashed while this turn was running" {
+		t.Fatalf("turnFailure = %v, want the original crash", err)
+	}
+	if !strings.Contains(err.Error(), "exit code 2") {
+		t.Fatalf("turnFailure = %q, want the crash exit code kept for the log", err)
 	}
 }
 
@@ -337,6 +377,44 @@ func TestTurnOutcomeReportsAReadError(t *testing.T) {
 
 	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "read the agent's answer") {
 		t.Fatalf("turnFailure = %v, want the read failure", err)
+	}
+}
+
+func TestSessionCrashEndsTheTurn(t *testing.T) {
+	st := newTurnState()
+	st.feed(gatewayEvent(t, "gw_session_state", map[string]any{
+		"state": "crashed", "reason": "exit", "exitCode": 2,
+	}), discardLogger())
+
+	select {
+	case <-st.doneCh:
+	default:
+		t.Fatal("a session crash did not end the turn")
+	}
+	if !st.hardSessionFailure() {
+		t.Fatal("the crash was not recorded as a hard session failure")
+	}
+	err := st.turnFailure(false)
+	if err == nil || !strings.Contains(PublicMessage(err), "crashed") {
+		t.Fatalf("turnFailure = %v, want the crash", err)
+	}
+	if !strings.Contains(err.Error(), "exit code 2") {
+		t.Fatalf("turnFailure = %q, want the exit code in the logged cause", err)
+	}
+}
+
+func TestStopAfterRetryFailureReportsTheStop(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	st.feed(assistantMessageEnd(t, "error", "529 overloaded"), discardLogger())
+	st.feed(gatewayEvent(t, "agent_settled", map[string]any{"aborted": true}), discardLogger())
+
+	err := st.turnFailure(false)
+	if err == nil || !strings.Contains(PublicMessage(err), "stopped") {
+		t.Fatalf("turnFailure = %v, want the user stop", err)
+	}
+	if strings.Contains(PublicMessage(err), "model request") {
+		t.Fatalf("the stop was reported as a provider error: %v", err)
 	}
 }
 
@@ -430,8 +508,8 @@ func TestRunTurnSurfacesTheProviderFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
-	if err == nil || !strings.Contains(err.Error(), "usage limit") {
-		t.Fatalf("runTurn error = %v, want the provider's message", err)
+	if err == nil || !strings.Contains(PublicMessage(err), "usage limit") {
+		t.Fatalf("runTurn public message = %v, want the provider's message", err)
 	}
 	if strings.Contains(err.Error(), "produced no answer") {
 		t.Fatalf("runTurn kept the generic no-answer text: %v", err)
@@ -468,8 +546,8 @@ func TestRunTurnReportsAProviderFailureAfterPartialText(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{}); err == nil || !strings.Contains(err.Error(), "usage limit") {
-		t.Fatalf("runTurn error = %v, want the provider failure after partial text", err)
+	if err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{}); err == nil || !strings.Contains(PublicMessage(err), "usage limit") {
+		t.Fatalf("runTurn public message = %v, want the provider failure after partial text", err)
 	}
 	if completed := platform.completedRequests(); len(completed) != 0 {
 		t.Errorf("completed requests = %+v, want none after a failed turn", completed)
@@ -490,6 +568,9 @@ func TestObservedTurnReportsATerminalFailureWithoutText(t *testing.T) {
 	notices := platform.postedNotices()
 	if len(notices) != 1 || !strings.Contains(notices[0].Text, "crashed") {
 		t.Fatalf("notices = %+v, want the session crash reported", notices)
+	}
+	if strings.Contains(notices[0].Text, "exit") || strings.Contains(notices[0].Text, "reason") {
+		t.Fatalf("notice leaked the session cause: %q", notices[0].Text)
 	}
 }
 
@@ -527,6 +608,76 @@ func TestObservedTurnReportsAFailureWithPartialText(t *testing.T) {
 	}
 	if got := r.failureText(); !strings.Contains(got, "provider exploded") {
 		t.Fatalf("renderer failure = %q, want the provider failure with partial text", got)
+	}
+	if got := r.failurePublic(); !strings.Contains(got, "provider exploded") {
+		t.Fatalf("renderer public failure = %q, want the provider detail in chat", got)
+	}
+}
+
+func TestRunTurnEndsWhenTheSessionCrashes(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	client := startTurnGateway(t, th, func(enc *json.Encoder) {
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "gw_session_state", "state": "crashed", "reason": "exit", "exitCode": 2,
+		})
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
+	if err == nil || !strings.Contains(PublicMessage(err), "crashed") {
+		t.Fatalf("runTurn = %v, want the session crash, not a wait for a settlement", err)
+	}
+	if strings.Contains(PublicMessage(err), "exit code") || !strings.Contains(err.Error(), "exit code 2") {
+		t.Fatalf("cause visibility = %q, want exit code in the log-facing error only", err)
+	}
+	if completed := platform.completedRequests(); len(completed) != 0 {
+		t.Errorf("completed requests = %+v, want none after a crash", completed)
+	}
+}
+
+func TestRunTurnReportsAStopInsteadOfAConnectionLoss(t *testing.T) {
+	b, _, st := newTestBot(t)
+	th := testThread(t, b, st)
+	client := startTurnGateway(t, th, func(enc *json.Encoder) {
+		_ = enc.Encode(map[string]any{"type": "gw_turn", "state": "running", "turnId": "t_1"})
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
+	}()
+	waitFor(t, "the turn to start", func() bool {
+		cur := th.cur.Load()
+		if cur == nil {
+			return false
+		}
+		cur.mu.Lock()
+		defer cur.mu.Unlock()
+		return cur.started
+	})
+	if stopped, err := th.abort(context.Background()); err != nil || !stopped {
+		t.Fatalf("abort = (%v, %v), want the live turn stopped", stopped, err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(PublicMessage(err), "stopped") {
+			t.Fatalf("runTurn = %v, want the stop message", err)
+		}
+		if strings.Contains(PublicMessage(err), "gateway connection") {
+			t.Fatalf("the stop was reported as a connection loss: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runTurn did not return after the stop")
 	}
 }
 
@@ -1509,6 +1660,7 @@ type recordingRenderer struct {
 	tasks              []TaskProgress
 	finals             []string
 	failure            string
+	publicFailure      string
 	failureContextErr  error
 	failureHasDeadline bool
 	signal             chan struct{} // if set, receives a value on every Delta
@@ -1553,6 +1705,7 @@ func (r *recordingRenderer) Fail(ctx context.Context, cause error) error {
 	_, hasDeadline := ctx.Deadline()
 	r.mu.Lock()
 	r.failure = cause.Error()
+	r.publicFailure = PublicMessage(cause)
 	r.failureContextErr = ctx.Err()
 	r.failureHasDeadline = hasDeadline
 	r.mu.Unlock()
@@ -1569,6 +1722,12 @@ func (r *recordingRenderer) failureText() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.failure
+}
+
+func (r *recordingRenderer) failurePublic() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.publicFailure
 }
 
 func (r *recordingRenderer) finalAnswers() []string {

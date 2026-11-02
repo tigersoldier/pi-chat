@@ -214,25 +214,35 @@ func (s *turnState) recordSessionState(ev gwclient.Event) {
 	if err != nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.eventDone || !s.started {
+	if !sessionStateEndsTurn(state.State) {
 		return
 	}
-	switch state.State {
-	case "crashed", "stopped", "restarting", protocol.SessionStateDeleted:
-		s.outcome.sessionState = state.State
-		s.outcome.sessionReason = compactTurnError(state.Reason)
-		if state.ExitCode != nil {
-			code := *state.ExitCode
-			s.outcome.sessionExitCode = &code
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.eventDone {
+		return
+	}
+	// Keep the first hard state unless a crash arrives later: a crash carries
+	// the exit code, while a restart/stop that follows it would erase the cause.
+	replace := s.outcome.sessionState == "" ||
+		state.State == protocol.SessionStateDeleted ||
+		(state.State == "crashed" && s.outcome.sessionState != "crashed")
+	if !replace {
+		return
+	}
+	s.outcome.sessionState = state.State
+	s.outcome.sessionReason = compactTurnError(state.Reason)
+	if state.ExitCode != nil {
+		code := *state.ExitCode
+		s.outcome.sessionExitCode = &code
+	} else {
+		s.outcome.sessionExitCode = nil
 	}
 }
 
 func (s *turnState) recordGatewayError(ev gwclient.Event) {
 	var gateway protocol.ErrorEvent
-	if ev.Unmarshal(&gateway) != nil {
+	if ev.Unmarshal(&gateway) != nil || gateway.ID != "" {
 		return
 	}
 	message := compactTurnError(gateway.Message)
@@ -301,13 +311,15 @@ func (o turnOutcome) explicitFailure(hasText bool) bool {
 	if o.hardSessionFailure() {
 		return true
 	}
+	// A user stop is the immediate fact even when the aborted run left a
+	// provider error on the last assistant message.
+	if o.aborted {
+		return !hasText
+	}
 	switch o.stopReason {
 	case "error", "length":
 		return true
 	case "aborted", "deferred":
-		return !hasText
-	}
-	if o.aborted {
 		return !hasText
 	}
 	if o.stopReason == "stop" || o.stopReason == "toolUse" {
@@ -320,6 +332,9 @@ func (o turnOutcome) explicitFailure(hasText bool) bool {
 func (o turnOutcome) explicitError() error {
 	if message, cause := o.sessionFailure(); message != "" {
 		return publicError(message, cause)
+	}
+	if o.aborted {
+		return publicError("the turn was stopped before it finished", nil)
 	}
 	switch o.stopReason {
 	case "error":
@@ -334,16 +349,13 @@ func (o turnOutcome) explicitError() error {
 	case "deferred":
 		return publicError("the model deferred the response and no final answer arrived", nil)
 	}
-	if o.aborted {
-		return publicError("the turn was stopped before it produced an answer", nil)
-	}
 	switch {
 	case o.retryError != "":
 		return publicError("the model request failed after retries: "+o.retryError, nil)
 	case o.compactionError != "":
 		return publicError("the conversation could not be compacted: "+o.compactionError, nil)
 	case o.extensionError != "":
-		return publicError("an extension failed during this turn: "+o.extensionError, nil)
+		return publicError("an extension failed during this turn", errors.New(o.extensionError))
 	case o.gatewayError != "":
 		return publicError("the gateway reported an error while this turn was running", errors.New(o.gatewayError))
 	case o.readError != "":
@@ -371,12 +383,34 @@ func (o turnOutcome) taskFailed(hasText bool) bool {
 	return o.explicitFailure(hasText)
 }
 
-func (o turnOutcome) hardSessionFailure() bool {
-	switch o.sessionState {
+func sessionStateEndsTurn(state string) bool {
+	switch state {
 	case "crashed", "stopped", "restarting", protocol.SessionStateDeleted:
 		return true
 	}
 	return false
+}
+
+func (o turnOutcome) hardSessionFailure() bool {
+	return sessionStateEndsTurn(o.sessionState)
+}
+
+func (s *turnState) hardSessionFailure() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome.hardSessionFailure()
+}
+
+// abortFailure is the public result when the local turn context was canceled
+// by a stop, before the normal settled path could classify it.
+func (s *turnState) abortFailure() error {
+	s.mu.Lock()
+	aborted := s.aborted || s.outcome.aborted || s.outcome.stopReason == "aborted"
+	s.mu.Unlock()
+	if !aborted {
+		return nil
+	}
+	return publicError("the turn was stopped before it finished", nil)
 }
 
 func (o turnOutcome) sessionFailure() (string, error) {
