@@ -618,6 +618,8 @@ func TestRunTurnEndsWhenTheSessionCrashes(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := testThread(t, b, st)
 	client := startTurnGateway(t, th, func(enc *json.Encoder) {
+		// The running turn sets the gateway latch; a crash never settles it.
+		_ = enc.Encode(map[string]any{"type": "gw_turn", "state": "running", "turnId": "t_1"})
 		_ = enc.Encode(map[string]any{"type": "agent_start"})
 		_ = enc.Encode(map[string]any{
 			"type": "gw_session_state", "state": "crashed", "reason": "exit", "exitCode": 2,
