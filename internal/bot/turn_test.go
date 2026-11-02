@@ -214,6 +214,16 @@ func TestTurnOutcomeReportsAborted(t *testing.T) {
 		}
 	})
 
+	t.Run("via the settled flag", func(t *testing.T) {
+		st := newTurnState()
+		st.markWork()
+		st.feed(gatewayEvent(t, "agent_settled", map[string]any{"aborted": true}), discardLogger())
+
+		if err := st.terminalFailure(false); err == nil || !strings.Contains(err.Error(), "stopped") {
+			t.Fatalf("terminalFailure = %v, want the abort message", err)
+		}
+	})
+
 	t.Run("with partial text", func(t *testing.T) {
 		st := newTurnState()
 		log := discardLogger()
@@ -480,6 +490,20 @@ func TestObservedTurnReportsATerminalFailureWithoutText(t *testing.T) {
 	notices := platform.postedNotices()
 	if len(notices) != 1 || !strings.Contains(notices[0].Text, "crashed") {
 		t.Fatalf("notices = %+v, want the session crash reported", notices)
+	}
+}
+
+func TestObservedTurnStaysSilentForASuccessfulTextlessWake(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	turn := newTurnState()
+	turn.markDone()
+	th.cur.Store(turn)
+
+	th.renderObservedTurn(turn, nil)
+
+	if notices := platform.postedNotices(); len(notices) != 0 {
+		t.Fatalf("notices = %+v, want no notice for a successful textless wake", notices)
 	}
 }
 
