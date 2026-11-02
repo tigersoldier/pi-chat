@@ -202,7 +202,6 @@ func TestTurnOutcomeReportsTruncation(t *testing.T) {
 func TestTurnOutcomeReportsAborted(t *testing.T) {
 	t.Run("without text", func(t *testing.T) {
 		st := newTurnState()
-		st.markWork()
 		st.feed(assistantMessageEnd(t, "aborted", ""), discardLogger())
 		st.feed(gatewayEvent(t, "agent_settled", map[string]any{"aborted": true}), discardLogger())
 

@@ -111,9 +111,7 @@ func (s *turnState) recordAgentSettled(ev gwclient.Event) {
 	}
 	if ev.Unmarshal(&settled) == nil && settled.Aborted {
 		s.mu.Lock()
-		if s.started {
-			s.outcome.aborted = true
-		}
+		s.outcome.aborted = true
 		s.mu.Unlock()
 	}
 }
