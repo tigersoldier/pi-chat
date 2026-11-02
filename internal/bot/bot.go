@@ -634,6 +634,10 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 		r, err := b.plat.StartTurn(ctx, m)
 		if err != nil {
 			b.log.Error("cannot start the reply", "thread", th.key, "error", err)
+			failure := publicError("I couldn't start the reply", err)
+			noticeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+			b.reply(noticeCtx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: ":warning: pi-chat: " + PublicMessage(failure)})
+			cancel()
 			b.failRequest(ctx, m)
 			return
 		}
@@ -648,6 +652,9 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 			terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 			if ferr := r.Fail(terminalCtx, err); ferr != nil {
 				b.log.Error("cannot report the failure", "thread", th.key, "error", ferr)
+				fallbackCtx, fallbackCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+				b.reply(fallbackCtx, Notice{Thread: &m.Thread, UserID: m.UserID, Text: ":warning: pi-chat: " + PublicMessage(err)})
+				fallbackCancel()
 			}
 			cancel()
 			b.failRequest(ctx, m)

@@ -132,7 +132,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 
 	client, err := th.ensure(ctx, m.Text)
 	if err != nil {
-		return err
+		return turnSetupError(err)
 	}
 	sessionPath := th.snapshot().SessionPath
 
@@ -204,7 +204,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.b.setStatus(ctx, th, StatusBusy)
 		client, err = th.ensure(ctx, m.Text)
 		if err != nil {
-			return err
+			return turnSetupError(err)
 		}
 		if latest, readErr := client.GetLastAssistantText(ctx); readErr == nil {
 			before = latest
@@ -218,9 +218,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
 		if st.sessionDeleted() {
 			th.forgetSessionForPath(ctx, sessionPath)
-			return fmt.Errorf("%w: it was deleted outside pi-chat", errSessionGone)
+			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
 		}
-		return fmt.Errorf("prompt: %w", err)
+		return publicError("I couldn't send the request to the agent", err)
 	}
 	// The prompt is where those messages went, so this is the first moment the
 	// watermark may move past them — and the instruction is owed until a prompt
@@ -235,14 +235,14 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if err := client.AwaitSettled(ctx); err != nil {
 		if st.sessionDeleted() {
 			th.forgetSessionForPath(ctx, sessionPath)
-			return fmt.Errorf("%w: it was deleted outside pi-chat", errSessionGone)
+			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
 		}
-		return fmt.Errorf("wait for the turn: %w", err)
+		return publicError("the gateway connection was lost while the agent was working", err)
 	}
 	// A concurrent `/abort` can race with settlement. Wait for its gateway
 	// outcome before finalizing the Slack task or stopping the renderer.
 	if err := st.waitAbortResolution(context.Background()); err != nil {
-		return fmt.Errorf("wait for an in-flight abort: %w", err)
+		return publicError("the stop request could not be completed", err)
 	}
 
 	// The turn is over, wherever it ended: remember how far this connection
@@ -250,29 +250,35 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// deleted session has nothing left to resume, so it is handled first.
 	if st.sessionDeleted() {
 		th.forgetSessionForPath(ctx, sessionPath)
-		return fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
+		return publicError("this session was deleted outside pi-chat; the next message starts a new one", errSessionGone)
 	}
 	th.saveCursorAfterActivity(ctx, client)
 
-	final, err := client.GetLastAssistantText(ctx)
-	if err != nil {
-		th.log.Warn("cannot read the answer", "error", err)
+	final, readErr := client.GetLastAssistantText(ctx)
+	if readErr != nil {
+		th.log.Warn("cannot read the answer", "error", readErr)
 	}
 	// GetLastAssistantText returns just the last assistant message. Preserve
 	// earlier visible messages and fall back to streamed text if reading back
 	// failed, while letting the authoritative final text correct the last one.
 	final = st.authoritativeText(final)
+	if readErr != nil && final == "" {
+		st.recordReadError(readErr)
+	}
 	if final != "" {
 		th.rememberAssistant(final)
 	}
+	if failure := st.turnFailure(final != ""); failure != nil {
+		return failure
+	}
 	if final == "" || (final == before && !st.sawWork()) {
-		return st.noAnswerError()
+		return errors.New("the agent produced no answer")
 	}
 
 	st.finishOpenTasks()
 	stopFlush()
 	if err := r.Finish(ctx, final); err != nil {
-		return fmt.Errorf("finish the reply: %w", err)
+		return publicError("the answer was produced, but the chat message could not be updated", err)
 	}
 	th.noteProgress(ctx, r)
 	th.touch()
@@ -364,6 +370,11 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 			if st.text() == "" && !st.hasPendingTaskUpdates() {
 				reconcile()
 				if st.text() == "" && !st.hasPendingTaskUpdates() {
+					if failure := st.terminalFailure(false); failure != nil {
+						noticeCtx, noticeCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+						th.b.reply(noticeCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(failure)})
+						noticeCancel()
+					}
 					if client != nil && !st.sessionDeleted() {
 						th.saveCursorAfterActivity(ctx, client)
 					}
@@ -390,6 +401,9 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	r, err := th.b.plat.StartTurn(ctx, m)
 	if err != nil {
 		th.log.Error("cannot start the asynchronous reply", "error", err)
+		noticeCtx, noticeCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+		th.b.reply(noticeCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(publicError("I couldn't start the reply", err))})
+		noticeCancel()
 		return
 	}
 	stopFlush := th.flush(ctx, st, r)
@@ -429,6 +443,9 @@ waitForCompletion:
 	stopFlush()
 	if waitErr == nil {
 		reconcile()
+		if failure := st.terminalFailure(st.text() != ""); failure != nil {
+			waitErr = failure
+		}
 	}
 
 	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
@@ -436,6 +453,9 @@ waitForCompletion:
 	if waitErr != nil {
 		if err := r.Fail(terminalCtx, waitErr); err != nil {
 			th.log.Error("cannot report the asynchronous reply failure", "error", err)
+			fallbackCtx, fallbackCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+			th.b.reply(fallbackCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(waitErr)})
+			fallbackCancel()
 		}
 	} else {
 		final := st.text()
@@ -444,6 +464,9 @@ waitForCompletion:
 		}
 		if err := r.Finish(terminalCtx, final); err != nil {
 			th.log.Error("cannot finish the asynchronous reply", "error", err)
+			if failErr := r.Fail(terminalCtx, publicError("the answer was produced, but the chat message could not be updated", err)); failErr != nil {
+				th.log.Error("cannot report the asynchronous reply failure", "error", failErr)
+			}
 		}
 	}
 	if waitErr == nil && client != nil && !st.sessionDeleted() {
@@ -580,16 +603,13 @@ type turnState struct {
 	discardingProgressClose bool
 	pendingProgress         []string
 
-	// lastAssistantStop and lastAssistantError remember how the last assistant
-	// message ended. A provider failure carries no text, so this is the only
-	// place its explanation reaches the turn's failure path.
-	lastAssistantStop  string
-	lastAssistantError string
+	outcome turnOutcome
 
 	messages       []string        // completed assistant messages with visible text
 	currentMessage strings.Builder // visible text in the current assistant message
 	shown          strings.Builder // text already handed to a renderer
 	work           bool
+	started        bool // a turn event established that work belongs to this reservation
 	// promptReservation distinguishes a queued Slack prompt from an unsolicited
 	// turn so an early agent_start can be reserved and rendered separately.
 	promptReservation bool
@@ -688,6 +708,10 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		// stopReason and errorMessage of an assistant message that failed.
 		s.recordAssistantEnd(ev)
 
+	case "agent_end":
+		// The fallback for a reconnect or replay that lost message_end frames.
+		s.recordAgentEnd(ev)
+
 	case "turn_start", "agent_start":
 		s.markProgressStarted()
 		s.markWork()
@@ -709,7 +733,17 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		// several of each (a tool call, then the answer), so treating either as
 		// the end would stop rendering while text was still to come. The
 		// documented signal is agent_settled, or gw_turn going settled.
+		s.recordAgentSettled(ev)
 		s.markDone()
+
+	case "auto_retry_start":
+		s.recordAutoRetryStart(ev)
+
+	case "auto_retry_end":
+		s.recordAutoRetryEnd(ev)
+
+	case "compaction_end":
+		s.recordCompactionEnd(ev)
 
 	case "gw_turn":
 		turn, err := ev.Turn()
@@ -723,6 +757,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		}
 
 	case "gw_session_state":
+		s.recordSessionState(ev)
 		state, err := ev.SessionState()
 		if err == nil && state.State == protocol.SessionStateDeleted {
 			// The session file is gone: the thread has to stop pointing at it
@@ -732,6 +767,9 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 			s.finishProgressTask(TaskError)
 			s.markDone()
 		}
+
+	case "gw_error":
+		s.recordGatewayError(ev)
 
 	case "extension_ui_request":
 		// Two kinds of frame share this type, and only one of them needs
@@ -758,6 +796,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		log.Debug("pi is waiting for a dialog response", "method", request.Method, "id", request.ID)
 
 	case "extension_error":
+		s.recordExtensionError(ev)
 		log.Warn("pi reported an extension error", "event", string(ev.Raw))
 	}
 	return true
@@ -1374,65 +1413,18 @@ func (s *turnState) replace(text string) {
 func (s *turnState) markWork() {
 	s.mu.Lock()
 	s.work = true
+	s.started = true
 	s.mu.Unlock()
 	s.workOnce.Do(func() { close(s.workCh) })
 }
 
-// recordAssistantEnd remembers how the last assistant message ended. Pi's
-// get_last_assistant_text is text-only, so a failed assistant message has no
-// text to read back; its stopReason and errorMessage are the only explanation
-// available to the turn.
-func (s *turnState) recordAssistantEnd(ev gwclient.Event) {
-	var end struct {
-		Message struct {
-			Role         string `json:"role"`
-			StopReason   string `json:"stopReason"`
-			ErrorMessage string `json:"errorMessage"`
-		} `json:"message"`
-	}
-	if err := ev.Unmarshal(&end); err != nil || end.Message.Role != "assistant" {
-		return
-	}
-	detail := compactTurnError(end.Message.ErrorMessage)
-	s.mu.Lock()
-	s.lastAssistantStop = end.Message.StopReason
-	s.lastAssistantError = detail
-	s.mu.Unlock()
-}
-
-// compactTurnError keeps a provider's explanation to one line and a bounded
-// length; it is shown in Slack, not logged, so ANSI and whitespace are noise.
-func compactTurnError(text string) string {
-	text = strings.Join(strings.Fields(stripANSI(text)), " ")
-	if runes := []rune(text); len(runes) > maxTurnErrorRunes {
-		return string(runes[:maxTurnErrorRunes-1]) + "…"
-	}
-	return text
-}
-
-// noAnswerError explains a turn that produced no visible answer. When the last
-// assistant message failed, the provider's own message is the useful cause;
-// otherwise the generic "no answer" remains accurate.
-func (s *turnState) noAnswerError() error {
-	s.mu.Lock()
-	stop, detail := s.lastAssistantStop, s.lastAssistantError
-	s.mu.Unlock()
-	if stop == "error" {
-		if detail != "" {
-			return fmt.Errorf("the model request failed: %s", detail)
-		}
-		return errors.New("the model request failed")
-	}
-	return errors.New("the agent produced no answer")
-}
-
-// doneProgressStatus is how the task card ends. A provider error with no
-// streamed answer is a failure; partial text still counts as an answer because
-// the reply will carry it.
+// doneProgressStatus is how the task card ends. It uses the same terminal
+// outcome as the reply, so a truncation, abort or provider failure after
+// partial text does not leave a successful card behind.
 func (s *turnState) doneProgressStatus() TaskProgressStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastAssistantStop == "error" && strings.TrimSpace(s.streamedText()) == "" {
+	if s.outcome.taskFailed(strings.TrimSpace(s.streamedText()) != "") {
 		return TaskError
 	}
 	return TaskComplete

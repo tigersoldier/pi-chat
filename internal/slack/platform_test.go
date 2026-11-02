@@ -1449,6 +1449,25 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 	}
 }
 
+func TestFailUsesOnlyThePublicMessage(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "patch")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cause := &bot.PublicError{Public: "the model request failed", Cause: errors.New("internal detail")}
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatal(err)
+	}
+
+	text, _ := stub.recorded()[len(stub.recorded())-1].params["markdown_text"].(string)
+	if !strings.Contains(text, "the model request failed") || strings.Contains(text, "internal detail") {
+		t.Fatalf("failure text = %q, want only the public message", text)
+	}
+}
+
 func TestFailKeepsCauseWhenPartialAnswerIsLong(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "patch")

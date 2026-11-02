@@ -74,6 +74,20 @@ func assistantMessageEnd(t *testing.T, stopReason, errorMessage string) gwclient
 	return messageEnd(t, "assistant", stopReason, errorMessage)
 }
 
+// gatewayEvent builds one pi/gateway event with the supplied fields.
+func gatewayEvent(t *testing.T, typ string, fields map[string]any) gwclient.Event {
+	t.Helper()
+	payload := map[string]any{"type": typ}
+	for key, value := range fields {
+		payload[key] = value
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gwclient.Event{Type: typ, Raw: raw}
+}
+
 func TestTurnStateAccumulatesTextDeltas(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
@@ -128,10 +142,11 @@ func TestTurnStateTracksToolTaskProgressWithoutArgumentsOrOutput(t *testing.T) {
 
 func TestProviderFailureReplacesTheGenericNoAnswerError(t *testing.T) {
 	st := newTurnState()
+	st.markWork()
 	log := discardLogger()
 	st.feed(assistantMessageEnd(t, "error", "Codex error: The usage limit has been reached"), log)
 
-	err := st.noAnswerError()
+	err := st.turnFailure(false)
 	if err == nil || !strings.Contains(err.Error(), "usage limit") {
 		t.Fatalf("noAnswerError = %v, want the provider's own message", err)
 	}
@@ -142,16 +157,176 @@ func TestProviderFailureReplacesTheGenericNoAnswerError(t *testing.T) {
 	// A later successful assistant message means a retry succeeded; the stale
 	// error must not describe the turn.
 	st.feed(assistantMessageEnd(t, "stop", ""), log)
-	if err := st.noAnswerError(); !strings.Contains(err.Error(), "produced no answer") {
+	if err := st.turnFailure(false); !strings.Contains(err.Error(), "produced no answer") {
 		t.Fatalf("after a successful message noAnswerError = %v, want the generic text", err)
 	}
 
 	// An error with no provider text still says the request failed; it does not
 	// pretend the agent simply had nothing to say.
 	bare := newTurnState()
+	bare.markWork()
 	bare.feed(assistantMessageEnd(t, "error", ""), log)
-	if got := bare.noAnswerError().Error(); got != "the model request failed" {
-		t.Fatalf("noAnswerError without detail = %q, want the request failure", got)
+	if got := bare.turnFailure(false).Error(); got != "the model request failed" {
+		t.Fatalf("turnFailure without detail = %q, want the request failure", got)
+	}
+}
+
+func TestProviderErrorAfterTextIsStillAFailure(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(textDelta(t, "partial answer"), log)
+	st.feed(assistantMessageEnd(t, "error", "Codex error: The usage limit has been reached"), log)
+
+	if err := st.turnFailure(true); err == nil || !strings.Contains(err.Error(), "usage limit") {
+		t.Fatalf("turnFailure = %v, want the provider error despite text", err)
+	}
+	if got := st.doneProgressStatus(); got != TaskError {
+		t.Fatalf("task status = %q, want incomplete", got)
+	}
+}
+
+func TestTurnOutcomeReportsTruncation(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(textDelta(t, "partial answer"), log)
+	st.feed(assistantMessageEnd(t, "length", ""), log)
+
+	if err := st.turnFailure(true); err == nil || !strings.Contains(err.Error(), "output limit") {
+		t.Fatalf("turnFailure = %v, want the output-limit failure", err)
+	}
+	if got := st.doneProgressStatus(); got != TaskError {
+		t.Fatalf("task status = %q, want incomplete", got)
+	}
+}
+
+func TestTurnOutcomeReportsAborted(t *testing.T) {
+	t.Run("without text", func(t *testing.T) {
+		st := newTurnState()
+		st.markWork()
+		st.feed(assistantMessageEnd(t, "aborted", ""), discardLogger())
+		st.feed(gatewayEvent(t, "agent_settled", map[string]any{"aborted": true}), discardLogger())
+
+		if err := st.terminalFailure(false); err == nil || !strings.Contains(err.Error(), "stopped") {
+			t.Fatalf("terminalFailure = %v, want the abort message", err)
+		}
+		if got := st.doneProgressStatus(); got != TaskError {
+			t.Fatalf("task status = %q, want incomplete", got)
+		}
+	})
+
+	t.Run("with partial text", func(t *testing.T) {
+		st := newTurnState()
+		log := discardLogger()
+		st.feed(textDelta(t, "partial answer"), log)
+		st.feed(assistantMessageEnd(t, "aborted", ""), log)
+		st.feed(gatewayEvent(t, "agent_settled", map[string]any{"aborted": true}), log)
+
+		if err := st.turnFailure(true); err != nil {
+			t.Fatalf("turnFailure = %v, want the partial answer to finish", err)
+		}
+		if got := st.doneProgressStatus(); got != TaskError {
+			t.Fatalf("task status = %q, want incomplete", got)
+		}
+	})
+}
+
+func TestTurnOutcomeReportsASessionCrash(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(textDelta(t, "partial answer"), log)
+	st.feed(gatewayEvent(t, "gw_session_state", map[string]any{
+		"state": "crashed", "reason": "exit", "exitCode": 2,
+	}), log)
+	st.feed(assistantMessageEnd(t, "stop", ""), log)
+	st.feed(gatewayEvent(t, "agent_settled", nil), log)
+
+	if err := st.turnFailure(true); err == nil || !strings.Contains(err.Error(), "crashed") {
+		t.Fatalf("turnFailure = %v, want the session crash", err)
+	}
+	if got := st.doneProgressStatus(); got != TaskError {
+		t.Fatalf("task status = %q, want incomplete", got)
+	}
+}
+
+func TestTurnOutcomeFallsBackToRetryError(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	log := discardLogger()
+	st.feed(gatewayEvent(t, "auto_retry_start", map[string]any{"errorMessage": "529 overloaded"}), log)
+	st.feed(gatewayEvent(t, "auto_retry_end", map[string]any{"success": false, "finalError": "529 overloaded"}), log)
+
+	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "after retries") {
+		t.Fatalf("turnFailure = %v, want the retry failure", err)
+	}
+}
+
+func TestTurnOutcomeFallsBackToCompactionError(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	st.feed(gatewayEvent(t, "compaction_end", map[string]any{"errorMessage": "summary failed"}), discardLogger())
+
+	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "compacted") {
+		t.Fatalf("turnFailure = %v, want the compaction failure", err)
+	}
+}
+
+func TestTurnOutcomeFallsBackToExtensionError(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	st.feed(gatewayEvent(t, "extension_error", map[string]any{"event": "tool_call", "error": "boom"}), discardLogger())
+
+	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "extension failed") || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("turnFailure = %v, want the extension failure", err)
+	}
+}
+
+func TestTurnOutcomeFallsBackToGatewayError(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	st.feed(gatewayEvent(t, "gw_error", map[string]any{"code": "session_crashed", "message": "pi died"}), discardLogger())
+
+	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "gateway") || !strings.Contains(err.Error(), "pi died") {
+		t.Fatalf("turnFailure = %v, want the gateway failure", err)
+	}
+}
+
+func TestTurnOutcomeUsesAgentEndWhenMessageEndIsMissing(t *testing.T) {
+	st := newTurnState()
+	st.markWork()
+	st.feed(gatewayEvent(t, "agent_end", map[string]any{
+		"messages": []any{map[string]any{
+			"role": "assistant", "stopReason": "error", "errorMessage": "from agent end",
+		}},
+	}), discardLogger())
+
+	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "from agent end") {
+		t.Fatalf("turnFailure = %v, want the agent_end fallback", err)
+	}
+}
+
+func TestTurnOutcomeIgnoresRecoveredNoise(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	st.feed(textDelta(t, "answer"), log)
+	st.feed(gatewayEvent(t, "auto_retry_start", map[string]any{"errorMessage": "529 overloaded"}), log)
+	st.feed(gatewayEvent(t, "auto_retry_end", map[string]any{"success": true}), log)
+	st.feed(gatewayEvent(t, "extension_error", map[string]any{"event": "tool_call", "error": "boom"}), log)
+	st.feed(assistantMessageEnd(t, "stop", ""), log)
+
+	if err := st.turnFailure(true); err != nil {
+		t.Fatalf("turnFailure = %v, want a successful answer", err)
+	}
+	if got := st.doneProgressStatus(); got != TaskComplete {
+		t.Fatalf("task status = %q, want complete", got)
+	}
+}
+
+func TestTurnOutcomeReportsAReadError(t *testing.T) {
+	st := newTurnState()
+	st.recordReadError(errors.New("read failed"))
+
+	if err := st.turnFailure(false); err == nil || !strings.Contains(err.Error(), "read the agent's answer") {
+		t.Fatalf("turnFailure = %v, want the read failure", err)
 	}
 }
 
@@ -165,9 +340,9 @@ func TestFailedProviderTurnEndsTheTaskAsIncomplete(t *testing.T) {
 	}{
 		{"provider error", "error", "Codex error: The usage limit has been reached", "", TaskError},
 		{"answer", "stop", "", "", TaskComplete},
-		// Partial text still reaches the reply as its answer, so the card is not
-		// marked incomplete for it.
-		{"provider error after text", "error", "Codex error: The usage limit has been reached", "I started on it", TaskComplete},
+		// A terminal provider error is a failure even when text was streamed;
+		// Fail preserves that text and appends the warning.
+		{"provider error after text", "error", "Codex error: The usage limit has been reached", "I started on it", TaskError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newTurnState()
@@ -196,10 +371,11 @@ func TestFailedProviderTurnEndsTheTaskAsIncomplete(t *testing.T) {
 
 func TestProviderFailureTextIsCompacted(t *testing.T) {
 	st := newTurnState()
+	st.markWork()
 	detail := "\x1b[31mCodex error:\nusage limit\x1b[0m " + strings.Repeat("x", maxTurnErrorRunes+50)
 	st.feed(assistantMessageEnd(t, "error", detail), discardLogger())
 
-	got := st.noAnswerError().Error()
+	got := st.turnFailure(false).Error()
 	if strings.ContainsAny(got, "\x1b\n") {
 		t.Fatalf("failure text kept ANSI or a newline: %q", got)
 	}
@@ -210,12 +386,13 @@ func TestProviderFailureTextIsCompacted(t *testing.T) {
 
 func TestNonAssistantMessageEndDoesNotClobberTheFailure(t *testing.T) {
 	st := newTurnState()
+	st.markWork()
 	log := discardLogger()
 	st.feed(assistantMessageEnd(t, "error", "Codex error: The usage limit has been reached"), log)
 	st.feed(messageEnd(t, "toolResult", "error", "the tool failed"), log)
 
-	if got := st.noAnswerError().Error(); !strings.Contains(got, "usage limit") {
-		t.Fatalf("noAnswerError = %q, want the assistant failure", got)
+	if got := st.turnFailure(false).Error(); !strings.Contains(got, "usage limit") {
+		t.Fatalf("turnFailure = %q, want the assistant failure", got)
 	}
 }
 
@@ -251,6 +428,81 @@ func TestRunTurnSurfacesTheProviderFailure(t *testing.T) {
 	}
 	if completed := platform.completedRequests(); len(completed) != 0 {
 		t.Errorf("completed requests = %+v, want none after a failed turn", completed)
+	}
+}
+
+func TestRunTurnReportsAProviderFailureAfterPartialText(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	client := startTurnGateway(t, th, func(enc *json.Encoder) {
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": "partial answer",
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role":         "assistant",
+				"content":      []any{},
+				"stopReason":   "error",
+				"errorMessage": "Codex error: The usage limit has been reached",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{}); err == nil || !strings.Contains(err.Error(), "usage limit") {
+		t.Fatalf("runTurn error = %v, want the provider failure after partial text", err)
+	}
+	if completed := platform.completedRequests(); len(completed) != 0 {
+		t.Errorf("completed requests = %+v, want none after a failed turn", completed)
+	}
+}
+
+func TestObservedTurnReportsATerminalFailureWithoutText(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	turn := newTurnState()
+	turn.outcome.sessionState = "crashed"
+	turn.outcome.sessionReason = "exit"
+	turn.markDone()
+	th.cur.Store(turn)
+
+	th.renderObservedTurn(turn, nil)
+
+	notices := platform.postedNotices()
+	if len(notices) != 1 || !strings.Contains(notices[0].Text, "crashed") {
+		t.Fatalf("notices = %+v, want the session crash reported", notices)
+	}
+}
+
+func TestObservedTurnReportsAFailureWithPartialText(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	turn := newTurnState()
+	turn.replace("partial answer")
+	turn.outcome.stopReason = "error"
+	turn.outcome.errorMessage = "provider exploded"
+	turn.markDone()
+	th.cur.Store(turn)
+
+	th.renderObservedTurn(turn, nil)
+
+	platform.mu.Lock()
+	r := platform.renderer
+	platform.mu.Unlock()
+	if r == nil {
+		t.Fatal("the observed turn did not start a renderer")
+	}
+	if got := r.failureText(); !strings.Contains(got, "provider exploded") {
+		t.Fatalf("renderer failure = %q, want the provider failure with partial text", got)
 	}
 }
 
@@ -1289,6 +1541,12 @@ func (r *recordingRenderer) failureContext() (error, bool) {
 	return r.failureContextErr, r.failureHasDeadline
 }
 
+func (r *recordingRenderer) failureText() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failure
+}
+
 func (r *recordingRenderer) finalAnswers() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1533,6 +1791,13 @@ func TestStartTurnErrorMarksOriginalRequestFailed(t *testing.T) {
 	}
 	if got := len(platform.completedRequests()); got != 0 {
 		t.Errorf("completed %d requests after StartTurn failed", got)
+	}
+	notices := platform.postedNotices()
+	if len(notices) != 1 || !strings.Contains(notices[0].Text, "I couldn't start the reply") {
+		t.Fatalf("notices = %+v, want a user-facing start failure", notices)
+	}
+	if strings.Contains(notices[0].Text, "cannot start renderer") {
+		t.Fatalf("the internal cause leaked into the notice: %q", notices[0].Text)
 	}
 	assertFailureReporterUsesLiveBoundedContext(t, platform)
 }

@@ -582,7 +582,7 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 // failureText reserves room for the cause before trimming a partial answer to
 // the one message a failed turn can update or post.
 func failureText(partial string, cause error) string {
-	failure := ":warning: pi-chat: " + cause.Error()
+	failure := ":warning: pi-chat: " + bot.PublicMessage(cause)
 	const marker = "\n\n… _(truncated)_"
 	if len(failure) > maxMessage {
 		cut := maxMessage - len(marker)
