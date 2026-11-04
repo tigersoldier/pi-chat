@@ -529,6 +529,17 @@ it is ready.
     back to a generic tool-name title. Well-formed markers are removed from the reply;
     oversized or credential-like marker content is rejected. Thinking, raw arguments, and
     output are not sent to Slack.
+- **Failure reporting** is classified from the turn's terminal outcome, not from one
+  provider-specific event: the last assistant `stopReason`/`errorMessage`, a failed retry or
+  compaction, an extension error, a session crash/stop/deletion, a gateway error, or a failed
+  answer read. A crash, stop or restart is terminal locally: the gateway does not publish
+  `gw_turn settled` for a crash, so the turn must not wait only on the gateway latch. A
+  terminal failure uses `Renderer.Fail` (or a warning notice when no reply was started yet),
+  which keeps any partial answer and appends the warning, and closes the task card as
+  `error`; a successful final assistant message ignores earlier recovered-retry/extension
+  noise. The chat message receives a `PublicError` message while the internal cause stays in
+  the log, including for observed turns. A synthetic observed turn with no text posts a
+  warning only for an explicit terminal failure, not for a successful textless wake.
 - `chat.stopStream` finalizes the *same* message with any footer blocks.
 
 Constraints and behaviours:

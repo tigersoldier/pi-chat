@@ -841,7 +841,7 @@ func (r *renderer) Fail(ctx context.Context, cause error) error {
 
 // failureText reserves room for the cause before truncating a partial answer.
 func failureText(partial string, cause error) string {
-	failure := ":warning: pi-chat: " + cause.Error()
+	failure := ":warning: pi-chat: " + bot.PublicMessage(cause)
 	if len(failure) > maxMessage {
 		return truncate(failure, maxMessage)
 	}

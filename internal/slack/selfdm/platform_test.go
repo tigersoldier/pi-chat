@@ -552,6 +552,30 @@ func TestFailKeepsThePartialAnswer(t *testing.T) {
 	}
 }
 
+func TestFailUsesOnlyThePublicMessage(t *testing.T) {
+	s, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.postMessage": postCounter(),
+		"chat.update":      func(url.Values) string { return `{"ok":true}` },
+	})
+	ctx := context.Background()
+	s.plat.flush = time.Hour
+	r, err := s.plat.StartTurn(ctx, bot.Message{Thread: bot.Thread{Channel: "D1", ThreadTS: "5.0"}})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cause := &bot.PublicError{Public: "the model request failed", Cause: errors.New("internal detail")}
+	if err := r.Fail(ctx, cause); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	got := stub.params("chat.update", 0).Get("text")
+	if !strings.Contains(got, "the model request failed") || strings.Contains(got, "internal detail") {
+		t.Fatalf("failure message = %q, want only the public message", got)
+	}
+}
+
 func TestFailKeepsCauseWhenPartialAnswerIsLong(t *testing.T) {
 	s, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
 		"chat.postMessage": postCounter(),

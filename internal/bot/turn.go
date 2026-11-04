@@ -34,6 +34,7 @@ const (
 	maxToolNameBytes          = 256
 	maxProgressDetailTitles   = 6
 	maxProgressDetailsRunes   = 600
+	maxTurnErrorRunes         = 400
 	turnProgressTaskID        = "turn-progress"
 )
 
@@ -131,7 +132,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 
 	client, err := th.ensure(ctx, m.Text)
 	if err != nil {
-		return err
+		if st.hardSessionFailure() {
+			return st.turnFailure(true)
+		}
+		return turnSetupError(err)
 	}
 	sessionPath := th.snapshot().SessionPath
 
@@ -171,6 +175,11 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// it in front of the first prompt of the conversation (DESIGN.md §4).
 	instruction := th.neededInstruction(ctx)
 
+	if st.hardSessionFailure() {
+		th.close(ctx)
+		return st.turnFailure(true)
+	}
+
 	// A live agent_start during preparation temporarily replaces this prompt
 	// reservation. Yield the lock so its observed reply can render first, then
 	// restore this reservation before sending the prompt.
@@ -203,7 +212,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.b.setStatus(ctx, th, StatusBusy)
 		client, err = th.ensure(ctx, m.Text)
 		if err != nil {
-			return err
+			if st.hardSessionFailure() {
+				return st.turnFailure(true)
+			}
+			return turnSetupError(err)
 		}
 		if latest, readErr := client.GetLastAssistantText(ctx); readErr == nil {
 			before = latest
@@ -217,9 +229,9 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
 		if st.sessionDeleted() {
 			th.forgetSessionForPath(ctx, sessionPath)
-			return fmt.Errorf("%w: it was deleted outside pi-chat", errSessionGone)
+			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
 		}
-		return fmt.Errorf("prompt: %w", err)
+		return publicError("I couldn't send the request to the agent", err)
 	}
 	// The prompt is where those messages went, so this is the first moment the
 	// watermark may move past them — and the instruction is owed until a prompt
@@ -229,19 +241,31 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		th.instructionSent()
 	}
 	if err := st.waitStarted(ctx, startGrace); err != nil {
+		if failure := st.abortFailure(); failure != nil {
+			return failure
+		}
+		if errors.Is(err, context.Canceled) {
+			return publicError("the turn was canceled", err)
+		}
 		return err
 	}
-	if err := client.AwaitSettled(ctx); err != nil {
+	if err := awaitSettledOrDone(ctx, client, st); err != nil {
 		if st.sessionDeleted() {
 			th.forgetSessionForPath(ctx, sessionPath)
-			return fmt.Errorf("%w: it was deleted outside pi-chat", errSessionGone)
+			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
 		}
-		return fmt.Errorf("wait for the turn: %w", err)
+		if failure := st.abortFailure(); failure != nil {
+			return failure
+		}
+		if errors.Is(err, context.Canceled) {
+			return publicError("the turn was canceled", err)
+		}
+		return publicError("the gateway connection was lost while the agent was working", err)
 	}
 	// A concurrent `/abort` can race with settlement. Wait for its gateway
 	// outcome before finalizing the Slack task or stopping the renderer.
 	if err := st.waitAbortResolution(context.Background()); err != nil {
-		return fmt.Errorf("wait for an in-flight abort: %w", err)
+		return publicError("the stop request could not be completed", err)
 	}
 
 	// The turn is over, wherever it ended: remember how far this connection
@@ -249,20 +273,30 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	// deleted session has nothing left to resume, so it is handled first.
 	if st.sessionDeleted() {
 		th.forgetSessionForPath(ctx, sessionPath)
-		return fmt.Errorf("%w: it was deleted outside pi-chat, so the next message starts a new one", errSessionGone)
+		return publicError("this session was deleted outside pi-chat; the next message starts a new one", errSessionGone)
+	}
+	if st.hardSessionFailure() {
+		th.close(ctx)
+		return st.turnFailure(true)
 	}
 	th.saveCursorAfterActivity(ctx, client)
 
-	final, err := client.GetLastAssistantText(ctx)
-	if err != nil {
-		th.log.Warn("cannot read the answer", "error", err)
+	final, readErr := client.GetLastAssistantText(ctx)
+	if readErr != nil {
+		th.log.Warn("cannot read the answer", "error", readErr)
 	}
 	// GetLastAssistantText returns just the last assistant message. Preserve
 	// earlier visible messages and fall back to streamed text if reading back
 	// failed, while letting the authoritative final text correct the last one.
 	final = st.authoritativeText(final)
+	if readErr != nil && final == "" {
+		st.recordReadError(readErr)
+	}
 	if final != "" {
 		th.rememberAssistant(final)
+	}
+	if failure := st.turnFailure(final != ""); failure != nil {
+		return failure
 	}
 	if final == "" || (final == before && !st.sawWork()) {
 		return errors.New("the agent produced no answer")
@@ -271,12 +305,31 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	st.finishOpenTasks()
 	stopFlush()
 	if err := r.Finish(ctx, final); err != nil {
-		return fmt.Errorf("finish the reply: %w", err)
+		return publicError("the answer was produced, but the chat message could not be updated", err)
 	}
 	th.noteProgress(ctx, r)
 	th.touch()
 	th.b.completeRequest(ctx, m)
 	return nil
+}
+
+// awaitSettledOrDone waits for pi to settle, but also stops when the turn has
+// already observed a terminal session state. A crashed or stopped session does
+// not produce gw_turn settled, and waiting only on the gateway latch would hold
+// the thread until shutdown.
+func awaitSettledOrDone(ctx context.Context, client *gwclient.Client, st *turnState) error {
+	settled := make(chan error, 1)
+	go func() {
+		settled <- client.AwaitSettled(ctx)
+	}()
+	select {
+	case err := <-settled:
+		return err
+	case <-st.doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // renderObservedTurn renders a turn the session started without a Slack
@@ -363,7 +416,17 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 			if st.text() == "" && !st.hasPendingTaskUpdates() {
 				reconcile()
 				if st.text() == "" && !st.hasPendingTaskUpdates() {
-					if client != nil && !st.sessionDeleted() {
+					if failure := st.terminalFailure(false); failure != nil {
+						th.log.Warn("asynchronous turn failed", "thread", th.key, "error", failure)
+						noticeCtx, noticeCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+						th.b.reply(noticeCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(failure)})
+						noticeCancel()
+					}
+					if st.hardSessionFailure() {
+						if !st.sessionDeleted() {
+							th.close(ctx)
+						}
+					} else if client != nil && !st.sessionDeleted() {
 						th.saveCursorAfterActivity(ctx, client)
 					}
 					return
@@ -389,6 +452,9 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	r, err := th.b.plat.StartTurn(ctx, m)
 	if err != nil {
 		th.log.Error("cannot start the asynchronous reply", "error", err)
+		noticeCtx, noticeCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+		th.b.reply(noticeCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(publicError("I couldn't start the reply", err))})
+		noticeCancel()
 		return
 	}
 	stopFlush := th.flush(ctx, st, r)
@@ -427,14 +493,28 @@ waitForCompletion:
 	st.finishOpenTasks()
 	stopFlush()
 	if waitErr == nil {
-		reconcile()
+		if st.hardSessionFailure() {
+			waitErr = st.turnFailure(st.text() != "")
+		} else {
+			reconcile()
+			if failure := st.terminalFailure(st.text() != ""); failure != nil {
+				waitErr = failure
+			}
+		}
+	}
+	if st.hardSessionFailure() && !st.sessionDeleted() {
+		th.close(ctx)
 	}
 
 	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 	defer cancel()
 	if waitErr != nil {
+		th.log.Warn("asynchronous turn failed", "thread", th.key, "error", waitErr)
 		if err := r.Fail(terminalCtx, waitErr); err != nil {
 			th.log.Error("cannot report the asynchronous reply failure", "error", err)
+			fallbackCtx, fallbackCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
+			th.b.reply(fallbackCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(waitErr)})
+			fallbackCancel()
 		}
 	} else {
 		final := st.text()
@@ -443,6 +523,9 @@ waitForCompletion:
 		}
 		if err := r.Finish(terminalCtx, final); err != nil {
 			th.log.Error("cannot finish the asynchronous reply", "error", err)
+			if failErr := r.Fail(terminalCtx, publicError("the answer was produced, but the chat message could not be updated", err)); failErr != nil {
+				th.log.Error("cannot report the asynchronous reply failure", "error", failErr)
+			}
 		}
 	}
 	if waitErr == nil && client != nil && !st.sessionDeleted() {
@@ -579,10 +662,13 @@ type turnState struct {
 	discardingProgressClose bool
 	pendingProgress         []string
 
+	outcome turnOutcome
+
 	messages       []string        // completed assistant messages with visible text
 	currentMessage strings.Builder // visible text in the current assistant message
 	shown          strings.Builder // text already handed to a renderer
 	work           bool
+	started        bool // a turn event established that work belongs to this reservation
 	// promptReservation distinguishes a queued Slack prompt from an unsolicited
 	// turn so an early agent_start can be reserved and rendered separately.
 	promptReservation bool
@@ -676,6 +762,15 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		s.startMessage()
 		s.markWork()
 
+	case "message_end":
+		// message_end carries the authoritative final message, including the
+		// stopReason and errorMessage of an assistant message that failed.
+		s.recordAssistantEnd(ev)
+
+	case "agent_end":
+		// The fallback for a reconnect or replay that lost message_end frames.
+		s.recordAgentEnd(ev)
+
 	case "turn_start", "agent_start":
 		s.markProgressStarted()
 		s.markWork()
@@ -697,7 +792,17 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		// several of each (a tool call, then the answer), so treating either as
 		// the end would stop rendering while text was still to come. The
 		// documented signal is agent_settled, or gw_turn going settled.
+		s.recordAgentSettled(ev)
 		s.markDone()
+
+	case "auto_retry_start":
+		s.recordAutoRetryStart(ev)
+
+	case "auto_retry_end":
+		s.recordAutoRetryEnd(ev)
+
+	case "compaction_end":
+		s.recordCompactionEnd(ev)
 
 	case "gw_turn":
 		turn, err := ev.Turn()
@@ -711,15 +816,26 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		}
 
 	case "gw_session_state":
+		s.recordSessionState(ev)
 		state, err := ev.SessionState()
-		if err == nil && state.State == protocol.SessionStateDeleted {
-			// The session file is gone: the thread has to stop pointing at it
-			// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
-			// because the read goroutine must not write to the database.
-			s.deleted.Store(true)
-			s.finishProgressTask(TaskError)
-			s.markDone()
+		if err == nil {
+			if state.State == protocol.SessionStateDeleted {
+				// The session file is gone: the thread has to stop pointing at it
+				// (DESIGN.md §4, invariant 3). The flag is read by the turn path,
+				// because the read goroutine must not write to the database.
+				s.deleted.Store(true)
+				s.finishProgressTask(TaskError)
+				s.markDone()
+			} else if sessionStateEndsTurn(state.State) {
+				// A crash never publishes gw_turn settled; a stop may publish it
+				// only after the client stopped waiting. End the local turn now
+				// so runTurn can report the session failure instead of hanging.
+				s.markDone()
+			}
 		}
+
+	case "gw_error":
+		s.recordGatewayError(ev)
 
 	case "extension_ui_request":
 		// Two kinds of frame share this type, and only one of them needs
@@ -746,6 +862,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		log.Debug("pi is waiting for a dialog response", "method", request.Method, "id", request.ID)
 
 	case "extension_error":
+		s.recordExtensionError(ev)
 		log.Warn("pi reported an extension error", "event", string(ev.Raw))
 	}
 	return true
@@ -1362,15 +1479,28 @@ func (s *turnState) replace(text string) {
 func (s *turnState) markWork() {
 	s.mu.Lock()
 	s.work = true
+	s.started = true
 	s.mu.Unlock()
 	s.workOnce.Do(func() { close(s.workCh) })
+}
+
+// doneProgressStatus is how the task card ends. It uses the same terminal
+// outcome as the reply, so a truncation, abort or provider failure after
+// partial text does not leave a successful card behind.
+func (s *turnState) doneProgressStatus() TaskProgressStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outcome.taskFailed(strings.TrimSpace(s.streamedText()) != "") {
+		return TaskError
+	}
+	return TaskComplete
 }
 
 func (s *turnState) markDone() {
 	s.mu.Lock()
 	s.eventDone = true
 	s.mu.Unlock()
-	s.finishProgressTask(TaskComplete)
+	s.finishProgressTask(s.doneProgressStatus())
 	s.flushProgressMarker()
 	s.mu.Lock()
 	s.pendingProgress = nil
