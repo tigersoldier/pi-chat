@@ -9,6 +9,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -646,9 +647,25 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 		// here rather than inside the turn so that every ending — an answer, a
 		// failure, a stop — takes it down again.
 		b.setStatus(ctx, th, StatusBusy)
-		defer b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
+		// A refused request never owned the turn, so another turn may still be
+		// running: lowering the indicator here would report it idle.
+		busy := false
+		defer func() {
+			if !busy {
+				b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
+			}
+		}()
 		if err := th.runTurn(ctx, m, r); err != nil {
-			b.log.Warn("turn failed", "thread", th.key, "error", err)
+			var refusal *busyTurnError
+			if errors.As(err, &refusal) {
+				// The request never reached pi, so this is an answered refusal, not
+				// a failed turn; the wait is still worth recording.
+				busy = true
+				b.log.Info("a request waited out its admission budget; answering instead of starting it",
+					"thread", th.key, "wait", b.queueWait())
+			} else {
+				b.log.Warn("turn failed", "thread", th.key, "error", err)
+			}
 			terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 			if ferr := r.Fail(terminalCtx, err); ferr != nil {
 				b.log.Error("cannot report the failure", "thread", th.key, "error", ferr)
@@ -660,6 +677,17 @@ func (b *Bot) startTurn(ctx context.Context, th *thread, m Message) {
 			b.failRequest(ctx, m)
 		}
 	}()
+}
+
+// queueWait is how long a prompt may wait for its thread's running turn before
+// pi-chat answers it instead of starting it. It is the same admission budget the
+// warm-session queue uses (DESIGN.md §10): a request that cannot be admitted
+// within it is answered, never held.
+func (b *Bot) queueWait() time.Duration {
+	if seconds := b.cfg.Concurrency.AdmissionWaitSeconds; seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return config.DefaultAdmissionSeconds * time.Second
 }
 
 // setStatus shows a thread session's lifecycle state, on platforms that can

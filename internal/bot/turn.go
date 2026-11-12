@@ -69,6 +69,91 @@ func (s *boundedIDSet) Clear() {
 
 func (s *boundedIDSet) Len() int { return len(s.ids) }
 
+// slotPollInterval covers the window in which the thread's turn slot is held
+// but no turn state is published yet: runTurn takes the slot before it
+// publishes its reservation, and releases it after clearing the state.
+const slotPollInterval = 20 * time.Millisecond
+
+// busyTurnError is a request that could not get its thread's turn slot within
+// the admission budget. Nothing was sent to pi, so it is an answered refusal
+// rather than a failed turn, and the answer names the turn blocking the thread
+// and the one control that ends it.
+type busyTurnError struct{ summary string }
+
+func (e *busyTurnError) Error() string {
+	detail := ""
+	if e.summary != "" {
+		detail = " (" + e.summary + ")"
+	}
+	return "the previous turn in this thread is still running" + detail +
+		"; I did not start this message. `@pi /abort` stops that turn, then send it again"
+}
+
+// busyErrorFor describes the turn that is holding the thread's slot.
+func busyErrorFor(active *turnState) error {
+	summary := ""
+	if active != nil {
+		summary = active.runningSummary(time.Now())
+	}
+	return &busyTurnError{summary: summary}
+}
+
+// acquireSlot takes the thread's turn slot, waiting at most until the request's
+// admission deadline. It returns with the slot held.
+func (th *thread) acquireSlot(ctx context.Context, deadline time.Time) error {
+	for {
+		if th.turnMu.TryLock() {
+			return nil
+		}
+		if err := th.awaitSlot(ctx, deadline); err != nil {
+			return err
+		}
+	}
+}
+
+// awaitSlot waits once for the thread's turn slot to change hands: the running
+// turn finished, the slot is between turns, or the admission budget ran out. A
+// nil error means the caller should try the slot again.
+func (th *thread) awaitSlot(ctx context.Context, deadline time.Time) error {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return busyErrorFor(th.cur.Load())
+	}
+	active := th.cur.Load()
+	if active == nil {
+		// The slot is held without a published turn for the moment runTurn takes
+		// to publish or tear one down, so a short poll is the whole wait.
+		select {
+		case <-time.After(min(slotPollInterval, remaining)):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return th.waitForTurn(ctx, active, deadline)
+}
+
+// waitForTurn blocks until the given turn is no longer the thread's turn, or
+// the admission budget runs out. Waiting on a turn that never settles is how a
+// queued request disappears without a trace: past the budget the request is
+// answered instead of started (DESIGN.md §7).
+func (th *thread) waitForTurn(ctx context.Context, active *turnState, deadline time.Time) error {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return busyErrorFor(active)
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-active.finishedCh:
+		return nil
+	case <-timer.C:
+		return busyErrorFor(active)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // runTurn prompts the thread's session and renders the answer.
 func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	turnCtx, cancel := context.WithCancel(ctx)
@@ -79,6 +164,11 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	held := false
 	waited := false
 	queuedReaction := false
+	// A queued prompt may wait, but not forever: a thread's slot is held for a
+	// whole turn, and a turn whose tool call never returns would otherwise
+	// swallow every later request in the thread without a trace (DESIGN.md §7).
+	// The budget is the admission wait the warm-session queue already uses.
+	deadline := time.Now().Add(th.b.queueWait())
 	for {
 		if !th.turnMu.TryLock() {
 			waited = true
@@ -86,7 +176,10 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 				th.b.queueRequest(ctx, m)
 				queuedReaction = true
 			}
-			th.turnMu.Lock()
+			if err := th.awaitSlot(ctx, deadline); err != nil {
+				return err
+			}
+			continue
 		}
 		held = true
 		active := th.cur.Load()
@@ -110,10 +203,8 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 			th.b.queueRequest(ctx, m)
 			queuedReaction = true
 		}
-		select {
-		case <-active.finishedCh:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := th.waitForTurn(ctx, active, deadline); err != nil {
+			return err
 		}
 	}
 	defer func() {
@@ -199,12 +290,12 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		waited = true
 		held = false
 		th.turnMu.Unlock()
-		select {
-		case <-active.finishedCh:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := th.waitForTurn(ctx, active, deadline); err != nil {
+			return err
 		}
-		th.turnMu.Lock()
+		if err := th.acquireSlot(ctx, deadline); err != nil {
+			return err
+		}
 		held = true
 		if err := ctx.Err(); err != nil {
 			return err
@@ -636,6 +727,8 @@ type turnState struct {
 	pending               strings.Builder // text not yet rendered
 	pendingTasks          []TaskProgress  // task updates not yet rendered
 	activeTasks           map[string]TaskProgress
+	runningTool           string // safe title of the open tool call, if any
+	runningToolCall       string // the call runningTool belongs to
 	seenToolCalls         boundedIDSet
 	seenToolEnds          boundedIDSet
 	lastEventSeq          uint64
@@ -908,6 +1001,7 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	if containsCredentialLikeText(title) {
 		title = "Using a tool"
 	}
+	s.runningTool, s.runningToolCall = title, callID
 	s.rememberProgressTitleLocked(title)
 	update := TaskProgress{
 		ID:     turnProgressTaskID,
@@ -942,9 +1036,38 @@ func (s *turnState) recordToolCompletion(ev gwclient.Event) {
 	if s.terminal {
 		return
 	}
+	s.clearRunningToolLocked(callID)
 	if s.seenToolEnds.Add(callID) {
 		s.progressCompletedActionCount++
 	}
+}
+
+// clearRunningToolLocked forgets an open tool call once it returns, so a notice
+// about a blocked request never names a tool the turn has stopped waiting for.
+// Callers hold s.mu.
+func (s *turnState) clearRunningToolLocked(callID string) {
+	if s.runningToolCall == callID {
+		s.runningTool, s.runningToolCall = "", ""
+	}
+}
+
+// runningSummary describes a turn that is still running, for the notice about a
+// request that had to wait behind it: how long it has been going and, while a
+// tool call is open, what it is doing. Both parts are safe to publish — an
+// elapsed time and a tool category, never prompt text, arguments or output.
+func (s *turnState) runningSummary(now time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	parts := make([]string, 0, 2)
+	if !s.progressStartedAt.IsZero() {
+		if elapsed := now.Sub(s.progressStartedAt); elapsed >= time.Second {
+			parts = append(parts, elapsed.Round(time.Second).String())
+		}
+	}
+	if s.runningTool != "" {
+		parts = append(parts, "currently "+strings.ToLower(s.runningTool))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (s *turnState) markProgressStarted() {

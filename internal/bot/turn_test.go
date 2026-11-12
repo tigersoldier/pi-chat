@@ -1935,6 +1935,58 @@ func TestQueuedRequestIsMarkedQueuedThenStarted(t *testing.T) {
 	}
 }
 
+// A request that cannot get its thread's turn slot within the admission budget
+// is answered instead of held: a turn whose tool call never returns must not
+// swallow every later message in the thread without a trace.
+func TestQueuedRequestIsAnsweredWhenTheTurnSlotNeverFrees(t *testing.T) {
+	b, platform, st := newTestBotWith(t, func(cfg *config.Config) {
+		cfg.Concurrency.AdmissionWaitSeconds = 1
+	})
+	th := testThread(t, b, st)
+	message := newTestMessage("stuck-request", "what is the progress?")
+	message.TS = "1700000000.000300"
+
+	active := newPromptTurnState()
+	active.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+	th.cur.Store(active)
+	// A running turn holds the slot for its whole life; this one never ends.
+	th.turnMu.Lock()
+	defer func() {
+		th.cur.CompareAndSwap(active, nil)
+		active.finish()
+		th.turnMu.Unlock()
+	}()
+
+	err := th.runTurn(context.Background(), message, &recordingRenderer{})
+	var refusal *busyTurnError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("runTurn error = %v, want a busy refusal", err)
+	}
+	for _, want := range []string{"still running", "running a command", "@pi /abort"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not mention %q", err, want)
+		}
+	}
+	if got := platform.queuedRequests(); len(got) != 1 || got[0].TS != message.TS {
+		t.Errorf("queued requests = %+v, want the waiting message", got)
+	}
+	if got := platform.startedRequests(); len(got) != 0 {
+		t.Errorf("started requests = %+v, want none for a refused request", got)
+	}
+}
+
+func TestBusySummaryNamesTheOpenToolCallAndForgetsItWhenItReturns(t *testing.T) {
+	st := newTurnState()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+	if got := st.runningSummary(time.Now()); !strings.Contains(got, "running a command") {
+		t.Errorf("summary while a tool is open = %q, want the open tool call", got)
+	}
+	st.feed(toolEvent(t, "tool_execution_end", "call-1", "bash", false), discardLogger())
+	if got := st.runningSummary(time.Now()); strings.Contains(got, "command") {
+		t.Errorf("summary after the tool returned = %q, want no tool call", got)
+	}
+}
+
 func TestCanceledTurnMarksOriginalRequestFailed(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := testThread(t, b, st)

@@ -444,6 +444,15 @@ commands inside message threads** and its slash-command payload carries no `thre
    reacts `:eyes:` to an allowed mention or one-to-one DM; success replaces it with
    `:white_check_mark:`, failure with `:warning:`. An unallowed request gets `:shrug:`
    and a private refusal.
+9. **A request that has to wait for its thread's turn is bounded and answered.** One
+   turn owns a thread at a time, and the slot is held for the whole turn, so a second
+   request is queued (`:eyes:` → `:hourglass_flowing_sand:`) for at most
+   `concurrency.admission_wait_seconds`. If the running turn still has not ended by
+   then, the request is answered — how long that turn has been running, the tool call
+   it is waiting on, and `@pi /abort` — and the slot stays with the turn that owns it.
+   A turn can outlive any deadline the agent sets (a tool call that never returns is
+   enough), and an unbounded wait would swallow every later message in the thread
+   without a trace.
 
 What reaches a session, and what does not:
 

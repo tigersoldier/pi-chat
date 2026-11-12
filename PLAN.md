@@ -606,6 +606,10 @@ user renames, and tests cover event parsing, search boundaries and source render
       content by default.
 - [ ] Make interactive approval the default for consequential tool actions; retain automatic
       approval only as an explicit opt-in.
+- [x] Bound the wait for a thread's turn by `concurrency.admission_wait_seconds` and answer
+      the queued request when it runs out (how long the turn has run, the open tool call, and
+      `@pi /abort`): a turn whose tool call never returns used to hold the thread's slot and
+      swallow every later message silently.
 
 **Exit:** long turns retain truthful status/progress, stop remains reliable across transitions,
 and feedback/approval flows have focused tests.
