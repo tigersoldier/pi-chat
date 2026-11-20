@@ -293,6 +293,15 @@ type TaskProgressReporter interface {
 	UpdateTasks(ctx context.Context, updates []TaskProgress) error
 }
 
+// TurnTicker is an optional renderer capability for work that must happen
+// while a turn runs, whether or not new text arrives. The core calls Tick on
+// its render cadence; the renderer decides when something is due, so an idle
+// call is cheap. It is how a native stream stays alive across a platform's
+// stream lifetime without the core knowing the platform's limits.
+type TurnTicker interface {
+	Tick(ctx context.Context) error
+}
+
 // Status is a thread session's lifecycle state, in the vocabulary the core
 // reasons about. Mapping it onto a platform's own states is the adapter's job:
 // a platform that cannot show one simply does not implement StatusReporter.
