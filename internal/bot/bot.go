@@ -962,11 +962,16 @@ func (b *Bot) refuse(ctx context.Context, userID, channel string, thread *Thread
 // piArgs is the argument list a new session starts with: the user's own
 // gateway.pi_args, --approve when approvals are automatic, the opt-in pi-chat
 // extension, the project's injected prompt, and the thread instruction.
-func (b *Bot) piArgs(project workspace.Project) []string {
+//
+// The self-DM surface cannot render a blocking dialog, so a session there would
+// deadlock waiting for an answer no one can give. It keeps --approve even under
+// the interactive default until the surface gains a text-approval protocol.
+func (b *Bot) piArgs(project workspace.Project, surface string) []string {
 	args := slices.Clone(b.cfg.Gateway.PiArgs)
 	// The setting is what makes the policy explicit; pi_args stays the place
 	// for everything else, and a hand-written --approve is not duplicated.
-	if b.cfg.Behavior.Approvals == "auto" && !slices.Contains(args, "--approve") {
+	approvalsUndisplayable := surface == SurfaceSelfDM
+	if (b.cfg.Behavior.Approvals == "auto" || approvalsUndisplayable) && !slices.Contains(args, "--approve") {
 		args = append(args, "--approve")
 	}
 	if b.cfg.ChatTools.Enabled {

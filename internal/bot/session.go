@@ -505,7 +505,7 @@ func (th *thread) create(ctx context.Context, prompt string) error {
 		}
 	}()
 
-	piArgs := th.b.piArgs(project)
+	piArgs := th.b.piArgs(project, th.t.Surface)
 
 	ctx, cancel := context.WithTimeout(ctx, sessionCreateTimeout)
 	defer cancel()

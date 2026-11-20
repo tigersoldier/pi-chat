@@ -521,25 +521,25 @@ it is ready.
   - `markdown_text` chunks for assistant text; final-only `chat.postMessage` replies and
     repair `chat.update` calls use their `markdown_text` field too, so every path preserves
     the same standard-Markdown syntax instead of switching to `mrkdwn`,
-  - `task_update` chunks represent one logical progress task for the whole reply. The
-    task gets a unique ID for this stream, starts as `in_progress` on the first tool call,
-    updates its title as later tools start, and becomes `complete` when the agent settles
-    (or `error` if the turn is aborted or exits abnormally). Its final title reports the
-    number of returned tool calls and elapsed time from the first observed agent/turn start
-    (falling back to the first tool start); errored calls count as executed actions. The
-    expandable `details` lists up to six unique safe action titles (at most 600 characters)
-    and is sent once, when the task completes; active updates change only the title, avoiding
-    repeated cumulative detail snapshots in the stream. Tool completion does not create or
-    recycle task IDs, so the timeline stays at one card;
-    individual completed steps are never shown as separate cards. An assistant message
-    consisting only of one or more `[[slack-progress: ...]]` markers (ignoring whitespace)
-    supplies FIFO custom titles for upcoming tool starts (max 80 characters each, with at
-    most 64 titles buffered); at most six safe titles are retained for details. Overflow or
-    an absent/invalid marker falls back to a generic tool-name title. Only a message that
-    consists of markers is removed from the reply and contributes titles; a marker quoted
-    inside prose stays visible and is not treated as progress. Oversized or credential-like
-    marker content is rejected when it is the whole message. Thinking, raw arguments, and
-    output are not sent to Slack.
+  - `task_update` chunks represent the reply's progress. A single tool keeps one rolling
+    summary card: it starts as `in_progress` on the first tool call, updates its title as
+    later tools start, and becomes `complete` when the agent settles (or `error` if the turn
+    is aborted or exits abnormally). Once a second distinct tool step is observed, the same
+    reply is promoted to a plan report with one row per observed step (at most 40 rows plus
+    one aggregate row), each row carrying only a safe title and status. The summary keeps
+    reporting the number of returned tool calls and elapsed time from the first observed
+    agent/turn start (falling back to the first tool start); errored calls count as executed
+    actions. The expandable `details` of the summary lists up to six unique safe action
+    titles (at most 600 characters) and is sent once, when the task completes. Tool
+    completion does not recycle IDs, so the timeline stays one card until promotion. An
+    assistant message consisting only of one or more `[[slack-progress: ...]]` markers
+    (ignoring whitespace) supplies FIFO custom titles for upcoming tool starts (max 80
+    characters each, with at most 64 titles buffered); at most six safe titles are retained
+    for details. Overflow or an absent/invalid marker falls back to a generic tool-name
+    title. Only a message that consists of markers is removed from the reply and contributes
+    titles; a marker quoted inside prose stays visible and is not treated as progress.
+    Oversized or credential-like marker content is rejected when it is the whole message.
+    Thinking, raw arguments, and output are not sent to Slack.
 - **A premature stop after a progress marker continues the turn.** Some models emit a
   well-formed marker and then end the response without the tool call it announced. A clean
   settlement whose entire authoritative message is a progress marker is treated as that
@@ -684,9 +684,11 @@ Constraints and behaviours:
       preserving the stop control. On startup, use the persisted message handle to mark an
       unfinished report interrupted before ingress; a process cannot resume a stream it did
       not hold.
-    - **Feedback and approvals:** Add answer-level feedback controls such as
-      `feedback_buttons`. Default consequential write/execute actions to human confirmation;
-      make automatic approval explicit opt-in, following Slack's [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
+    - **Feedback and approvals:** Interactive approval is the default for consequential
+      write/execute actions, and automatic approval is explicit opt-in, following Slack's
+      [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
+      Answer-level feedback controls such as `feedback_buttons` remain to be added, with
+      submissions acknowledged without retaining response content by default.
     - **Data retention:** Before expanding context, decide whether Slack-derived content may
       enter persisted Pi histories or local sidecars. Prefer minimal retention; any opt-in
       storage needs clear retention and deletion behavior, consistent with Slack's
@@ -732,9 +734,14 @@ Constraints and behaviours:
     debug (a `warning`/`error` `notify` goes to the journal at warn); treating them as
     "unanswerable UI input" produced a false alarm on every single turn, since
     `pi-lens-lsp` emits `setStatus` continuously.
-- `approvals = "auto"` passes `--approve` and pi resolves dialogs itself. That does
-  **not** silence the frame type: sessions emit `setStatus`/`setWidget` regardless, so
-  the classification above is always required.
+- **Approvals are interactive by default.** `approvals = "interactive"` is the default: a
+  blocking write/execute dialog is routed to the turn's author in Slack. Setting
+  `approvals = "auto"` is an explicit opt-in that passes `--approve` and lets pi resolve
+  dialogs itself. The self-DM surface cannot render a blocking dialog, so its sessions keep
+  `--approve` under either setting until that surface gains a text-approval protocol;
+  otherwise the turn would wait forever for an answer nobody can give. Neither setting
+  silences the frame type: sessions emit `setStatus`/`setWidget` regardless, so the
+  classification above is always required.
 - **Strip ANSI escapes** (and control characters) from every string a pi extension
   supplies before it reaches Slack — observed `setStatus.statusText` carries raw SGR
   sequences (`\x1b[38;5;241m…`), and Block Kit renders them literally.
@@ -1014,7 +1021,7 @@ mode     = "stream"                # stream | patch
 flush_ms = 1000
 
 [behavior]
-approvals = "auto"                 # auto adds --approve to pi_args | interactive
+approvals = "interactive"          # interactive (default) | auto adds --approve to pi_args
 # injected_prompt = """…"""        # {reposRoot} {projectsRoot} {date} {slug}; empty = none
 
 [log]

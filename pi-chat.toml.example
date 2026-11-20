@@ -81,7 +81,10 @@ mode     = "stream"   # stream: chat.startStream | patch: postMessage + update
 flush_ms = 1000       # coalescing window for Slack message updates
 
 [behavior]
-approvals = "auto"    # auto: pi resolves dialogs (--approve) | interactive: Block Kit
+# Default: consequential tool actions wait for a human in Slack. Set "auto"
+# only to opt in to pi resolving those dialogs itself (adds --approve).
+# The self-DM surface cannot show dialogs, so its sessions always get --approve.
+approvals = "interactive"  # interactive: Block Kit | auto: pi resolves dialogs
 # injected_prompt = """
 # ...
 # """
