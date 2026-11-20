@@ -1179,6 +1179,40 @@ func TestProgressReportUpdatesAreCoalescedAndThrottled(t *testing.T) {
 	}
 }
 
+func TestPromotedProgressReportIsNotRotated(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	first := bot.TaskProgress{ID: "step-1", Title: "Read the configuration", Status: bot.TaskInProgress}
+	second := bot.TaskProgress{ID: "step-2", Title: "Run the checks", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.progressReport {
+		t.Fatal("two distinct steps did not promote the report")
+	}
+	before := len(stub.methods())
+
+	// The report is a Block Kit message, not a stream: an old stream clock must
+	// not make Tick open another one.
+	r.mu.Lock()
+	r.streamStartedAt = time.Now().Add(-2 * streamRotateAfter)
+	r.mu.Unlock()
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(stub.methods()); got != before {
+		t.Fatalf("Tick after promotion made %d calls, want none: %v", got-before, stub.methods()[before:])
+	}
+
+	if err := r.Delta(ctx, "late text"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stub.methods(), []string{"chat.postMessage", "agents.sessions.setStatus"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls after late text = %v, want the report left alone", got)
+	}
+}
+
 func TestMultiStepProgressPostsAPlanWhenStreamingIsDisabled(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "patch")
