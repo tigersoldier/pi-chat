@@ -758,9 +758,17 @@ func (a *API) AppendStream(ctx context.Context, channel, ts string, chunks []str
 // button) has already closed it. The text is not repeated here: it was already
 // appended, and whether stopStream's own markdown_text replaces or appends the
 // streamed content is not documented, so relying on it could duplicate the answer.
-func (a *API) StopStream(ctx context.Context, channel, ts string) error {
-	return a.call(ctx, "chat.stopStream", map[string]any{
+//
+// sessionStatus, when non-empty, is the agent session's status after the stop.
+// A turn that rotates to a new stream passes "processing" so closing the old
+// segment does not make the session look idle while work continues.
+func (a *API) StopStream(ctx context.Context, channel, ts, sessionStatus string) error {
+	params := map[string]any{
 		"channel": channel,
 		"ts":      ts,
-	}, nil)
+	}
+	if sessionStatus != "" {
+		params["session_status"] = sessionStatus
+	}
+	return a.call(ctx, "chat.stopStream", params, nil)
 }

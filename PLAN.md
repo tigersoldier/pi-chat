@@ -596,9 +596,10 @@ user renames, and tests cover event parsing, search boundaries and source render
 
 ### M8 — Long-task progress and user controls
 
-- [ ] Choose and implement the long-job pattern: rotate streams or switch to a plan message
-      with throttled `chat.update`; handle Slack's 10-minute/12,000-character stream limits,
-      keep the session `processing`, and preserve stop/cancel behavior.
+- [x] Rotate the reply stream before Slack's 10-minute stream timeout, replaying the task
+      timeline into the new message, keeping the session `processing`, and restoring that
+      status if Slack finalized the old stream first. The 12,000-character budget still
+      defers to a bounded final patch at settlement; stop/cancel behavior is unchanged.
 - [ ] Use timeline task cards for short work and plan mode for multi-step work; expose only
       safe task details and approved source metadata, and throttle `chat.update` to Slack's
       documented cadence.

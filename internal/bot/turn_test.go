@@ -1864,6 +1864,40 @@ func TestFlushStartsImmediatelyOnFirstText(t *testing.T) {
 	}
 }
 
+// tickingRenderer exercises the optional TurnTicker capability.
+type tickingRenderer struct {
+	recordingRenderer
+	ticked chan struct{}
+}
+
+func (r *tickingRenderer) Tick(ctx context.Context) error {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		return errors.New("renderer tick has no deadline")
+	}
+	select {
+	case r.ticked <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func TestFlushTicksRenderersThatAskForIt(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Render.FlushMS = 5
+	b := &Bot{cfg: cfg, log: discardLogger()}
+	th := &thread{key: "test", b: b, log: b.log}
+	r := &tickingRenderer{ticked: make(chan struct{}, 8)}
+	st := newTurnState()
+
+	stop := th.flush(context.Background(), st, r)
+	defer stop()
+	select {
+	case <-r.ticked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renderer did not receive a heartbeat while the turn runs")
+	}
+}
+
 func TestFlushRendersPendingText(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Render.FlushMS = 5

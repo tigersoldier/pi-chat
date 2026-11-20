@@ -579,6 +579,21 @@ Constraints and behaviours:
   with visible text, keep them in order and separate them with a blank line (`\n\n`), rather
   than dropping earlier responses. A later user turn gets its own reply message instead of
   updating the previous turn's answer.
+- **A long turn rotates its stream before Slack closes it.** Slack finalizes a stream
+  10 minutes after `chat.startStream`; appends do not extend that lifetime. It then saves
+  the streamed content, marks unfinished tasks as `error`, moves the agent session to
+  `active`, and answers later `chat.appendStream`/`chat.stopStream` calls with
+  `message_not_in_streaming_state`. The adapter therefore checks the stream's age on the
+  core's render cadence (and again before every append). At nine minutes it stops the
+  current stream with `session_status: processing` — so the session stays busy instead of
+  falling to `active` — opens a new stream in the same thread, replays the current task
+  cards as its initial chunks, and keeps rendering text produced after the boundary.
+  The previous message keeps the progress it streamed; the newest one is what `Finish`
+  corrects with the authoritative answer. If Slack had already finalized the stream (the
+  stop answers `message_not_in_streaming_state`), the adapter restores `processing` after
+  opening the replacement, so the loading indicator and stop button come back. A refused
+  replacement falls back to patching the finalized message: progress updates stop, but
+  the answer still lands.
 - **Status and title, two tiers:**
   - *Declared as an agent* (`slack/manifest.yaml`, Slack's agent messaging
     experience): `agents.sessions.setStatus` takes real lifecycle values that map onto
@@ -644,9 +659,11 @@ Constraints and behaviours:
       returns source links. Decide permission and retention rules before enabling search;
       treat retrieved content as untrusted input.
     - **Progress:** Use timeline task cards for simple actions and a plan for multi-step
-      work. For work that may cross Slack's [10-minute or 12,000-character stream limits](https://docs.slack.dev/reference/methods/chat.startStream#timeout),
-      compare (A) rotating streams with `session_status: processing` and (B) `chat.postMessage`
-      with a plan block and rate-limited `chat.update`; keep stop/status lifecycle continuous.
+      work. Long turns already rotate their stream before Slack's [10-minute stream
+      limit](https://docs.slack.dev/reference/methods/chat.startStream#timeout) (see above)
+      and keep the session `processing`; the separate 12,000-character budget still falls
+      back to a bounded final patch at settlement. A plan message with rate-limited
+      `chat.update` remains an option for multi-step work.
     - **Feedback and approvals:** Add answer-level feedback controls such as
       `feedback_buttons`. Default consequential write/execute actions to human confirmation;
       make automatic approval explicit opt-in, following Slack's [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).

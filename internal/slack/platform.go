@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
@@ -23,6 +24,14 @@ const (
 	// maxMessage is a conservative byte budget within Slack's 12,000-character
 	// markdown_text limit, leaving room for the truncation marker.
 	maxMessage = 12_000
+
+	// streamRotateAfter is how long one Slack stream stays open. Slack
+	// documents a 10-minute lifetime measured from chat.startStream, and appends
+	// do not extend it; when it expires Slack finalizes the message, moves the
+	// agent session to active, and rejects later appends. Rotate with a minute
+	// of margin so latency cannot let Slack close the stream under the turn.
+	// https://docs.slack.dev/reference/methods/chat.startStream#timeout
+	streamRotateAfter = 9 * time.Minute
 
 	replyTooLongNotice = "Slack rejected this reply as too long. Please ask for a shorter version."
 )
@@ -513,8 +522,15 @@ type renderer struct {
 	ts                   string
 	streamState          streamState
 	streamAttempted      bool
+	streamStartedAt      time.Time
 	streamTextIncomplete bool
 	text                 strings.Builder
+
+	// tasks keeps the latest state of every task card so a rotated stream can
+	// start with the timeline the previous message was showing instead of an
+	// empty one.
+	tasks     map[string]streamPayloadChunk
+	taskOrder []string
 }
 
 func (r *renderer) Start(ctx context.Context) error {
@@ -529,6 +545,7 @@ func (r *renderer) Start(ctx context.Context) error {
 		ts, err := r.startStream(ctx, nil)
 		if err == nil {
 			r.ts = ts
+			r.streamStartedAt = time.Now()
 			r.setStreamState(streamActive, "start_stream")
 			return nil
 		}
@@ -590,8 +607,17 @@ func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) 
 			return fmt.Errorf("start task stream: %w", err)
 		}
 		r.ts = ts
+		r.streamStartedAt = time.Now()
+		r.rememberTasks(chunks)
 		r.setStreamState(streamActive, "task_start_stream")
 		return nil
+	}
+	if r.rotationDue(time.Now()) {
+		if err := r.rotate(ctx); err != nil {
+			// Progress is best-effort: the text path still patches the reply,
+			// and a failed rotation must not fail the turn.
+			return nil
+		}
 	}
 	if r.streamState != streamActive {
 		return nil
@@ -607,7 +633,131 @@ func (r *renderer) UpdateTasks(ctx context.Context, updates []bot.TaskProgress) 
 		}
 		return fmt.Errorf("append task updates: %w", err)
 	}
+	r.rememberTasks(chunks)
 	return nil
+}
+
+// rotationDue reports whether the open stream is old enough to rotate before
+// Slack's 10-minute stream timeout. A renderer that never streamed (or that
+// already fell back to patching) has nothing to rotate.
+func (r *renderer) rotationDue(now time.Time) bool {
+	if !r.wantStream || r.ts == "" || r.streamStartedAt.IsZero() {
+		return false
+	}
+	return !now.Before(r.streamStartedAt.Add(streamRotateAfter))
+}
+
+// Tick implements bot.TurnTicker. The core calls it on the render cadence; the
+// work is due only once per stream lifetime, so most calls are a clock check.
+func (r *renderer) Tick(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.rotationDue(time.Now()) {
+		return nil
+	}
+	return r.rotate(ctx)
+}
+
+// rotate closes the current stream and opens a new one in the same thread.
+// Slack finalizes a stream 10 minutes after chat.startStream (appends do not
+// extend it), moves the agent session to active, and rejects later appends
+// with message_not_in_streaming_state. A turn that runs longer would otherwise
+// lose its progress timeline and stop control while the agent keeps working.
+//
+// The previous message keeps what it streamed. The new message starts with the
+// current task cards, receives only text produced after this point, and becomes
+// the target Finish corrects with the authoritative answer.
+func (r *renderer) rotate(ctx context.Context) error {
+	if r.ts == "" {
+		return nil
+	}
+	previous := r.ts
+	expired := false
+	if r.streamMayBeActive() {
+		err := r.api.StopStream(ctx, r.channel, previous, "processing")
+		switch {
+		case err == nil:
+			r.setStreamState(streamClosed, "rotated")
+		case streamAlreadyStopped(err):
+			// Slack finalized the stream itself and set the session active.
+			expired = true
+			r.setStreamState(streamClosed, "rotation_found_expired")
+		default:
+			// Closure is unconfirmed. The next stream is still the only way to
+			// keep progress flowing, but keep the uncertainty in the state.
+			r.setStreamState(streamUnknown, "rotation_stop_failed")
+			if r.log != nil {
+				r.log.Warn("cannot close the previous Slack reply stream before rotating",
+					"message_ts", previous, "error", err)
+			}
+		}
+	} else {
+		expired = true
+	}
+
+	chunks := r.taskChunks()
+	ts, err := r.startStream(ctx, chunks)
+	if err != nil {
+		// The finalized message still carries the answer. Progress updates
+		// stop, but a rotation failure must not fail the turn.
+		r.wantStream = false
+		if r.log != nil {
+			r.log.Warn("cannot open another Slack stream; patching the reply instead",
+				"message_ts", previous, "error", err)
+		}
+		return fmt.Errorf("open the next Slack stream: %w", err)
+	}
+	r.ts = ts
+	r.streamStartedAt = time.Now()
+	r.streamTextIncomplete = false
+	r.text.Reset()
+	r.setStreamState(streamActive, "rotated_stream")
+	if expired {
+		// Slack's timeout drops the session to active. Put the running state
+		// back so the new stream keeps its loading indicator and stop button.
+		thread := bot.Thread{Channel: r.channel, ThreadTS: r.threadTS}
+		if err := r.platform.SetStatus(ctx, thread, bot.StatusBusy); err != nil && r.log != nil {
+			r.log.Warn("cannot restore the running status after a stream timeout",
+				"message_ts", ts, "error", err)
+		}
+	}
+	if r.log != nil {
+		r.log.Info("rotated the Slack reply stream to keep a long turn live",
+			"previous_message_ts", previous,
+			"message_ts", ts,
+			"task_chunks", len(chunks),
+			"expired", expired)
+	}
+	return nil
+}
+
+// rememberTasks keeps the latest card state for each task ID so a rotated
+// stream can reproduce the timeline.
+func (r *renderer) rememberTasks(chunks []streamPayloadChunk) {
+	if len(chunks) == 0 {
+		return
+	}
+	if r.tasks == nil {
+		r.tasks = make(map[string]streamPayloadChunk, len(chunks))
+	}
+	for _, chunk := range chunks {
+		if _, exists := r.tasks[chunk.ID]; !exists {
+			r.taskOrder = append(r.taskOrder, chunk.ID)
+		}
+		r.tasks[chunk.ID] = chunk
+	}
+}
+
+// taskChunks returns the last known state of every task in the order it first
+// appeared.
+func (r *renderer) taskChunks() []streamPayloadChunk {
+	out := make([]streamPayloadChunk, 0, len(r.taskOrder))
+	for _, id := range r.taskOrder {
+		if chunk, ok := r.tasks[id]; ok {
+			out = append(out, chunk)
+		}
+	}
+	return out
 }
 
 func taskUpdateChunk(update bot.TaskProgress) (streamPayloadChunk, error) {
@@ -657,6 +807,15 @@ func (r *renderer) Delta(ctx context.Context, text string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// The new text belongs to the next segment when the stream is due to
+	// rotate; rotating first keeps the old segment's text out of the new
+	// message (the final answer is patched into the newest message).
+	if r.streamState == streamActive && r.rotationDue(time.Now()) {
+		if err := r.rotate(ctx); err != nil {
+			// rotate falls back to patching; the switch below carries on with
+			// the finalized message.
+		}
+	}
 	r.text.WriteString(text)
 	if r.ts == "" {
 		// Start may fail before a message handle exists. Retain the partial
@@ -925,7 +1084,7 @@ func (r *renderer) stopStream(ctx context.Context) error {
 		r.log.Debug("stopping Slack reply stream",
 			"message_ts", r.ts, "stream_state", streamStateName(r.streamState))
 	}
-	if err := r.api.StopStream(ctx, r.channel, r.ts); err != nil {
+	if err := r.api.StopStream(ctx, r.channel, r.ts, ""); err != nil {
 		if streamAlreadyStopped(err) {
 			r.setStreamState(streamClosed, "stop_reported_already_stopped")
 			return nil

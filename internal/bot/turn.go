@@ -24,6 +24,7 @@ import (
 const (
 	startGrace                = 15 * time.Second
 	renderTerminalTimeout     = 15 * time.Second
+	renderTickTimeout         = 15 * time.Second
 	assistantMessageSeparator = "\n\n"
 	progressMarkerOpen        = "[[slack-progress:"
 	progressMarkerClose       = "]]"
@@ -1998,6 +1999,18 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 			case <-st.taskCh:
 				render(false)
 			case <-ticker.C:
+				if ticker, ok := r.(TurnTicker); ok {
+					// Maintenance (such as rotating a native stream before its
+					// platform closes it) gets its own bounded budget so a slow
+					// API call cannot hold up the text waiting to be rendered.
+					tickCtx, cancelTick := context.WithTimeout(loopCtx, renderTickTimeout)
+					err := ticker.Tick(tickCtx)
+					cancelTick()
+					if err != nil {
+						th.log.Warn("cannot refresh the reply while the turn runs",
+							"thread", th.key, "error", err)
+					}
+				}
 				render(false)
 			}
 		}

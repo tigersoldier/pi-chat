@@ -745,6 +745,258 @@ func TestStreamingAppendsAndFinishes(t *testing.T) {
 	}
 }
 
+func TestLongTurnRotatesTheReplyStreamBeforeSlackClosesIt(t *testing.T) {
+	starts := 0
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "chat.startStream" {
+			starts++
+			return fmt.Sprintf(`{"ok":true,"ts":"1700000000.%06d"}`, starts)
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing is due while the stream is young, so the heartbeat is cheap.
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(stub.methods(), ","); got != "chat.startStream,chat.appendStream" {
+		t.Fatalf("calls before the stream is due = %v, want no rotation", got)
+	}
+
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Second)
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "second"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "firstsecond"); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.startStream,chat.appendStream,chat.stopStream,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	if got := calls[2].params["session_status"]; got != "processing" {
+		t.Fatalf("rotation stop session_status = %v, want processing so the turn stays busy", got)
+	}
+	if got := calls[5].params["session_status"]; got != nil {
+		t.Fatalf("final stop session_status = %v, want Slack's default", got)
+	}
+	if got := calls[4].params["ts"]; got != "1700000000.000002" {
+		t.Fatalf("text after rotation went to %v, want the new stream", got)
+	}
+	if got := calls[6].params["ts"]; got != "1700000000.000002" {
+		t.Fatalf("final answer went to %v, want the newest message", got)
+	}
+	if got := calls[6].params["markdown_text"]; got != "firstsecond" {
+		t.Fatalf("final answer = %q, want the authoritative text in the newest message", got)
+	}
+	if got := r.Progress(); got != "1700000000.000002" {
+		t.Fatalf("progress = %q, want the newest reply message", got)
+	}
+}
+
+func TestTextDeltaRotatesWhenTheStreamIsDue(t *testing.T) {
+	starts := 0
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "chat.startStream" {
+			starts++
+			return fmt.Sprintf(`{"ok":true,"ts":"1700000000.%06d"}`, starts)
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Second)
+	if err := r.Delta(ctx, "second"); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.startStream,chat.appendStream"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	var chunks []streamPayloadChunk
+	jsonParam(t, calls[4].params, "chunks", &chunks)
+	if calls[4].params["ts"] != "1700000000.000002" || len(chunks) != 1 || chunks[0].Text != "second" {
+		t.Fatalf("text after the boundary = %+v, want it appended to the new stream", calls[4].params)
+	}
+}
+
+func TestRotationCarriesTaskProgressIntoTheNewStream(t *testing.T) {
+	starts := 0
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "chat.startStream" {
+			starts++
+			return fmt.Sprintf(`{"ok":true,"ts":"1700000000.%06d"}`, starts)
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	progress := bot.TaskProgress{ID: "turn-progress", Title: "Reading files", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+	progress.Status = bot.TaskComplete
+	progress.Details = "Completed actions:\n• Reading files"
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Second)
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	if got := strings.Join(stub.methods(), ","); got != "chat.startStream,chat.appendStream,chat.stopStream,chat.startStream" {
+		t.Fatalf("calls = %v, want a rotation after the task update", got)
+	}
+	var chunks []streamPayloadChunk
+	jsonParam(t, calls[3].params, "chunks", &chunks)
+	if len(chunks) != 1 || chunks[0].Type != "task_update" || chunks[0].ID != progress.ID ||
+		chunks[0].Status != string(progress.Status) || chunks[0].Details != progress.Details {
+		t.Fatalf("new stream initial chunks = %+v, want the current task card", chunks)
+	}
+}
+
+func TestTaskUpdateRotatesWhenTheStreamIsDue(t *testing.T) {
+	starts := 0
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "chat.startStream" {
+			starts++
+			return fmt.Sprintf(`{"ok":true,"ts":"1700000000.%06d"}`, starts)
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	progress := bot.TaskProgress{ID: "turn-progress", Title: "Reading files", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Second)
+	progress.Title = "Updating files"
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := "chat.startStream,chat.stopStream,chat.startStream,chat.appendStream"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	if got := calls[3].params["ts"]; got != "1700000000.000002" {
+		t.Fatalf("task update went to %v, want the rotated stream", got)
+	}
+	if got := calls[1].params["session_status"]; got != "processing" {
+		t.Fatalf("rotation stop session_status = %v, want processing", got)
+	}
+}
+
+func TestRotationAfterSlackExpiredTheStreamRestoresProcessing(t *testing.T) {
+	stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+		if method == "chat.stopStream" {
+			return "message_not_in_streaming_state"
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Minute)
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := "chat.startStream,chat.stopStream,chat.startStream,agents.sessions.setStatus"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	status := calls[3].params
+	if status["status"] != "processing" || status["channel_id"] != "C1" || status["thread_ts"] != "1700000000.000100" {
+		t.Fatalf("restored status = %+v, want processing on the same thread", status)
+	}
+	if r.streamState != streamActive {
+		t.Fatalf("stream state = %v, want a live replacement stream", r.streamState)
+	}
+}
+
+func TestRotationFallsBackToPatchingWhenANewStreamIsRefused(t *testing.T) {
+	starts := 0
+	stub := &stubSlack{policy: func(method string, _ map[string]any) string {
+		if method == "chat.startStream" {
+			starts++
+			if starts >= 2 {
+				return "invalid_thread_ts"
+			}
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delta(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Second)
+	if err := r.Tick(ctx); err == nil {
+		t.Fatal("a refused replacement stream should be reported")
+	}
+	if r.wantStream {
+		t.Fatal("a refused replacement stream should fall back to patching")
+	}
+	if err := r.Delta(ctx, "second"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Finish(ctx, "firstsecond"); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.startStream,chat.startStream,chat.update,chat.update"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want the finalized reply patched instead", got)
+	}
+	for _, call := range calls {
+		if call.method != "chat.update" {
+			continue
+		}
+		if call.params["ts"] != "1700000000.000001" || call.params["markdown_text"] != "firstsecond" {
+			t.Fatalf("fallback update = %+v, want the full answer in the original reply", call.params)
+		}
+	}
+}
+
 func TestTaskUpdatesShareTheReplyStream(t *testing.T) {
 	stub := &stubSlack{}
 	r := newTestRenderer(t, stub, "stream")
