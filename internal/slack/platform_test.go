@@ -904,15 +904,60 @@ func TestTaskUpdateRotatesWhenTheStreamIsDue(t *testing.T) {
 	}
 
 	calls := stub.recorded()
-	want := "chat.startStream,chat.stopStream,chat.startStream,chat.appendStream"
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.startStream,chat.appendStream"
 	if got := strings.Join(stub.methods(), ","); got != want {
 		t.Fatalf("calls = %v, want %v", got, want)
 	}
-	if got := calls[3].params["ts"]; got != "1700000000.000002" {
+	var finished []streamPayloadChunk
+	jsonParam(t, calls[1].params, "chunks", &finished)
+	if len(finished) != 1 || finished[0].Status != string(bot.TaskComplete) || finished[0].Title != rotationContinuationTitle {
+		t.Fatalf("old card update = %+v, want it completed as continued", finished)
+	}
+	if got := calls[4].params["ts"]; got != "1700000000.000002" {
 		t.Fatalf("task update went to %v, want the rotated stream", got)
 	}
-	if got := calls[1].params["session_status"]; got != "processing" {
+	if got := calls[2].params["session_status"]; got != "processing" {
 		t.Fatalf("rotation stop session_status = %v, want processing", got)
+	}
+}
+
+func TestRotationCompletesTheOldTaskCard(t *testing.T) {
+	starts := 0
+	stub := &stubSlack{bodies: func(method string, _ map[string]any) string {
+		if method == "chat.startStream" {
+			starts++
+			return fmt.Sprintf(`{"ok":true,"ts":"1700000000.%06d"}`, starts)
+		}
+		return ""
+	}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+
+	progress := bot.TaskProgress{ID: "turn-progress", Title: "Reading files", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{progress}); err != nil {
+		t.Fatal(err)
+	}
+	r.streamStartedAt = time.Now().Add(-streamRotateAfter - time.Second)
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := stub.recorded()
+	want := "chat.startStream,chat.appendStream,chat.stopStream,chat.startStream"
+	if got := strings.Join(stub.methods(), ","); got != want {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	var finished []streamPayloadChunk
+	jsonParam(t, calls[1].params, "chunks", &finished)
+	if len(finished) != 1 || finished[0].Status != string(bot.TaskComplete) ||
+		finished[0].Title != rotationContinuationTitle || finished[0].Details != "" {
+		t.Fatalf("old card update = %+v, want a completed continuation card without details", finished)
+	}
+	var replayed []streamPayloadChunk
+	jsonParam(t, calls[3].params, "chunks", &replayed)
+	if len(replayed) != 1 || replayed[0].Status != string(bot.TaskInProgress) ||
+		replayed[0].Title != progress.Title {
+		t.Fatalf("replacement card = %+v, want the live in-progress card replayed", replayed)
 	}
 }
 

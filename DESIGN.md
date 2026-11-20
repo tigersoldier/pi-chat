@@ -588,12 +588,15 @@ Constraints and behaviours:
   current stream with `session_status: processing` — so the session stays busy instead of
   falling to `active` — opens a new stream in the same thread, replays the current task
   cards as its initial chunks, and keeps rendering text produced after the boundary.
-  The previous message keeps the progress it streamed; the newest one is what `Finish`
-  corrects with the authoritative answer. If Slack had already finalized the stream (the
-  stop answers `message_not_in_streaming_state`), the adapter restores `processing` after
-  opening the replacement, so the loading indicator and stop button come back. A refused
-  replacement falls back to patching the finalized message: progress updates stop, but
-  the answer still lands.
+  Before the stop it marks any still-open card in the old segment `complete` as *Continued
+  in a new message*; Slack otherwise renders open tasks in a stopped stream as `error`.
+  That completion is visual only and is not written to the task cache, so the new stream
+  replays the live `in_progress` card. The previous message keeps the progress it streamed;
+  the newest one is what `Finish` corrects with the authoritative answer. If Slack had
+  already finalized the stream (the stop answers `message_not_in_streaming_state`), the
+  adapter restores `processing` after opening the replacement, so the loading indicator and
+  stop button come back. A refused replacement falls back to patching the finalized
+  message: progress updates stop, but the answer still lands.
 - **Status and title, two tiers:**
   - *Declared as an agent* (`slack/manifest.yaml`, Slack's agent messaging
     experience): `agents.sessions.setStatus` takes real lifecycle values that map onto

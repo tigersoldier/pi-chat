@@ -33,6 +33,12 @@ const (
 	// https://docs.slack.dev/reference/methods/chat.startStream#timeout
 	streamRotateAfter = 9 * time.Minute
 
+	// rotationContinuationTitle labels the task cards in a segment that is being
+	// closed. Slack marks still-open tasks as errors when their stream stops;
+	// completing them with this title keeps that error out of the thread while
+	// the live cards continue in the replacement stream.
+	rotationContinuationTitle = "Continued in a new message"
+
 	replyTooLongNotice = "Slack rejected this reply as too long. Please ask for a shorter version."
 )
 
@@ -674,6 +680,7 @@ func (r *renderer) rotate(ctx context.Context) error {
 	previous := r.ts
 	expired := false
 	if r.streamMayBeActive() {
+		r.closeOldTasks(ctx)
 		err := r.api.StopStream(ctx, r.channel, previous, "processing")
 		switch {
 		case err == nil:
@@ -729,6 +736,36 @@ func (r *renderer) rotate(ctx context.Context) error {
 			"expired", expired)
 	}
 	return nil
+}
+
+// closeOldTasks marks the current segment's open task cards complete before
+// its stream is stopped. The task cache is deliberately left unchanged: the
+// replacement stream replays the live in-progress cards from taskChunks().
+func (r *renderer) closeOldTasks(ctx context.Context) {
+	updates := make([]streamPayloadChunk, 0, len(r.taskOrder))
+	for _, chunk := range r.taskChunks() {
+		if chunk.Status != string(bot.TaskInProgress) {
+			continue
+		}
+		chunk.Status = string(bot.TaskComplete)
+		chunk.Title = rotationContinuationTitle
+		chunk.Details = ""
+		updates = append(updates, chunk)
+	}
+	if len(updates) == 0 {
+		return
+	}
+	if err := r.api.AppendStream(ctx, r.channel, r.ts, updates); err != nil {
+		if r.log != nil {
+			r.log.Warn("cannot mark the previous stream's tasks as continued",
+				"message_ts", r.ts, "task_update_chunks", len(updates), "error", err)
+		}
+		return
+	}
+	if r.log != nil {
+		r.log.Debug("marked the previous stream's tasks as continued",
+			"message_ts", r.ts, "task_update_chunks", len(updates))
+	}
 }
 
 // rememberTasks keeps the latest card state for each task ID so a rotated
