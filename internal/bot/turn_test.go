@@ -553,6 +553,204 @@ func TestRunTurnReportsAProviderFailureAfterPartialText(t *testing.T) {
 	}
 }
 
+func TestRunTurnContinuesAfterProgressMarkerOnlyStop(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	var mu sync.Mutex
+	var prompts []string
+	client := startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, prompt int, text string) string {
+		mu.Lock()
+		prompts = append(prompts, text)
+		mu.Unlock()
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		switch prompt {
+		case 1:
+			_ = enc.Encode(map[string]any{
+				"type": "message_update",
+				"assistantMessageEvent": map[string]any{
+					"type": "text_delta", "contentIndex": 0,
+					"delta": "[[slack-progress: Checking service logs]]",
+				},
+			})
+			_ = enc.Encode(map[string]any{
+				"type": "message_end",
+				"message": map[string]any{
+					"role": "assistant", "content": []any{}, "stopReason": "stop",
+				},
+			})
+			_ = enc.Encode(map[string]any{"type": "agent_settled"})
+			return "[[slack-progress: Checking service logs]]"
+		case 2:
+			_ = enc.Encode(map[string]any{
+				"type": "message_update",
+				"assistantMessageEvent": map[string]any{
+					"type": "text_delta", "contentIndex": 0, "delta": "Finished the task.",
+				},
+			})
+			_ = enc.Encode(map[string]any{
+				"type": "message_end",
+				"message": map[string]any{
+					"role": "assistant", "content": []any{}, "stopReason": "stop",
+				},
+			})
+			_ = enc.Encode(map[string]any{"type": "agent_settled"})
+			return "Finished the task."
+		default:
+			t.Errorf("unexpected prompt %d", prompt)
+			return ""
+		}
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	renderer := &recordingRenderer{}
+	if err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, renderer); err != nil {
+		t.Fatalf("runTurn = %v, want the answer from the continuation", err)
+	}
+	if got := renderer.finalAnswers(); len(got) != 1 || got[0] != "Finished the task." {
+		t.Fatalf("final answers = %q, want the continuation answer", got)
+	}
+	if completed := platform.completedRequests(); len(completed) != 1 {
+		t.Fatalf("completed requests = %+v, want one completed user turn", completed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(prompts) != 2 || prompts[1] != progressMarkerContinuationText {
+		t.Fatalf("prompts = %q, want the user prompt and one continuation", prompts)
+	}
+}
+
+func TestRunTurnStopsRetryingAfterProgressMarkerLimit(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	var mu sync.Mutex
+	prompts := 0
+	marker := "[[slack-progress: Checking service logs]]"
+	client := startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, _ int, _ string) string {
+		mu.Lock()
+		prompts++
+		mu.Unlock()
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": marker,
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role": "assistant", "content": []any{}, "stopReason": "stop",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return marker
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
+	if err == nil || !strings.Contains(err.Error(), "produced no answer") {
+		t.Fatalf("runTurn = %v, want the no-answer error after the retry limit", err)
+	}
+	if completed := platform.completedRequests(); len(completed) != 0 {
+		t.Errorf("completed requests = %+v, want none when the retry limit is exhausted", completed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := maxProgressMarkerRetries + 1; prompts != want {
+		t.Fatalf("prompts = %d, want %d bounded attempts", prompts, want)
+	}
+}
+
+func TestRunTurnDoesNotContinueAfterProgressMarkerOnProviderFailure(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	var mu sync.Mutex
+	prompts := 0
+	marker := "[[slack-progress: Checking service logs]]"
+	client := startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, _ int, _ string) string {
+		mu.Lock()
+		prompts++
+		mu.Unlock()
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": marker,
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role": "assistant", "content": []any{}, "stopReason": "error",
+				"errorMessage": "provider exploded",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return marker
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
+	if err == nil || !strings.Contains(PublicMessage(err), "provider exploded") {
+		t.Fatalf("runTurn = %v, want the provider failure instead of a continuation", err)
+	}
+	if completed := platform.completedRequests(); len(completed) != 0 {
+		t.Errorf("completed requests = %+v, want none after a failed turn", completed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if prompts != 1 {
+		t.Fatalf("prompts = %d, want no continuation after a provider failure", prompts)
+	}
+}
+
+func TestRunTurnPreservesAnInlineProgressMarkerInTheAnswer(t *testing.T) {
+	b, _, st := newTestBot(t)
+	th := testThread(t, b, st)
+	const answer = "The marker is [[slack-progress: not a real status]] in prose."
+	client := startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, _ int, _ string) string {
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": answer,
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role": "assistant", "content": []any{}, "stopReason": "stop",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return answer
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	renderer := &recordingRenderer{}
+	if err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, renderer); err != nil {
+		t.Fatalf("runTurn = %v, want the inline marker to be ordinary text", err)
+	}
+	if got := renderer.rendered(); got != answer {
+		t.Fatalf("streamed answer = %q, want the inline marker preserved", got)
+	}
+	if got := renderer.finalAnswers(); len(got) != 1 || got[0] != answer {
+		t.Fatalf("final answer = %q, want the inline marker preserved", got)
+	}
+}
+
 func TestObservedTurnReportsATerminalFailureWithoutText(t *testing.T) {
 	b, platform, st := newTestBot(t)
 	th := testThread(t, b, st)
@@ -686,6 +884,17 @@ func TestRunTurnReportsAStopInsteadOfAConnectionLoss(t *testing.T) {
 // events the fake pi would emit; every command gets an empty successful response.
 func startTurnGateway(t *testing.T, th *thread, onPrompt func(*json.Encoder)) *gwclient.Client {
 	t.Helper()
+	return startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, _ int, _ string) string {
+		onPrompt(enc)
+		return ""
+	})
+}
+
+// startTurnGatewayWithLastText is startTurnGateway with a scripted
+// get_last_assistant_text response. onPrompt handles the n-th prompt (1-based)
+// and returns the text that get_last_assistant_text reports afterwards.
+func startTurnGatewayWithLastText(t *testing.T, th *thread, onPrompt func(*json.Encoder, int, string) string) *gwclient.Client {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -707,19 +916,26 @@ func startTurnGateway(t *testing.T, th *thread, onPrompt func(*json.Encoder)) *g
 		_ = enc.Encode(protocol.Welcome{Type: "gw_welcome", Protocol: protocol.Version,
 			ClientID: "turn-test", Concurrency: "queue",
 			Session: &protocol.SessionRef{Path: "/test-session.jsonl"}})
+		prompts := 0
+		lastAssistant := ""
 		for {
 			var raw json.RawMessage
 			if dec.Decode(&raw) != nil {
 				return
 			}
-			var command struct{ Type, ID string }
+			var command struct{ Type, ID, Message string }
 			_ = json.Unmarshal(raw, &command)
 			if command.Type == "prompt" {
-				onPrompt(enc)
+				prompts++
+				lastAssistant = onPrompt(enc, prompts, command.Message)
+			}
+			data := map[string]any{}
+			if command.Type == "get_last_assistant_text" {
+				data["text"] = lastAssistant
 			}
 			_ = enc.Encode(map[string]any{
 				"type": "response", "id": command.ID, "command": command.Type,
-				"success": true, "data": map[string]any{},
+				"success": true, "data": data,
 			})
 		}
 	}()
@@ -735,28 +951,30 @@ func startTurnGateway(t *testing.T, th *thread, onPrompt func(*json.Encoder)) *g
 	return client
 }
 
-func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T) {
+func TestInlineProgressMarkerStaysInReplyAndDoesNotTitleTool(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
 	startedAt := time.Unix(2_000, 0)
 	st.progressStartedAt = startedAt
 
+	marker := "[[slack-progress: Checking current service\nlogs]]"
 	st.feed(textDelta(t, "Checking the service. [[slack-prog"), log)
 	st.feed(textDelta(t, "ress: Checking current service\nlogs]]"), log)
-	if got := st.takePending(); got != "Checking the service. " {
-		t.Fatalf("reply text = %q, want marker removed", got)
+	if got := st.takePending(); got != "Checking the service. "+marker {
+		t.Fatalf("reply text = %q, want the inline marker preserved", got)
 	}
 
 	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
 	updates := st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].Title != "Checking current service logs" || updates[0].Details != "" {
-		t.Fatalf("start updates = %+v, want concise title without rolling details", updates)
+	if len(updates) != 1 || updates[0].Title != "Running a command" || updates[0].Details != "" {
+		t.Fatalf("start updates = %+v, want the tool fallback title", updates)
 	}
-	if got := st.text(); strings.Contains(got, progressMarkerOpen) {
-		t.Fatalf("progress marker leaked into reply text %q", got)
+	if got := st.text(); !strings.Contains(got, marker) {
+		t.Fatalf("inline marker disappeared from reply text %q", got)
 	}
-	if got := st.authoritativeText("Finished. [[slack-progress: hidden status]]"); strings.Contains(got, "hidden status") {
-		t.Fatalf("authoritative answer leaked a progress marker: %q", got)
+	final := "Finished. [[slack-progress: hidden status]]"
+	if got := st.authoritativeText(final); got != final {
+		t.Fatalf("authoritative answer = %q, want the inline marker preserved", got)
 	}
 
 	st.feed(toolEvent(t, "tool_execution_end", "call-1", "bash", false), log)
@@ -765,7 +983,7 @@ func TestPublicProgressMarkerBecomesTaskTitleAndIsRemovedFromReply(t *testing.T)
 	}
 	st.finishProgressTaskAt(TaskComplete, startedAt.Add(75*time.Second))
 	updates = st.takeTaskUpdates()
-	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 1 action · 1m15s" || updates[0].Details != "Completed actions:\n• Checking current service logs" || updates[0].Status != TaskComplete {
+	if len(updates) != 1 || updates[0].ID != turnProgressTaskID || updates[0].Title != "Completed · 1 action · 1m15s" || updates[0].Details != "Completed actions:\n• Running a command" || updates[0].Status != TaskComplete {
 		t.Fatalf("turn completion update = %+v", updates)
 	}
 }
@@ -851,9 +1069,10 @@ func TestParallelProgressMarkersStayInToolStartOrder(t *testing.T) {
 
 func TestProgressTitlesAreTrimmedAndRejectCommandLikeText(t *testing.T) {
 	recovered := newTurnState()
-	recovered.replace("Answer [[slack-progress: hidden status]] done")
-	if got := recovered.takePending(); strings.Contains(got, "hidden status") || strings.Contains(got, progressMarkerOpen) {
-		t.Fatalf("recovered text leaked a status marker: %q", got)
+	inline := "Answer [[slack-progress: hidden status]] done"
+	recovered.replace(inline)
+	if got := recovered.takePending(); got != inline {
+		t.Fatalf("recovered text = %q, want the inline marker preserved", got)
 	}
 
 	long := strings.Repeat("Check ", maxProgressTitleRunes)
@@ -1131,26 +1350,36 @@ func TestOversizedToolIdentifiersAreNotRetained(t *testing.T) {
 	}
 }
 
-func TestOversizedProgressMarkerIsRemovedFromReply(t *testing.T) {
+func TestOversizedProgressMarkerIsOnlyRemovedWhenItIsTheWholeMessage(t *testing.T) {
 	log := discardLogger()
 	content := strings.Repeat("x", maxProgressTitleRunes+1)
 	marker := progressMarkerOpen + content + " tail" + progressMarkerClose
-	want := "Before  after"
+	inline := "Before " + marker + " after"
 
 	streamed := newTurnState()
 	streamed.feed(textDelta(t, "Before "+progressMarkerOpen+content), log)
 	streamed.feed(textDelta(t, " tail"+progressMarkerClose+" after"), log)
-	if got := streamed.text(); got != want {
-		t.Fatalf("streamed oversized marker = %q, want %q", got, want)
+	if got := streamed.text(); got != inline {
+		t.Fatalf("streamed inline oversized marker = %q, want it preserved literally", got)
 	}
-	if got := streamed.authoritativeText("Before " + marker + " after"); got != want {
-		t.Fatalf("authoritative oversized marker = %q, want %q", got, want)
+	if got := streamed.authoritativeText(inline); got != inline {
+		t.Fatalf("authoritative inline oversized marker = %q, want it preserved literally", got)
 	}
 
 	recovered := newTurnState()
-	recovered.replace("Before " + marker + " after")
-	if got := recovered.text(); got != want {
-		t.Fatalf("recovered oversized marker = %q, want %q", got, want)
+	recovered.replace(inline)
+	if got := recovered.text(); got != inline {
+		t.Fatalf("recovered inline oversized marker = %q, want it preserved literally", got)
+	}
+
+	markerOnly := newTurnState()
+	markerOnly.feed(textDelta(t, marker), log)
+	markerOnly.finishMessageText()
+	if got := markerOnly.text(); got != "" {
+		t.Fatalf("marker-only oversized message = %q, want it removed", got)
+	}
+	if len(markerOnly.pendingProgress) != 0 {
+		t.Fatalf("marker-only oversized message queued titles: %v", markerOnly.pendingProgress)
 	}
 }
 
@@ -1298,15 +1527,18 @@ func TestDuplicateToolStartDoesNotConsumeNextProgressTitle(t *testing.T) {
 	}
 }
 
-func TestProgressCaptureAndTitleQueueAreBounded(t *testing.T) {
+func TestProgressMarkerBoundariesAndTitleQueueAreBounded(t *testing.T) {
 	log := discardLogger()
 	st := newTurnState()
 	overlong := strings.Repeat("x", maxProgressTitleRunes+1)
 	st.feed(textDelta(t, progressMarkerOpen+overlong), log)
-	if st.capturingProgress || st.progressCapture.Len() != 0 {
-		t.Fatalf("oversized marker retained capture state: capturing=%v bytes=%d", st.capturingProgress, st.progressCapture.Len())
-	}
 	st.startMessage()
+	if got := st.text(); got != "" {
+		t.Fatalf("an unfinished oversized marker leaked into the reply: %q", got)
+	}
+	if len(st.pendingProgress) != 0 {
+		t.Fatalf("unfinished oversized marker queued titles: %v", st.pendingProgress)
+	}
 	st.feed(textDelta(t, "Final answer"), log)
 	if got := st.text(); got != "Final answer" {
 		t.Fatalf("text after an oversized marker boundary = %q, want final answer", got)
@@ -1316,6 +1548,7 @@ func TestProgressCaptureAndTitleQueueAreBounded(t *testing.T) {
 	for range maxPendingProgressTitles + 1 {
 		st.feed(textDelta(t, "[[slack-progress: Check service]]"), log)
 	}
+	st.finishMessageText()
 	if len(st.pendingProgress) != maxPendingProgressTitles {
 		t.Fatalf("queued titles = %d, want cap %d", len(st.pendingProgress), maxPendingProgressTitles)
 	}

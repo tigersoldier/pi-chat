@@ -531,13 +531,24 @@ it is ready.
     and is sent once, when the task completes; active updates change only the title, avoiding
     repeated cumulative detail snapshots in the stream. Tool completion does not create or
     recycle task IDs, so the timeline stays at one card;
-    individual completed steps are never shown as separate cards. A valid
-    `[[slack-progress: ...]]` assistant-text marker supplies a FIFO custom title for the
-    next tool start (max 80 characters, with at most 64 titles buffered); at most six safe
-    titles are retained for details. Overflow or an absent/invalid marker falls
-    back to a generic tool-name title. Well-formed markers are removed from the reply;
-    oversized or credential-like marker content is rejected. Thinking, raw arguments, and
+    individual completed steps are never shown as separate cards. An assistant message
+    consisting only of one or more `[[slack-progress: ...]]` markers (ignoring whitespace)
+    supplies FIFO custom titles for upcoming tool starts (max 80 characters each, with at
+    most 64 titles buffered); at most six safe titles are retained for details. Overflow or
+    an absent/invalid marker falls back to a generic tool-name title. Only a message that
+    consists of markers is removed from the reply and contributes titles; a marker quoted
+    inside prose stays visible and is not treated as progress. Oversized or credential-like
+    marker content is rejected when it is the whole message. Thinking, raw arguments, and
     output are not sent to Slack.
+- **A premature stop after a progress marker continues the turn.** Some models emit a
+  well-formed marker and then end the response without the tool call it announced. A clean
+  settlement whose entire authoritative message is a progress marker is treated as that
+  premature stop: the turn logs it, waits for the gateway's own settled frame, and sends a
+  brief `Continue.` prompt into the same session while keeping the reply stream and task
+  card open. Automatic continuation is bounded to two retries per user turn; when the limit
+  is exhausted the normal `the agent produced no answer` failure is reported. A user stop,
+  hard session failure, read error or other terminal outcome still fails the turn instead
+  of continuing it.
 - **Failure reporting** is classified from the turn's terminal outcome, not from one
   provider-specific event: the last assistant `stopReason`/`errorMessage`, a failed retry or
   compaction, an extension error, a session crash/stop/deletion, a gateway error, or a failed
