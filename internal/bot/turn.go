@@ -37,6 +37,12 @@ const (
 	maxProgressDetailsRunes   = 600
 	maxTurnErrorRunes         = 400
 	turnProgressTaskID        = "turn-progress"
+
+	// A model can end its response right after a progress marker, before the
+	// tool call that marker announced. "Continue" resumes it, but retry only a
+	// few times so a model stuck in that pattern cannot loop indefinitely.
+	maxProgressMarkerRetries       = 2
+	progressMarkerContinuationText = "Continue."
 )
 
 // boundedIDSet deduplicates a rolling window of IDs without retaining
@@ -318,91 +324,152 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if instruction != "" {
 		prompt = instruction + "\n\n" + prompt
 	}
-	if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
+	for attempt := 0; ; attempt++ {
+		if attempt == 0 {
+			if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
+				if st.sessionDeleted() {
+					th.forgetSessionForPath(ctx, sessionPath)
+					return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
+				}
+				return publicError("I couldn't send the request to the agent", err)
+			}
+			// The prompt is where those messages went, so this is the first moment the
+			// watermark may move past them — and the instruction is owed until a prompt
+			// has actually carried it.
+			th.rememberObserved(ctx, obs)
+			if instruction != "" {
+				th.instructionSent()
+			}
+		} else {
+			if _, err := client.Prompt(ctx, progressMarkerContinuationText); err != nil {
+				if st.sessionDeleted() {
+					th.forgetSessionForPath(ctx, sessionPath)
+					return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
+				}
+				return publicError("I couldn't continue the request to the agent", err)
+			}
+		}
+		if err := st.waitStarted(ctx, startGrace); err != nil {
+			if failure := st.abortFailure(); failure != nil {
+				return failure
+			}
+			if errors.Is(err, context.Canceled) {
+				return publicError("the turn was canceled", err)
+			}
+			return err
+		}
+		if err := awaitSettledOrDone(ctx, client, st); err != nil {
+			if st.sessionDeleted() {
+				th.forgetSessionForPath(ctx, sessionPath)
+				return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
+			}
+			if failure := st.abortFailure(); failure != nil {
+				return failure
+			}
+			if errors.Is(err, context.Canceled) {
+				return publicError("the turn was canceled", err)
+			}
+			return publicError("the gateway connection was lost while the agent was working", err)
+		}
+		// A concurrent `/abort` can race with settlement. Wait for its gateway
+		// outcome before finalizing the Slack task or stopping the renderer.
+		if err := st.waitAbortResolution(context.Background()); err != nil {
+			return publicError("the stop request could not be completed", err)
+		}
+
+		// The turn is over, wherever it ended: remember how far this connection
+		// got, so reopening the thread resumes here instead of replaying it. A
+		// deleted session has nothing left to resume, so it is handled first.
 		if st.sessionDeleted() {
 			th.forgetSessionForPath(ctx, sessionPath)
-			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
+			return publicError("this session was deleted outside pi-chat; the next message starts a new one", errSessionGone)
 		}
-		return publicError("I couldn't send the request to the agent", err)
-	}
-	// The prompt is where those messages went, so this is the first moment the
-	// watermark may move past them — and the instruction is owed until a prompt
-	// has actually carried it.
-	th.rememberObserved(ctx, obs)
-	if instruction != "" {
-		th.instructionSent()
-	}
-	if err := st.waitStarted(ctx, startGrace); err != nil {
-		if failure := st.abortFailure(); failure != nil {
+		if st.hardSessionFailure() {
+			th.close(ctx)
+			return st.turnFailure(true)
+		}
+		th.saveCursorAfterActivity(ctx, client)
+
+		final, readErr := client.GetLastAssistantText(ctx)
+		if readErr != nil {
+			th.log.Warn("cannot read the answer", "error", readErr)
+		}
+		// GetLastAssistantText returns just the last assistant message. Preserve
+		// earlier visible messages and fall back to streamed text if reading back
+		// failed, while letting the authoritative final text correct the last one.
+		rawFinal := final
+		final = st.authoritativeText(final)
+		if readErr != nil && final == "" {
+			st.recordReadError(readErr)
+		}
+		if final != "" {
+			th.rememberAssistant(final)
+		}
+		// Some models end a response right after a progress marker and before
+		// the tool call it announced. That is a premature stop, not an answer:
+		// resume the same user turn with a brief continuation.
+		if final == "" && readErr == nil && onlyProgressMarkers(rawFinal) &&
+			attempt < maxProgressMarkerRetries && st.canContinueAfterProgressMarker() {
+			th.log.Warn("the agent stopped after a progress marker without a tool call; continuing",
+				"thread", th.key, "session", sessionPath, "retry", attempt+1,
+				"max_retries", maxProgressMarkerRetries)
+			// agent_settled closes the local done signal, but the gateway's own
+			// settled frame may still be in flight. AwaitSettled covers the gateway
+			// latch; GetState is a round-trip barrier that guarantees the read loop
+			// has fed every earlier frame into this reservation before it is reused.
+			settleCtx, cancelSettle := context.WithTimeout(ctx, gatewayTimeout)
+			settleErr := client.AwaitSettled(settleCtx)
+			if settleErr == nil {
+				_, settleErr = client.GetState(settleCtx)
+			}
+			cancelSettle()
+			if settleErr != nil {
+				if errors.Is(settleErr, context.DeadlineExceeded) {
+					// Without a confirmed settlement the continuation could race the
+					// previous turn's frame. Keep the original failure rather than hang.
+					th.log.Warn("the gateway did not confirm the previous response settled; not continuing",
+						"thread", th.key, "session", sessionPath, "error", settleErr)
+					return errors.New("the agent produced no answer")
+				}
+				if st.sessionDeleted() {
+					th.forgetSessionForPath(ctx, sessionPath)
+					return publicError("this session was deleted outside pi-chat; the next message starts a new one", settleErr)
+				}
+				if isGone(settleErr) {
+					th.forgetSessionForPath(ctx, sessionPath)
+					return publicError("this session was deleted outside pi-chat; the next message starts a new one", settleErr)
+				}
+				if failure := st.abortFailure(); failure != nil {
+					return failure
+				}
+				if errors.Is(settleErr, context.Canceled) {
+					return publicError("the turn was canceled", settleErr)
+				}
+				return publicError("the gateway connection was lost while the agent was working", settleErr)
+			}
+			before = rawFinal
+			stopFlush()
+			st.rearmForContinuation()
+			stopFlush = th.flush(ctx, st, r)
+			continue
+		}
+		if failure := st.turnFailure(final != ""); failure != nil {
 			return failure
 		}
-		if errors.Is(err, context.Canceled) {
-			return publicError("the turn was canceled", err)
+		if final == "" || (final == before && !st.sawWork()) {
+			return errors.New("the agent produced no answer")
 		}
-		return err
-	}
-	if err := awaitSettledOrDone(ctx, client, st); err != nil {
-		if st.sessionDeleted() {
-			th.forgetSessionForPath(ctx, sessionPath)
-			return publicError("this session was deleted outside pi-chat; the next message starts a new one", err)
-		}
-		if failure := st.abortFailure(); failure != nil {
-			return failure
-		}
-		if errors.Is(err, context.Canceled) {
-			return publicError("the turn was canceled", err)
-		}
-		return publicError("the gateway connection was lost while the agent was working", err)
-	}
-	// A concurrent `/abort` can race with settlement. Wait for its gateway
-	// outcome before finalizing the Slack task or stopping the renderer.
-	if err := st.waitAbortResolution(context.Background()); err != nil {
-		return publicError("the stop request could not be completed", err)
-	}
 
-	// The turn is over, wherever it ended: remember how far this connection
-	// got, so reopening the thread resumes here instead of replaying it. A
-	// deleted session has nothing left to resume, so it is handled first.
-	if st.sessionDeleted() {
-		th.forgetSessionForPath(ctx, sessionPath)
-		return publicError("this session was deleted outside pi-chat; the next message starts a new one", errSessionGone)
+		st.finishOpenTasks()
+		stopFlush()
+		if err := r.Finish(ctx, final); err != nil {
+			return publicError("the answer was produced, but the chat message could not be updated", err)
+		}
+		th.noteProgress(ctx, r)
+		th.touch()
+		th.b.completeRequest(ctx, m)
+		return nil
 	}
-	if st.hardSessionFailure() {
-		th.close(ctx)
-		return st.turnFailure(true)
-	}
-	th.saveCursorAfterActivity(ctx, client)
-
-	final, readErr := client.GetLastAssistantText(ctx)
-	if readErr != nil {
-		th.log.Warn("cannot read the answer", "error", readErr)
-	}
-	// GetLastAssistantText returns just the last assistant message. Preserve
-	// earlier visible messages and fall back to streamed text if reading back
-	// failed, while letting the authoritative final text correct the last one.
-	final = st.authoritativeText(final)
-	if readErr != nil && final == "" {
-		st.recordReadError(readErr)
-	}
-	if final != "" {
-		th.rememberAssistant(final)
-	}
-	if failure := st.turnFailure(final != ""); failure != nil {
-		return failure
-	}
-	if final == "" || (final == before && !st.sawWork()) {
-		return errors.New("the agent produced no answer")
-	}
-
-	st.finishOpenTasks()
-	stopFlush()
-	if err := r.Finish(ctx, final); err != nil {
-		return publicError("the answer was produced, but the chat message could not be updated", err)
-	}
-	th.noteProgress(ctx, r)
-	th.touch()
-	th.b.completeRequest(ctx, m)
-	return nil
 }
 
 // awaitSettledOrDone waits for pi to settle, but also stops when the turn has
@@ -750,11 +817,13 @@ type turnState struct {
 	progressElapsed              time.Duration
 	progressElapsedCaptured      bool
 
-	progressRemainder       string
-	progressCapture         strings.Builder
-	capturingProgress       bool
-	discardingProgressClose bool
-	pendingProgress         []string
+	// rawMessage holds text since the start of the current assistant message
+	// until it is known whether the whole message is a progress marker. A
+	// marker is only treated as progress when it is the entire message: prose
+	// that happens to quote one stays visible.
+	rawMessage      strings.Builder
+	messageDecided  bool
+	pendingProgress []string
 
 	outcome turnOutcome
 
@@ -803,6 +872,76 @@ func newTurnState() *turnState {
 		taskCh:          make(chan struct{}, 1),
 		abortResolvedCh: make(chan struct{}, 1),
 	}
+}
+
+// rearmForContinuation prepares this reservation for another model response
+// after a clean settlement produced no visible answer. Text already shown and
+// the reply's progress history stay; only the per-response lifecycle, channels
+// and terminal outcome are reset. The caller must have stopped the current
+// flush loop first, because it reads these channels.
+func (s *turnState) rearmForContinuation() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.pending.Reset()
+	s.pendingTasks = nil
+	s.activeTasks = make(map[string]TaskProgress)
+	s.runningTool = ""
+	s.runningToolCall = ""
+	s.seenToolCalls.Clear()
+	s.seenToolEnds.Clear()
+	s.progressStartedSent = false
+	s.terminal = false
+	s.eventDone = false
+	s.settled = false
+	s.progressFinalized = false
+	s.pendingTerminalStatus = ""
+	s.abortPending = 0
+	s.donePending = false
+	s.aborted = false
+	s.progressElapsedCaptured = false
+	s.rawMessage.Reset()
+	s.messageDecided = false
+	s.pendingProgress = nil
+	s.currentMessage.Reset()
+	s.work = false
+	s.started = false
+	s.outcome = turnOutcome{}
+
+	s.workOnce = sync.Once{}
+	s.doneOnce = sync.Once{}
+	s.textOnce = sync.Once{}
+	s.firstTextOnce = sync.Once{}
+	s.workCh = make(chan struct{})
+	s.doneCh = make(chan struct{})
+	s.textCh = make(chan struct{})
+	s.firstTextCh = make(chan struct{})
+	s.taskCh = make(chan struct{}, 1)
+	s.abortResolvedCh = make(chan struct{}, 1)
+}
+
+// canContinueAfterProgressMarker reports whether a settlement that produced no
+// visible answer is only a premature stop. Any user stop, hard session failure,
+// read error or other terminal error must still reach the user.
+func (s *turnState) canContinueAfterProgressMarker() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.eventDone {
+		return false
+	}
+	if s.aborted || s.outcome.aborted || s.outcome.hardSessionFailure() {
+		return false
+	}
+	if s.outcome.retryError != "" || s.outcome.compactionError != "" ||
+		s.outcome.extensionError != "" || s.outcome.gatewayError != "" ||
+		s.outcome.readError != "" || s.outcome.errorMessage != "" {
+		return false
+	}
+	switch s.outcome.stopReason {
+	case "", "stop":
+		return true
+	}
+	return false
 }
 
 // feed records one gateway event. Unknown event types are ignored on purpose:
@@ -859,6 +998,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 	case "message_end":
 		// message_end carries the authoritative final message, including the
 		// stopReason and errorMessage of an assistant message that failed.
+		s.finishMessageText()
 		s.recordAssistantEnd(ev)
 
 	case "agent_end":
@@ -963,6 +1103,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 }
 
 func (s *turnState) recordToolTask(ev gwclient.Event) {
+	s.finishMessageText()
 	var tool struct {
 		ToolCallID string `json:"toolCallId"`
 		ToolName   string `json:"toolName"`
@@ -1315,86 +1456,59 @@ func taskTitle(toolName string) string {
 }
 
 func (s *turnState) appendAssistantDelta(delta string) {
-	if visible := s.consumeProgressDelta(delta); visible != "" {
-		s.append(visible)
+	s.mu.Lock()
+	if s.messageDecided {
+		wrote := s.appendLocked(delta)
+		s.mu.Unlock()
+		if wrote {
+			s.signalText()
+		}
+		return
+	}
+
+	s.rawMessage.WriteString(delta)
+	raw := s.rawMessage.String()
+	only, incomplete := progressMarkerPrefix(raw)
+	if only || incomplete {
+		s.mu.Unlock()
+		return
+	}
+	// The message contains something besides progress markers, so it was
+	// ordinary text all along. Show the held prefix, including any markers it
+	// happens to quote, and stream the rest normally.
+	s.messageDecided = true
+	s.rawMessage.Reset()
+	wrote := s.appendLocked(raw)
+	s.mu.Unlock()
+	if wrote {
+		s.signalText()
 	}
 }
 
-// consumeProgressDelta removes the explicit public-status marker from reply
-// text and queues only a bounded short title for the next tool start. Thinking
-// deltas never reach this parser.
-func (s *turnState) consumeProgressDelta(delta string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	input := s.progressRemainder + delta
-	s.progressRemainder = ""
-	var visible strings.Builder
-	for input != "" {
-		if s.discardingProgressClose {
-			end := strings.Index(input, progressMarkerClose)
+// progressMarkerPrefix reports whether text seen so far could still be a
+// progress-marker-only assistant message. incomplete is true when the text ends
+// inside a possible marker; only is true when everything seen is whitespace or
+// complete markers. Both mean more deltas may still decide the question.
+func progressMarkerPrefix(text string) (only, incomplete bool) {
+	for {
+		text = strings.TrimLeftFunc(text, unicode.IsSpace)
+		if text == "" {
+			return true, false
+		}
+		if strings.HasPrefix(text, progressMarkerOpen) {
+			rest := text[len(progressMarkerOpen):]
+			end := strings.Index(rest, progressMarkerClose)
 			if end < 0 {
-				keep := progressMarkerPrefixSuffixLen(input, progressMarkerClose)
-				if keep > 0 {
-					s.progressRemainder = input[len(input)-keep:]
-				}
-				break
+				return false, true
 			}
-			input = input[end+len(progressMarkerClose):]
-			s.discardingProgressClose = false
+			text = rest[end+len(progressMarkerClose):]
 			continue
 		}
-
-		if s.capturingProgress {
-			end := strings.Index(input, progressMarkerClose)
-			if end < 0 {
-				keep := progressMarkerPrefixSuffixLen(input, progressMarkerClose)
-				payload := input[:len(input)-keep]
-				captured := s.progressCapture.String()
-				if len([]rune(captured))+len([]rune(payload)) > maxProgressTitleRunes {
-					// An overlong status marker is invalid metadata. Drop its content
-					// through the closing delimiter without retaining it.
-					if keep > 0 {
-						s.progressRemainder = input[len(input)-keep:]
-					}
-					s.progressCapture.Reset()
-					s.capturingProgress = false
-					s.discardingProgressClose = true
-					break
-				}
-				s.progressCapture.WriteString(payload)
-				if keep > 0 {
-					s.progressRemainder = input[len(input)-keep:]
-				}
-				break
-			}
-
-			content := s.progressCapture.String() + input[:end]
-			if len([]rune(content)) <= maxProgressTitleRunes && len(s.pendingProgress) < maxPendingProgressTitles {
-				s.pendingProgress = append(s.pendingProgress, trimProgressTitle(content))
-			}
-			s.progressCapture.Reset()
-			s.capturingProgress = false
-			input = input[end+len(progressMarkerClose):]
-			continue
+		if progressMarkerPrefixSuffixLen(text, progressMarkerOpen) == len(text) {
+			return false, true
 		}
-
-		start := strings.Index(input, progressMarkerOpen)
-		if start >= 0 {
-			visible.WriteString(input[:start])
-			input = input[start+len(progressMarkerOpen):]
-			s.capturingProgress = true
-			continue
-		}
-
-		keep := progressMarkerPrefixSuffixLen(input, progressMarkerOpen)
-		visible.WriteString(input[:len(input)-keep])
-		if keep > 0 {
-			s.progressRemainder = input[len(input)-keep:]
-		}
-		break
+		return false, false
 	}
-	return visible.String()
 }
 
 func progressMarkerPrefixSuffixLen(text, marker string) int {
@@ -1458,54 +1572,118 @@ func containsCredentialLikeText(text string) bool {
 	return false
 }
 
-func (s *turnState) flushProgressMarker() {
+// finishMessageText decides how to treat the current assistant message. A
+// message made only of progress markers supplies titles for upcoming tool
+// starts and is not shown. Any other message is ordinary text and keeps its
+// markers literally, so prose that quotes one is not altered.
+func (s *turnState) finishMessageText() {
 	s.mu.Lock()
-	tail := s.progressRemainder
-	if s.capturingProgress {
-		content := s.progressCapture.String() + tail
-		if len([]rune(content)) <= maxProgressTitleRunes && !containsCredentialLikeText(content) {
-			tail = progressMarkerOpen + content
-		} else {
-			tail = ""
+	raw := s.rawMessage.String()
+	s.rawMessage.Reset()
+	decided := s.messageDecided
+	s.messageDecided = false
+
+	var wrote bool
+	if !decided && raw != "" {
+		if titles, ok := markerOnlyTitles(raw); ok {
+			s.queueProgressTitlesLocked(titles)
+			raw = ""
+		} else if start, content, ok := trailingProgressMarker(raw); ok && !validProgressMarkerContent(content) {
+			// Preserve the old safety rule for an unfinished marker whose
+			// content is oversized or credential-like: drop that tail instead
+			// of echoing it into the reply.
+			raw = raw[:start]
 		}
-	} else if s.discardingProgressClose {
-		tail = ""
 	}
-	s.progressRemainder = ""
-	s.progressCapture.Reset()
-	s.capturingProgress = false
-	s.discardingProgressClose = false
+	if raw != "" {
+		wrote = s.appendLocked(raw)
+	}
 	s.mu.Unlock()
-	if tail != "" {
-		s.append(tail)
+	if wrote {
+		s.signalText()
 	}
 }
 
-func stripProgressMarkers(text string) string {
-	var visible strings.Builder
-	for text != "" {
-		start := strings.Index(text, progressMarkerOpen)
-		if start < 0 {
-			visible.WriteString(text)
-			break
+// markerOnlyTitles returns the titles of a message that consists only of
+// progress markers and whitespace. ok is false as soon as any other text is
+// present, which keeps a marker quoted inside prose from being treated.
+func markerOnlyTitles(text string) (titles []string, ok bool) {
+	for {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return titles, true
 		}
-		visible.WriteString(text[:start])
+		if !strings.HasPrefix(text, progressMarkerOpen) {
+			return nil, false
+		}
+		rest := text[len(progressMarkerOpen):]
+		end := strings.Index(rest, progressMarkerClose)
+		if end < 0 {
+			return nil, false
+		}
+		if title := progressMarkerTitle(rest[:end]); title != "" {
+			titles = append(titles, title)
+		}
+		text = rest[end+len(progressMarkerClose):]
+	}
+}
+
+// trailingProgressMarker returns the first marker that never closes, so an
+// unfinished marker at the end of an otherwise literal message can still be
+// checked against the safety rules.
+func trailingProgressMarker(text string) (start int, content string, ok bool) {
+	offset := 0
+	for {
+		i := strings.Index(text[offset:], progressMarkerOpen)
+		if i < 0 {
+			return 0, "", false
+		}
+		start = offset + i
 		contentStart := start + len(progressMarkerOpen)
 		end := strings.Index(text[contentStart:], progressMarkerClose)
 		if end < 0 {
-			content := text[contentStart:]
-			if len([]rune(content)) <= maxProgressTitleRunes && !containsCredentialLikeText(content) {
-				visible.WriteString(text[start:])
-			}
-			break
+			return start, text[contentStart:], true
 		}
-		suffixStart := contentStart + end + len(progressMarkerClose)
-		text = text[suffixStart:]
+		offset = contentStart + end + len(progressMarkerClose)
 	}
-	return visible.String()
+}
+
+func validProgressMarkerContent(content string) bool {
+	return len([]rune(content)) <= maxProgressTitleRunes && !containsCredentialLikeText(content)
+}
+
+// progressMarkerTitle turns marker content into a task title, or "" when the
+// content is not valid metadata. Overlong content is rejected rather than
+// truncated, matching the marker contract.
+func progressMarkerTitle(content string) string {
+	if len([]rune(content)) > maxProgressTitleRunes {
+		return ""
+	}
+	return trimProgressTitle(content)
+}
+
+func (s *turnState) queueProgressTitlesLocked(titles []string) {
+	for _, title := range titles {
+		if len(s.pendingProgress) >= maxPendingProgressTitles {
+			return
+		}
+		s.pendingProgress = append(s.pendingProgress, title)
+	}
+}
+
+// onlyProgressMarkers reports that the raw assistant text was non-empty and
+// consisted only of progress markers. A model that stops there has not answered
+// and, in the observed failure mode, intended to call a tool next.
+func onlyProgressMarkers(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	_, ok := markerOnlyTitles(text)
+	return ok
 }
 
 func (s *turnState) finishOpenTasks() {
+	s.finishMessageText()
 	s.mu.Lock()
 	if s.settled || s.progressFinalized {
 		s.mu.Unlock()
@@ -1546,7 +1724,7 @@ func (s *turnState) takeTaskUpdates() []TaskProgress {
 }
 
 func (s *turnState) startMessage() {
-	s.flushProgressMarker()
+	s.finishMessageText()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.currentMessage.Len() > 0 {
@@ -1560,23 +1738,37 @@ func (s *turnState) append(delta string) {
 		return
 	}
 	s.mu.Lock()
+	wrote := s.appendLocked(delta)
+	s.mu.Unlock()
+	if wrote {
+		s.signalText()
+	}
+}
+
+func (s *turnState) appendLocked(delta string) bool {
+	if delta == "" {
+		return false
+	}
 	if s.currentMessage.Len() == 0 && len(s.messages) > 0 {
 		s.pending.WriteString(assistantMessageSeparator)
 	}
 	s.pending.WriteString(delta)
 	s.currentMessage.WriteString(delta)
-	s.mu.Unlock()
+	return true
+}
+
+func (s *turnState) signalText() {
 	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
 	s.textOnce.Do(func() { close(s.textCh) })
 }
 
 func (s *turnState) replace(text string) {
-	text = stripProgressMarkers(text)
+	if onlyProgressMarkers(text) {
+		text = ""
+	}
 	s.mu.Lock()
-	s.progressRemainder = ""
-	s.progressCapture.Reset()
-	s.capturingProgress = false
-	s.discardingProgressClose = false
+	s.rawMessage.Reset()
+	s.messageDecided = false
 	s.pendingProgress = nil
 	if text == "" {
 		s.mu.Unlock()
@@ -1596,8 +1788,7 @@ func (s *turnState) replace(text string) {
 	s.currentMessage.Reset()
 	s.currentMessage.WriteString(text)
 	s.mu.Unlock()
-	s.firstTextOnce.Do(func() { close(s.firstTextCh) })
-	s.textOnce.Do(func() { close(s.textCh) })
+	s.signalText()
 }
 
 func (s *turnState) markWork() {
@@ -1621,11 +1812,11 @@ func (s *turnState) doneProgressStatus() TaskProgressStatus {
 }
 
 func (s *turnState) markDone() {
+	s.finishMessageText()
 	s.mu.Lock()
 	s.eventDone = true
 	s.mu.Unlock()
 	s.finishProgressTask(s.doneProgressStatus())
-	s.flushProgressMarker()
 	s.mu.Lock()
 	s.pendingProgress = nil
 	s.seenToolCalls.Clear()
@@ -1649,6 +1840,8 @@ func (s *turnState) finish() {
 	s.finishOnce.Do(func() {
 		s.mu.Lock()
 		s.terminal = true
+		s.rawMessage.Reset()
+		s.messageDecided = false
 		s.seenToolCalls.Clear()
 		s.seenToolEnds.Clear()
 		s.pendingProgress = nil
@@ -1693,7 +1886,9 @@ func (s *turnState) authoritativeText(final string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	final = stripProgressMarkers(final)
+	if onlyProgressMarkers(final) {
+		final = ""
+	}
 	if final == "" {
 		return s.streamedText()
 	}
