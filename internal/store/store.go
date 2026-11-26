@@ -31,7 +31,7 @@ import (
 // schemaVersion is bumped when the schema changes in a way an older binary
 // cannot cope with. A database from a newer pi-chat is refused rather than
 // silently misread.
-const schemaVersion = 10
+const schemaVersion = 11
 
 // schema is the whole database. `pending_ui` and `admissions` are created here
 // but only written from phase 2 on: the schema is one artifact, and creating
@@ -253,6 +253,16 @@ var migrations = []struct {
 		// and are canceled by the bot rather than authorized to an unknown user.
 		`ALTER TABLE pending_ui ADD COLUMN requester_user_id TEXT NOT NULL DEFAULT ''`,
 	}},
+	{to: 11, stmt: []string{
+		// progress_ts is a live-turn handle: this build clears it once the reply
+		// reaches a terminal Slack state, so a non-empty value at startup means a
+		// turn was interrupted. Earlier builds wrote the handle but never cleared
+		// it, leaving every completed reply with a value that recovery would
+		// mistake for an interrupted stream and replace with a notice. Those old
+		// values cannot be told apart from a genuine interruption, so start clean
+		// once; this build maintains the handle from here on.
+		`UPDATE threads SET progress_ts = '' WHERE progress_ts <> ''`,
+	}},
 }
 
 // Store is the open database.
@@ -391,6 +401,7 @@ var versionStatements = map[int]string{
 	8:  "PRAGMA user_version = 8",
 	9:  "PRAGMA user_version = 9",
 	10: "PRAGMA user_version = 10",
+	11: "PRAGMA user_version = 11",
 }
 
 // recordVersion stamps the schema version on the same executor as the schema

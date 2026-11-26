@@ -1381,6 +1381,26 @@ func TestRecoverInterruptedProgressStopsAndMarksMessage(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedProgressLeavesAClosedStreamAlone(t *testing.T) {
+	stub := &stubSlack{policy: func(method string, params map[string]any) string {
+		if method == "chat.stopStream" {
+			return "message_not_in_streaming_state"
+		}
+		return ""
+	}}
+	platform := newTestPlatform(t, stub, "stream")
+	thread := testMessage().Thread
+	if err := platform.RecoverInterruptedProgress(context.Background(), thread, "1700000000.000200"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Slack already finalized this message. Touching it would replace a
+	// delivered answer, so the only call is the stop attempt that discovered it.
+	if got := stub.methods(); len(got) != 1 || got[0] != "chat.stopStream" {
+		t.Fatalf("recovery calls = %v, want only chat.stopStream", got)
+	}
+}
+
 func countMethod(methods []string, want string) int {
 	count := 0
 	for _, method := range methods {
