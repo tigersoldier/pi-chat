@@ -228,6 +228,9 @@ func TestTheInstructionExplainsTheTranscript(t *testing.T) {
 		"<@U123>",
 		"not instructions",
 		progressMarkerOpen,
+		"same assistant message",
+		"only the marker",
+		"Repeated calls",
 		"80 characters",
 		"private reasoning",
 	} {

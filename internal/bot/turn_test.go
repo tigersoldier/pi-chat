@@ -2,10 +2,12 @@ package bot
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1016,6 +1018,70 @@ func TestProgressClosingDelimiterCanSplitAcrossDeltas(t *testing.T) {
 	}
 }
 
+func TestLeadingProgressMarkerWithProseIsConsumed(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(textDelta(t, "[[slack-progress: Checking service logs]] Looking at the logs"), log)
+	if got := st.text(); got != "Looking at the logs" {
+		t.Fatalf("reply text = %q, want only the prose", got)
+	}
+	if len(st.pendingProgress) != 1 || st.pendingProgress[0] != "Checking service logs" {
+		t.Fatalf("queued titles = %v, want the leading marker", st.pendingProgress)
+	}
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	updates := st.takeTaskUpdates()
+	if len(updates) != 1 || updates[0].Title != "Checking service logs" {
+		t.Fatalf("task update = %+v, want the leading marker title", updates)
+	}
+}
+
+func TestSplitLeadingProgressMarkerWithProseIsConsumed(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(textDelta(t, "[[slack-progress: Checking service"), log)
+	st.feed(textDelta(t, " logs]] Looking at the logs"), log)
+	if got := st.text(); got != "Looking at the logs" {
+		t.Fatalf("reply text = %q, want the prose after a split marker", got)
+	}
+	if len(st.pendingProgress) != 1 || st.pendingProgress[0] != "Checking service logs" {
+		t.Fatalf("queued titles = %v, want the completed split marker", st.pendingProgress)
+	}
+}
+
+func TestLeadingProgressMarkersBeforeProseAreConsumedInOrder(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(textDelta(t, "[[slack-progress: First action]][[slack-progress: Second action]] Doing work"), log)
+	if got := st.text(); got != "Doing work" {
+		t.Fatalf("reply text = %q, want only the prose", got)
+	}
+	if len(st.pendingProgress) != 2 || st.pendingProgress[0] != "First action" || st.pendingProgress[1] != "Second action" {
+		t.Fatalf("queued titles = %v, want both leading markers in order", st.pendingProgress)
+	}
+}
+
+func TestLeadingProgressMarkerIsStrippedFromTheAuthoritativeAnswerAndRecovery(t *testing.T) {
+	st := newTurnState()
+	marker := "[[slack-progress: Checking service logs]]"
+	if got := st.authoritativeText(marker + " Looking at the logs"); got != "Looking at the logs" {
+		t.Fatalf("authoritative answer = %q, want only the prose", got)
+	}
+	if got := st.authoritativeText(marker); got != "" {
+		t.Fatalf("marker-only authoritative answer = %q, want empty", got)
+	}
+	st.replace(marker + " Looking at the logs")
+	if got := st.text(); got != "Looking at the logs" {
+		t.Fatalf("recovered text = %q, want only the prose", got)
+	}
+	inline := "Looking at the logs. [[slack-progress: quoted]]"
+	if got := st.authoritativeText(inline); got != inline {
+		t.Fatalf("inline marker authoritative answer = %q, want it preserved", got)
+	}
+}
+
 func TestIncompleteProgressMarkerDoesNotSuppressFollowingReply(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
@@ -1481,6 +1547,16 @@ func TestProgressSummaryFormatsActionCountAndDuration(t *testing.T) {
 	}
 }
 
+func TestProgressStepTitleLeavesRoomForTheCount(t *testing.T) {
+	got := progressStepTitle(strings.Repeat("x", maxProgressTitleRunes), 12)
+	if runes := []rune(got); len(runes) > maxProgressTitleRunes {
+		t.Fatalf("grouped title has %d runes, want at most %d: %q", len(runes), maxProgressTitleRunes, got)
+	}
+	if !strings.HasSuffix(got, " (×12)") {
+		t.Fatalf("grouped title = %q, want the count suffix", got)
+	}
+}
+
 func TestCompletedActionCountUsesUniqueToolEnds(t *testing.T) {
 	st := newTurnState()
 	log := discardLogger()
@@ -1493,10 +1569,12 @@ func TestCompletedActionCountUsesUniqueToolEnds(t *testing.T) {
 	st.feed(end, log)
 	st.feed(end, log)
 
+	st.feed(textDelta(t, "[[slack-progress: Second action]]"), log)
 	st.feed(toolEvent(t, "tool_execution_start", "completed-2", "bash", false), log)
 	st.takeTaskUpdates()
 	st.feed(toolEvent(t, "tool_execution_end", "completed-2", "bash", true), log)
 
+	st.feed(textDelta(t, "[[slack-progress: Third action]]"), log)
 	st.feed(toolEvent(t, "tool_execution_start", "still-running", "bash", false), log)
 	st.takeTaskUpdates()
 	st.finishProgressTaskAt(TaskComplete, startedAt.Add(125*time.Second))
@@ -1593,8 +1671,9 @@ func TestProgressMarkerBoundariesAndTitleQueueAreBounded(t *testing.T) {
 	}
 
 	st = newTurnState()
-	for range maxPendingProgressTitles + 1 {
-		st.feed(textDelta(t, "[[slack-progress: Check service]]"), log)
+	for i := range maxPendingProgressTitles + 1 {
+		title := fmt.Sprintf("Check service %d", i+1)
+		st.feed(textDelta(t, "[[slack-progress: "+title+"]]"), log)
 	}
 	st.finishMessageText()
 	if len(st.pendingProgress) != maxPendingProgressTitles {
@@ -1604,20 +1683,128 @@ func TestProgressMarkerBoundariesAndTitleQueueAreBounded(t *testing.T) {
 		id := "queued-" + strings.Repeat("x", i+1)
 		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
 		got := st.takeTaskUpdates()
-		if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Check service" {
-			t.Fatalf("queued progress %d = %+v", i, got)
+		wantTitle := fmt.Sprintf("Check service %d", i+1)
+		if i >= maxProgressReportTasks {
+			wantTitle = fmt.Sprintf("Additional actions (%d)", i+1-maxProgressReportTasks)
+		}
+		if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != wantTitle {
+			t.Fatalf("queued progress %d = %+v, want title %q", i, got, wantTitle)
 		}
 	}
 	st.feed(toolEvent(t, "tool_execution_start", "overflow", "bash", false), log)
 	got := st.takeTaskUpdates()
-	if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Running a command" {
-		t.Fatalf("overflow should use the generic title: %+v", got)
+	if summary, ok := lastProgressTask(got, turnProgressTaskID); !ok || summary.Title != "Additional actions (25)" {
+		t.Fatalf("overflow should aggregate the hidden calls: %+v", got)
 	}
 	if len(st.progressTaskOrder) != maxProgressReportTasks || st.activeTasks[progressOverflowTaskID].Title == "" {
 		t.Fatalf("visible steps=%d overflow=%+v, want %d steps and one aggregate", len(st.progressTaskOrder), st.activeTasks[progressOverflowTaskID], maxProgressReportTasks)
 	}
 	if st.seenToolCalls.Len() != maxSeenToolCallIDs {
 		t.Fatalf("seen tool-call IDs = %d, want bounded cap %d", st.seenToolCalls.Len(), maxSeenToolCallIDs)
+	}
+}
+
+func TestRepeatedToolTitlesStayOneGroupedRow(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+	startedAt := time.Unix(6_000, 0)
+	st.progressStartedAt = startedAt
+
+	for i := 1; i <= 50; i++ {
+		id := fmt.Sprintf("call-%d", i)
+		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
+		st.feed(toolEvent(t, "tool_execution_end", id, "bash", false), log)
+	}
+
+	updates := st.takeTaskUpdates()
+	summary, ok := lastProgressTask(updates, turnProgressTaskID)
+	if !ok || summary.Title != "Running a command (×50)" {
+		t.Fatalf("grouped summary = %+v, want the running count", updates)
+	}
+	if st.progressPlanStarted {
+		t.Fatal("one repeated title promoted a plan")
+	}
+	if len(st.progressTaskOrder) != 1 {
+		t.Fatalf("report rows = %d, want one grouped row", len(st.progressTaskOrder))
+	}
+	if step := st.activeTasks["tool-step-1"]; step.Title != "Running a command (×50)" || step.Status != TaskComplete {
+		t.Fatalf("grouped step = %+v, want complete with the count", step)
+	}
+
+	st.finishProgressTaskAt(TaskComplete, startedAt.Add(10*time.Second))
+	updates = st.takeTaskUpdates()
+	summary, ok = lastProgressTask(updates, turnProgressTaskID)
+	if !ok || summary.Title != "Completed · 50 actions · 10s" {
+		t.Fatalf("completion summary = %+v, want fifty actions", updates)
+	}
+	for _, update := range updates {
+		if strings.HasPrefix(update.ID, "tool-step-") {
+			t.Fatalf("a single-title turn published a plan row: %+v", update)
+		}
+	}
+}
+
+func TestDistinctTitlePromotesGroupedPlan(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprintf("bash-%d", i)
+		st.feed(toolEvent(t, "tool_execution_start", id, "bash", false), log)
+		st.feed(toolEvent(t, "tool_execution_end", id, "bash", false), log)
+	}
+	st.feed(textDelta(t, "[[slack-progress: Reading files]]"), log)
+	st.feed(toolEvent(t, "tool_execution_start", "read-1", "read", false), log)
+
+	updates := st.takeTaskUpdates()
+	if !st.progressPlanStarted {
+		t.Fatal("a second distinct title did not promote the plan")
+	}
+	first, ok := lastProgressTask(updates, "tool-step-1")
+	if !ok || first.Title != "Running a command (×3)" {
+		t.Fatalf("first grouped row = %+v, want three commands", updates)
+	}
+	second, ok := lastProgressTask(updates, "tool-step-2")
+	if !ok || second.Title != "Reading files" {
+		t.Fatalf("second row = %+v, want the distinct title", updates)
+	}
+}
+
+func TestGroupedRowWaitsForEveryCallAndKeepsAnError(t *testing.T) {
+	st := newTurnState()
+	log := discardLogger()
+
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), log)
+	st.feed(toolEvent(t, "tool_execution_start", "call-2", "bash", false), log)
+	st.feed(toolEvent(t, "tool_execution_end", "call-1", "bash", false), log)
+	if step := st.activeTasks["tool-step-1"]; step.Status != TaskInProgress {
+		t.Fatalf("grouped row after one return = %+v, want in-progress", step)
+	}
+	st.feed(toolEvent(t, "tool_execution_end", "call-2", "bash", true), log)
+	if step := st.activeTasks["tool-step-1"]; step.Status != TaskError {
+		t.Fatalf("grouped row after all returns = %+v, want error", step)
+	}
+	if len(st.progressTaskOrder) != 1 {
+		t.Fatalf("report rows = %d, want one grouped row", len(st.progressTaskOrder))
+	}
+}
+
+func TestMissingProgressMarkerIsLoggedOnce(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	st := newTurnState()
+
+	for i := 1; i <= 2; i++ {
+		st.feed(toolEvent(t, "tool_execution_start", fmt.Sprintf("call-%d", i), "bash", false), log)
+	}
+	if got := strings.Count(logs.String(), "without a progress marker"); got != 1 {
+		t.Fatalf("missing-marker log count = %d, want 1:\n%s", got, logs.String())
+	}
+
+	st.feed(textDelta(t, "[[slack-progress: Marked action]]"), log)
+	st.feed(toolEvent(t, "tool_execution_start", "call-3", "read", false), log)
+	if got := strings.Count(logs.String(), "without a progress marker"); got != 1 {
+		t.Fatalf("a marker logged a fallback title: count = %d\n%s", got, logs.String())
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 //
 // The first line of instructionText is this marker, so the text reads as prose
 // and is still findable.
-const instructionMarker = "(pi-chat instruction v4)"
+const instructionMarker = "(pi-chat instruction v5)"
 
 // instructionOpen and instructionClose wrap the instruction when it travels in a
 // message rather than in the system prompt, so the agent can tell the
@@ -70,14 +70,19 @@ standard Markdown, not Slack mrkdwn: use **bold**, _italic_, ` + "`code`" + `, f
 blocks, [label](URL) links and simple hyphen lists. Avoid headings, tables and images;
 keep each reply below 12,000 characters.
 
-Before each tool call, emit only a brief, user-facing progress marker as
-ordinary assistant text, for example [[slack-progress: Checking service logs]].
-Keep its content to one short action phrase of at most 80 characters. The
+Before every tool call, emit one brief, user-facing progress marker as ordinary
+assistant text, for example [[slack-progress: Checking service logs]]. Put it in
+the same assistant message as the tool call, as a text block before the call —
+not in thinking, not in the tool arguments, and not held back until the task
+finishes. Make that text block contain only the marker, with no sentence around
+it: pi-chat treats a marker quoted inside prose as ordinary text and does not
+use it as a task title. Repeated calls in a long tool loop each need their own
+marker. Keep its content to one short action phrase of at most 80 characters. The
 integration displays that phrase as a Slack task title and removes the marker
-from the reply. Do not put private reasoning, tool arguments, tool output,
-credentials (including PINs, passcodes, and one-time codes) or other sensitive
-information in progress markers, and never use
-thinking text as a progress update.`
+from the reply.
+Do not put private reasoning, tool arguments, tool output, credentials (including
+PINs, passcodes, and one-time codes) or other sensitive information in progress
+markers, and never use thinking text as a progress update.`
 
 // instructionState is what this process knows about whether a session's context
 // already carries the instruction.
