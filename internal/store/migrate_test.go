@@ -175,8 +175,8 @@ func TestMigratesVersionNinePendingDialogsWithoutRequester(t *testing.T) {
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read the version: %v", err)
 	}
-	if version != 10 {
-		t.Fatalf("version after migration = %d, want 10", version)
+	if version != schemaVersion {
+		t.Fatalf("version after migration = %d, want %d", version, schemaVersion)
 	}
 	legacy, found, err := s.PendingUI(ctx, "old-route")
 	if err != nil || !found {
@@ -194,6 +194,98 @@ func TestMigratesVersionNinePendingDialogsWithoutRequester(t *testing.T) {
 		RequesterUserID: "U1", SessionPath: legacy.SessionPath, Method: legacy.Method,
 	}); err == nil || inserted {
 		t.Fatalf("legacy route was re-authorized: inserted=%v err=%v", inserted, err)
+	}
+}
+
+func writeV10Database(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "state", "pi-chat.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create the directory: %v", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatalf("write the v10 schema: %v", err)
+	}
+	row := sampleThread()
+	if _, err := db.Exec(`INSERT INTO threads
+        (thread_key, workspace_id, channel_id, thread_ts, surface, session_name,
+         session_path, session_id, cwd, project_dir, state, last_seq, leaf_id,
+         progress_ts, observed_ts, created_at, last_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.ThreadKey, row.WorkspaceID, row.ChannelID, row.ThreadTS, row.Surface,
+		row.SessionName, row.SessionPath, row.SessionID, row.Cwd, row.ProjectDir,
+		row.State, row.LastSeq, row.LeafID, row.ProgressTS, row.ObservedTS,
+		row.CreatedAt.Unix(), row.LastActive.Unix()); err != nil {
+		t.Fatalf("insert a v10 row: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 10"); err != nil {
+		t.Fatalf("stamp version 10: %v", err)
+	}
+	return path
+}
+
+// TestMigrationClearsProgressHandlesLeftByEarlierBuilds: earlier builds wrote
+// progress_ts but never cleared it, so every completed streamed reply still has
+// a handle. Recovery would mistake those for interrupted turns and overwrite
+// delivered answers, so the upgrade clears them once and the new build's own
+// clearing keeps the column trustworthy afterwards.
+func TestMigrationClearsProgressHandlesLeftByEarlierBuilds(t *testing.T) {
+	ctx := context.Background()
+	path := writeV10Database(t)
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open a v10 database: %v", err)
+	}
+	defer s.Close()
+
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read the version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("version after migration = %d, want %d", version, schemaVersion)
+	}
+
+	want := sampleThread()
+	row, found, err := s.Thread(ctx, want.ThreadKey)
+	if err != nil {
+		t.Fatalf("Thread: %v", err)
+	}
+	if !found {
+		t.Fatal("the migration lost the thread row")
+	}
+	if row.ProgressTS != "" {
+		t.Errorf("legacy ProgressTS = %q, want cleared", row.ProgressTS)
+	}
+	if row.SessionPath != want.SessionPath || row.ObservedTS != want.ObservedTS {
+		t.Errorf("the migration changed the row: path %q observed %q", row.SessionPath, row.ObservedTS)
+	}
+
+	// The cleanup is an upgrade step, not a policy: a handle the new build writes
+	// must survive the next restart so recovery can still find it.
+	const fresh = "1700000000.000300"
+	if err := s.SetProgressTS(ctx, row.ThreadKey, fresh); err != nil {
+		t.Fatalf("SetProgressTS: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close after writing a fresh handle: %v", err)
+	}
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen the migrated database: %v", err)
+	}
+	defer reopened.Close()
+	row, found, err = reopened.Thread(ctx, want.ThreadKey)
+	if err != nil || !found {
+		t.Fatalf("Thread after reopen = found %v, err %v", found, err)
+	}
+	if row.ProgressTS != fresh {
+		t.Errorf("ProgressTS after reopen = %q, want %q", row.ProgressTS, fresh)
 	}
 }
 

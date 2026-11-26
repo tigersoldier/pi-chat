@@ -816,15 +816,19 @@ Rules:
   that owns the thread and marks the leftover reply interrupted — stopping the stream and
   replacing its blocks on the app surface, or replacing the patched placeholder on the
   self-DM — restores the session to `active`, and clears the handle only after Slack accepts
-  the update. This does not resume a stream the new process never held; subsequent Pi
-  output may start a new reply. Only the message timestamp is stored, never progress titles,
-  tool arguments or output.
+  the update. Only a stream that is still open is treated as interrupted: when Slack answers
+  `message_not_in_streaming_state`, recovery clears the handle without editing the message,
+  because the reply was already finalized and replacing it would erase a delivered answer.
+  Schema 11 clears the handles earlier builds wrote but never cleared, once, so that upgrade
+  cannot turn every completed reply into an interruption notice. This does not resume a stream
+  the new process never held; subsequent Pi output may start a new reply. Only the message
+  timestamp is stored, never progress titles, tool arguments or output.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
 - **The current schema writes `threads`, `seen`, session-tool bindings, and pending UI routes.** A
   new tool-enabled session commits its thread row and binding in one transaction before
   the first prompt. `pending_ui` and `admissions` are created with the rest of the schema
   and are written when dialogs and queueing are enabled. The database carries a schema
-  version (currently 10) and refuses to open one written by a newer pi-chat.
+  version (currently 11) and refuses to open one written by a newer pi-chat.
 - **Schema changes are migrations**, not a new schema: `init` migrates a database whose
   `user_version` is behind, stamping each step's version only after its statements
   succeed, so a failure is retried on the next start rather than half-applied. A fresh

@@ -440,8 +440,24 @@ func (p *Platform) StatusRefreshInterval() time.Duration { return 45 * time.Minu
 // RecoverInterruptedProgress closes a stream left by a previous process and
 // replaces its task UI with an explicit interruption notice. The message handle
 // is durable; task content remains solely in Slack.
+//
+// Only a stream that is still open is an interrupted reply. Slack answers
+// message_not_in_streaming_state for a message it already finalized, and a
+// stored handle can outlive its turn (an earlier build did not clear it, and a
+// crash between delivery and the clear has the same shape). Replacing that
+// message would erase a delivered answer, so a closed stream is left alone.
 func (p *Platform) RecoverInterruptedProgress(ctx context.Context, t bot.Thread, ts string) error {
-	if err := p.api.StopStream(ctx, t.Channel, ts, "active"); err != nil && !IsCode(err, "message_not_in_streaming_state") {
+	err := p.api.StopStream(ctx, t.Channel, ts, "active")
+	switch {
+	case err == nil:
+		// The stream was still open, so this reply really was interrupted.
+	case streamAlreadyStopped(err):
+		if p.log != nil {
+			p.log.Debug("leaving a message whose stream is already closed alone",
+				"channel", t.Channel, "message_ts", ts, "error", err)
+		}
+		return nil
+	default:
 		return fmt.Errorf("stop the interrupted Slack stream: %w", err)
 	}
 	if err := p.api.UpdateBlocks(ctx, t.Channel, ts,
