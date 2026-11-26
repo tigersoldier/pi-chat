@@ -291,7 +291,7 @@ rather than once per turn.
   after a successful compaction — which is what can summarize it away.
 - **Whether it is already installed is asked of the catalog**, not guessed from the
   session's name: `gw_list_sessions[].spawn["append-system-prompt"]` is searched for the
-  instruction's own marker (`(pi-chat instruction v3)`). A session created before this
+  instruction's own marker (`(pi-chat instruction v5)`). A session created before this
   instruction version has pi-chat's name and no current marker, and would otherwise never
   get the update. A catalog that cannot answer means it is sent — a repetition costs a few
   hundred tokens, while a session that never learns how its prompts are shaped misreads
@@ -524,21 +524,26 @@ it is ready.
   - `task_update` chunks represent the reply's progress. A single tool keeps one rolling
     summary card: it starts as `in_progress` on the first tool call, updates its title as
     later tools start, and becomes `complete` when the agent settles (or `error` if the turn
-    is aborted or exits abnormally). Once a second distinct tool step is observed, the same
-    reply is promoted to a plan report with one row per observed step (at most 40 rows plus
-    one aggregate row), each row carrying only a safe title and status. The summary keeps
-    reporting the number of returned tool calls and elapsed time from the first observed
-    agent/turn start (falling back to the first tool start); errored calls count as executed
-    actions. The expandable `details` of the summary lists up to six unique safe action
-    titles (at most 600 characters) and is sent once, when the task completes. Tool
-    completion does not recycle IDs, so the timeline stays one card until promotion. An
-    assistant message consisting only of one or more `[[slack-progress: ...]]` markers
-    (ignoring whitespace) supplies FIFO custom titles for upcoming tool starts (max 80
-    characters each, with at most 64 titles buffered); at most six safe titles are retained
-    for details. Overflow or an absent/invalid marker falls back to a generic tool-name
-    title. Only a message that consists of markers is removed from the reply and contributes
-    titles; a marker quoted inside prose stays visible and is not treated as progress.
-    Oversized or credential-like marker content is rejected when it is the whole message.
+    is aborted or exits abnormally). Once a second distinct tool title is observed, the same
+    reply is promoted to a plan report with one row per distinct safe title (at most 40 rows
+    plus one aggregate row), each row carrying only a safe title and status. A title that
+    repeats reuses its row and appends the count (`Running a command (×12)`), so a long loop
+    of one tool stays one row; a turn with only one distinct title keeps the compact rolling
+    card and is never promoted. The summary keeps reporting the number of returned tool
+    calls and elapsed time from the first observed agent/turn start (falling back to the
+    first tool start); errored calls count as executed actions. The expandable `details` of
+    the summary lists up to six unique safe action titles (at most 600 characters) and is
+    sent once, when the task completes. A repeated title reuses its row ID; a distinct title
+    gets the next ID. Progress markers at the start of an assistant message supply FIFO
+    custom titles for upcoming tool starts (max 80 characters each, with at most 64 titles
+    buffered); at most six safe titles are retained for details. Overflow or an
+    absent/invalid marker falls back to a generic tool-name title; repeated fallback titles
+    collapse like any other title, and the first missing marker in a turn is logged at
+    debug so a non-compliant model is visible without warning spam. Leading markers are
+    consumed even when prose follows, so `[[slack-progress: ...]] I am checking...` supplies
+    the title and shows only the prose; a marker that appears after prose stays literal. A
+    message made only of markers contributes no reply text. Oversized or credential-like
+    marker content never becomes a title; a leading marker is removed with the marker text.
     Thinking, raw arguments, and output are not sent to Slack.
 - **A premature stop after a progress marker continues the turn.** Some models emit a
   well-formed marker and then end the response without the tool call it announced. A clean
@@ -675,16 +680,17 @@ Constraints and behaviours:
     - **Progress (chosen):** Keep the timeline stream for simple work, and rotate it before
       Slack's [10-minute stream limit](https://docs.slack.dev/reference/methods/chat.startStream#timeout)
       so a long turn keeps its task timeline and stop control. When a second distinct tool
-      step is observed, stop the stream with `session_status: processing` and promote the same
+      title is observed, stop the stream with `session_status: processing` and promote the same
       message to a plan; if Slack has already closed a single-task stream, replace it with a
-      task card. Keep at most 40 observed steps plus one aggregate row, expose safe
-      titles/status only, and coalesce `chat.update` to Slack's three-second cadence with a
-      fresh `block_id` per plan update. Post the final answer separately so the report remains
-      visible. Renew `processing`/`suspended` status before Slack's one-hour lease expires —
-      a failed renewal is retried within minutes, not a full interval — preserving the stop
-      control. On startup, use the persisted message handle to mark an unfinished report
-      interrupted before ingress; the self-DM surface replaces its patched placeholder, and a
-      process cannot resume a stream it did not hold.
+      task card. Keep at most 40 distinct rows plus one aggregate row, fold repeated titles
+      into their row with a count, expose safe titles/status only, and coalesce `chat.update`
+      to Slack's three-second cadence with a fresh `block_id` per plan update. Post the final
+      answer separately so the report remains visible. Renew `processing`/`suspended` status
+      before Slack's one-hour lease expires — a failed renewal is retried within minutes,
+      not a full interval — preserving the stop control. On startup, use the persisted
+      message handle to mark an unfinished report interrupted before ingress; the self-DM
+      surface replaces its patched placeholder, and a process cannot resume a stream it did
+      not hold.
     - **Feedback and approvals:** Interactive approval is the default for consequential
       write/execute actions, and automatic approval is explicit opt-in, following Slack's
       [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).

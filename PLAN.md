@@ -315,7 +315,7 @@ for.
       builds for sessions we create, and prefix it to the first prompt we send in an
       adopted session inside `<slack-specific-instructions>` markers — re-sent after an
       observed `compaction_end`, never per turn
-      — built: `internal/bot/instruction.go` (the text, the `(pi-chat instruction v3)` marker
+      — built: `internal/bot/instruction.go` (the text, the `(pi-chat instruction v5)` marker
       that identifies it, and `appendSystemPrompt`, which coalesces the configured
       `pi_args` and the project's injected prompt into **one** flag instead of risking
       two), the catalog check for whether a session already carries it
@@ -606,8 +606,11 @@ user renames, and tests cover event parsing, search boundaries and source render
       12,000-character budget still defers to a bounded final patch at settlement;
       stop/cancel behavior is unchanged.
 - [x] Promote observed multi-step work to a plan (or a task card when Slack already closed
-      the stream), publishing at most 40 observed steps plus one aggregate row. Only safe
-      titles/status are exposed (never tool arguments, output, or private reasoning);
+      the stream), publishing at most 40 distinct titles plus one aggregate row. A repeated
+      safe title reuses its row and carries a count, so a single-tool loop stays a compact
+      card instead of a wall of identical rows. Leading progress markers are consumed even
+      when prose follows: the marker titles the step and the prose stays in the reply. Only
+      safe titles/status are exposed (never tool arguments, output, or private reasoning);
       `chat.update` is coalesced to Slack's three-second cadence with a fresh `block_id` per
       plan update, and the final answer is posted separately so the report stays visible.
       Status `processing`/`suspended` is renewed before Slack's one-hour lease expires, and a

@@ -807,28 +807,35 @@ func reconcileObservedText(st *turnState, final string, before [32]byte, haveBef
 // (DESIGN.md §4). It performs in-memory parsing and bookkeeping, buffer appends,
 // and non-blocking channel signals; the rendering side reads from other goroutines.
 type turnState struct {
-	cancel                context.CancelFunc
-	mu                    sync.Mutex
-	pending               strings.Builder // text not yet rendered
-	pendingTasks          []TaskProgress  // task updates not yet rendered
-	activeTasks           map[string]TaskProgress
-	progressStartsSent    map[string]bool
-	progressTaskOrder     []string
-	toolTaskByCallID      map[string]string
-	runningTool           string // safe title of the open tool call, if any
-	runningToolCall       string // the call runningTool belongs to
-	seenToolCalls         boundedIDSet
-	seenToolEnds          boundedIDSet
-	lastEventSeq          uint64
-	progressPlanStarted   bool
-	terminal              bool
-	eventDone             bool // terminal event observed, independent of renderer release
-	settled               bool
-	progressFinalized     bool
-	pendingTerminalStatus TaskProgressStatus
-	abortPending          int
-	donePending           bool
-	aborted               bool
+	cancel                 context.CancelFunc
+	mu                     sync.Mutex
+	pending                strings.Builder // text not yet rendered
+	pendingTasks           []TaskProgress  // task updates not yet rendered
+	activeTasks            map[string]TaskProgress
+	progressStartsSent     map[string]bool
+	progressTaskOrder      []string
+	progressStepByTitle    map[string]string
+	progressStepBase       map[string]string
+	progressStepCounts     map[string]int
+	progressStepActive     map[string]int
+	progressStepErrored    map[string]bool
+	progressHiddenActions  int
+	progressFallbackLogged bool
+	toolTaskByCallID       map[string]string
+	runningTool            string // safe title of the open tool call, if any
+	runningToolCall        string // the call runningTool belongs to
+	seenToolCalls          boundedIDSet
+	seenToolEnds           boundedIDSet
+	lastEventSeq           uint64
+	progressPlanStarted    bool
+	terminal               bool
+	eventDone              bool // terminal event observed, independent of renderer release
+	settled                bool
+	progressFinalized      bool
+	pendingTerminalStatus  TaskProgressStatus
+	abortPending           int
+	donePending            bool
+	aborted                bool
 
 	progressActionTitles         []string
 	progressActionCount          int
@@ -883,14 +890,19 @@ type turnState struct {
 
 func newTurnState() *turnState {
 	return &turnState{
-		activeTasks:     make(map[string]TaskProgress),
-		firstTextCh:     make(chan struct{}),
-		workCh:          make(chan struct{}),
-		doneCh:          make(chan struct{}),
-		textCh:          make(chan struct{}),
-		finishedCh:      make(chan struct{}),
-		taskCh:          make(chan struct{}, 1),
-		abortResolvedCh: make(chan struct{}, 1),
+		activeTasks:         make(map[string]TaskProgress),
+		progressStepByTitle: make(map[string]string),
+		progressStepBase:    make(map[string]string),
+		progressStepCounts:  make(map[string]int),
+		progressStepActive:  make(map[string]int),
+		progressStepErrored: make(map[string]bool),
+		firstTextCh:         make(chan struct{}),
+		workCh:              make(chan struct{}),
+		doneCh:              make(chan struct{}),
+		textCh:              make(chan struct{}),
+		finishedCh:          make(chan struct{}),
+		taskCh:              make(chan struct{}, 1),
+		abortResolvedCh:     make(chan struct{}, 1),
 	}
 }
 
@@ -983,6 +995,13 @@ func (s *turnState) resetProgressTrackingLocked() {
 	clear(s.activeTasks)
 	s.progressStartsSent = nil
 	s.progressTaskOrder = nil
+	clear(s.progressStepByTitle)
+	clear(s.progressStepBase)
+	clear(s.progressStepCounts)
+	clear(s.progressStepActive)
+	clear(s.progressStepErrored)
+	s.progressHiddenActions = 0
+	s.progressFallbackLogged = false
 	s.toolTaskByCallID = nil
 	s.seenToolCalls.Clear()
 	s.seenToolEnds.Clear()
@@ -1052,7 +1071,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 		s.markWork()
 
 	case "tool_execution_start":
-		s.recordToolTask(ev)
+		s.recordToolTask(ev, log)
 		s.markWork()
 
 	case "tool_execution_end":
@@ -1141,7 +1160,7 @@ func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 	return true
 }
 
-func (s *turnState) recordToolTask(ev gwclient.Event) {
+func (s *turnState) recordToolTask(ev gwclient.Event, log *slog.Logger) {
 	s.finishMessageText()
 	var tool struct {
 		ToolCallID string `json:"toolCallId"`
@@ -1170,7 +1189,8 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 		return
 	}
 	title := safeToolTitle(name)
-	if len(s.pendingProgress) > 0 {
+	usedMarker := len(s.pendingProgress) > 0
+	if usedMarker {
 		title = s.pendingProgress[0]
 		copy(s.pendingProgress, s.pendingProgress[1:])
 		s.pendingProgress[len(s.pendingProgress)-1] = ""
@@ -1185,17 +1205,33 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	s.runningTool, s.runningToolCall = title, callID
 	s.rememberProgressTitleLocked(title)
 
-	stepID := ""
-	step := TaskProgress{Title: title, Status: TaskInProgress}
-	if s.progressActionCount <= maxProgressReportTasks {
-		stepID = fmt.Sprintf("tool-step-%d", s.progressActionCount)
-		step.ID = stepID
+	// A repeated safe title is the same observed step, not a new one: keep one
+	// row, count the calls, and show the count so a long loop of one tool cannot
+	// fill the plan with identical rows (DESIGN.md §6).
+	stepID := s.progressStepByTitle[title]
+	stepTitle := title
+	if stepID != "" {
+		s.progressStepCounts[stepID]++
+		s.progressStepActive[stepID]++
+		base := s.progressStepBase[stepID]
+		if base == "" {
+			base = title
+		}
+		stepTitle = progressStepTitle(base, s.progressStepCounts[stepID])
+	} else if len(s.progressTaskOrder) < maxProgressReportTasks {
+		stepID = fmt.Sprintf("tool-step-%d", len(s.progressTaskOrder)+1)
 		s.progressTaskOrder = append(s.progressTaskOrder, stepID)
+		s.progressStepByTitle[title] = stepID
+		s.progressStepBase[stepID] = title
+		s.progressStepCounts[stepID] = 1
+		s.progressStepActive[stepID] = 1
 	} else {
 		stepID = progressOverflowTaskID
-		step.ID = stepID
-		step.Title = fmt.Sprintf("Additional actions (%d)", s.progressActionCount-maxProgressReportTasks)
+		s.progressHiddenActions++
+		s.progressStepActive[stepID]++
+		stepTitle = fmt.Sprintf("Additional actions (%d)", s.progressHiddenActions)
 	}
+	step := TaskProgress{ID: stepID, Title: stepTitle, Status: TaskInProgress}
 	s.activeTasks[stepID] = step
 	if s.toolTaskByCallID == nil {
 		s.toolTaskByCallID = make(map[string]string)
@@ -1206,18 +1242,18 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 
 	update := TaskProgress{
 		ID:     turnProgressTaskID,
-		Title:  title,
+		Title:  stepTitle,
 		Status: TaskInProgress,
 	}
 	s.activeTasks[turnProgressTaskID] = update
 	s.queueProgressUpdateLocked(update)
 
-	if !s.progressPlanStarted && s.progressActionCount >= 2 {
+	if !s.progressPlanStarted && len(s.progressTaskOrder) >= 2 {
 		s.progressPlanStarted = true
-		// A single tool uses the compact rolling task. Once distinct work steps
-		// exist, publish their observed states so the renderer can promote it to
-		// a bounded plan report. Replay each row's start before its latest state
-		// so a quickly completed first step is not lost during promotion.
+		// A single distinct title uses the compact rolling task. Once a second
+		// distinct title exists, publish the observed rows so the renderer can
+		// promote it to a bounded plan report. Replay each row's start before its
+		// latest state so a quickly completed first step is not lost.
 		for _, id := range s.progressTaskOrder {
 			current := s.activeTasks[id]
 			started := current
@@ -1235,7 +1271,15 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	} else if s.progressPlanStarted {
 		s.queueProgressUpdateLocked(step)
 	}
+	logFallback := !usedMarker && !s.progressFallbackLogged
+	if logFallback {
+		s.progressFallbackLogged = true
+	}
 	s.mu.Unlock()
+	if logFallback && log != nil {
+		log.Debug("a tool started without a progress marker; using its fallback title",
+			"tool", name, "title", title)
+	}
 	s.signalTaskUpdate()
 }
 
@@ -1268,11 +1312,24 @@ func (s *turnState) recordToolCompletion(ev gwclient.Event) {
 	delete(s.toolTaskByCallID, callID)
 	updated := false
 	if stepID != "" {
+		if tool.IsError {
+			s.progressStepErrored[stepID] = true
+		}
+		if s.progressStepActive[stepID] > 0 {
+			s.progressStepActive[stepID]--
+		}
 		if step, ok := s.activeTasks[stepID]; ok {
-			if tool.IsError {
-				step.Status = TaskError
+			// A grouped row stays in progress while another call with the same
+			// title is still running. Once the group is empty, any error in it
+			// wins, so a failed command is not hidden by later successes.
+			if s.progressStepActive[stepID] == 0 {
+				if s.progressStepErrored[stepID] {
+					step.Status = TaskError
+				} else {
+					step.Status = TaskComplete
+				}
 			} else {
-				step.Status = TaskComplete
+				step.Status = TaskInProgress
 			}
 			s.activeTasks[stepID] = step
 			if s.progressPlanStarted {
@@ -1461,7 +1518,11 @@ func (s *turnState) finalizeProgressLocked() bool {
 				continue
 			}
 			if step.Status == TaskInProgress {
-				step.Status = status
+				if s.progressStepErrored[id] {
+					step.Status = TaskError
+				} else {
+					step.Status = status
+				}
 			}
 			s.activeTasks[id] = step
 			s.queueProgressUpdateLocked(step)
@@ -1469,7 +1530,11 @@ func (s *turnState) finalizeProgressLocked() bool {
 		}
 		if step, ok := s.activeTasks[progressOverflowTaskID]; ok {
 			if step.Status == TaskInProgress {
-				step.Status = status
+				if s.progressStepErrored[progressOverflowTaskID] {
+					step.Status = TaskError
+				} else {
+					step.Status = status
+				}
 			}
 			s.queueProgressUpdateLocked(step)
 			delete(s.activeTasks, progressOverflowTaskID)
@@ -1563,6 +1628,29 @@ func summarizeProgressMetrics(status TaskProgressStatus, actionCount int, elapse
 	return fmt.Sprintf("%s · %d %s · %s", label, actionCount, actionLabel, duration)
 }
 
+// progressStepTitle adds the count when one safe title covers several observed
+// calls. The base title is already bounded; leave room for the suffix so the
+// rendered task title stays within maxProgressTitleRunes.
+func progressStepTitle(title string, count int) string {
+	if count <= 1 {
+		return title
+	}
+	suffix := fmt.Sprintf(" (×%d)", count)
+	room := maxProgressTitleRunes - len([]rune(suffix))
+	if room < 1 {
+		room = 1
+	}
+	runes := []rune(title)
+	if len(runes) > room {
+		if room > 1 {
+			title = string(runes[:room-1]) + "…"
+		} else {
+			title = string(runes[:room])
+		}
+	}
+	return title + suffix
+}
+
 func progressDetails(titles []string, total int) string {
 	if len(titles) == 0 || total <= 0 {
 		return ""
@@ -1620,6 +1708,16 @@ func (s *turnState) appendAssistantDelta(delta string) {
 
 	s.rawMessage.WriteString(delta)
 	raw := s.rawMessage.String()
+	if titles, rest, consumed := consumeLeadingProgressMarkers(raw); consumed {
+		s.queueProgressTitlesLocked(titles)
+		raw = rest
+		s.rawMessage.Reset()
+		s.rawMessage.WriteString(raw)
+		if raw == "" {
+			s.mu.Unlock()
+			return
+		}
+	}
 	only, incomplete := progressMarkerPrefix(raw)
 	if only || incomplete {
 		s.mu.Unlock()
@@ -1724,10 +1822,10 @@ func containsCredentialLikeText(text string) bool {
 	return false
 }
 
-// finishMessageText decides how to treat the current assistant message. A
-// message made only of progress markers supplies titles for upcoming tool
-// starts and is not shown. Any other message is ordinary text and keeps its
-// markers literally, so prose that quotes one is not altered.
+// finishMessageText decides how to treat the current assistant message. Leading
+// progress markers supply titles for upcoming tool starts even when prose
+// follows; a message made only of markers is not shown. A marker after prose
+// stays literal, so prose that quotes one is not altered.
 func (s *turnState) finishMessageText() {
 	s.mu.Lock()
 	raw := s.rawMessage.String()
@@ -1737,14 +1835,23 @@ func (s *turnState) finishMessageText() {
 
 	var wrote bool
 	if !decided && raw != "" {
-		if titles, ok := markerOnlyTitles(raw); ok {
+		if titles, rest, consumed := consumeLeadingProgressMarkers(raw); consumed {
 			s.queueProgressTitlesLocked(titles)
+			raw = rest
+		}
+		if strings.TrimSpace(raw) == "" {
 			raw = ""
-		} else if start, content, ok := trailingProgressMarker(raw); ok && !validProgressMarkerContent(content) {
-			// Preserve the old safety rule for an unfinished marker whose
-			// content is oversized or credential-like: drop that tail instead
-			// of echoing it into the reply.
-			raw = raw[:start]
+		}
+		if raw != "" {
+			if titles, ok := markerOnlyTitles(raw); ok {
+				s.queueProgressTitlesLocked(titles)
+				raw = ""
+			} else if start, content, ok := trailingProgressMarker(raw); ok && !validProgressMarkerContent(content) {
+				// Preserve the old safety rule for an unfinished marker whose
+				// content is oversized or credential-like: drop that tail instead
+				// of echoing it into the reply.
+				raw = raw[:start]
+			}
 		}
 	}
 	if raw != "" {
@@ -1754,6 +1861,44 @@ func (s *turnState) finishMessageText() {
 	if wrote {
 		s.signalText()
 	}
+}
+
+// consumeLeadingProgressMarkers removes complete progress markers at the start
+// of an assistant message and returns their titles. A marker at the start is
+// metadata even when prose follows, so the prose is shown and the marker is
+// not. A marker that appears after prose stays literal because it may be
+// quoted; markerOnlyTitles still handles a message made only of markers.
+func consumeLeadingProgressMarkers(text string) (titles []string, rest string, consumed bool) {
+	rest = text
+	for {
+		trimmed := strings.TrimLeftFunc(rest, unicode.IsSpace)
+		if !strings.HasPrefix(trimmed, progressMarkerOpen) {
+			if consumed {
+				rest = trimmed
+			}
+			return titles, rest, consumed
+		}
+		afterOpen := trimmed[len(progressMarkerOpen):]
+		end := strings.Index(afterOpen, progressMarkerClose)
+		if end < 0 {
+			return titles, trimmed, consumed
+		}
+		if title := progressMarkerTitle(afterOpen[:end]); title != "" {
+			titles = append(titles, title)
+		}
+		rest = afterOpen[end+len(progressMarkerClose):]
+		consumed = true
+	}
+}
+
+// stripLeadingProgressMarkers is consumeLeadingProgressMarkers for callers that
+// only need the text. It leaves an inline marker after prose alone.
+func stripLeadingProgressMarkers(text string) string {
+	_, rest, consumed := consumeLeadingProgressMarkers(text)
+	if !consumed {
+		return text
+	}
+	return rest
 }
 
 // markerOnlyTitles returns the titles of a message that consists only of
@@ -1918,9 +2063,7 @@ func (s *turnState) signalText() {
 }
 
 func (s *turnState) replace(text string) {
-	if onlyProgressMarkers(text) {
-		text = ""
-	}
+	text = stripLeadingProgressMarkers(text)
 	s.mu.Lock()
 	s.rawMessage.Reset()
 	s.messageDecided = false
@@ -2041,9 +2184,7 @@ func (s *turnState) authoritativeText(final string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if onlyProgressMarkers(final) {
-		final = ""
-	}
+	final = stripLeadingProgressMarkers(final)
 	if final == "" {
 		return s.streamedText()
 	}
