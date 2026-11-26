@@ -1068,14 +1068,15 @@ func (th *thread) saveCursorAt(ctx context.Context, seq uint64, leaf string) {
 }
 
 // noteProgress remembers the message a turn is writing into, so a restart knows
-// which reply it left half-written (DESIGN.md §7).
+// which reply it left half-written (DESIGN.md §7). It is called on the render
+// cadence as well as on task updates, so an unchanged handle is not rewritten.
 func (th *thread) noteProgress(ctx context.Context, r Renderer) {
 	reporter, ok := r.(ProgressReporter)
 	if !ok {
 		return
 	}
 	ts := reporter.Progress()
-	if ts == "" {
+	if ts == "" || ts == th.snapshot().ProgressTS {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, storeTimeout)

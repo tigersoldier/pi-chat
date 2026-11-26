@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -65,6 +66,7 @@ type fakePlatform struct {
 	requestStartError     error
 	statuses              []Status // lifecycle states, in the order the core asked for them
 	statusRefreshInterval time.Duration
+	statusFailures        int
 	recoveries            []progressRecoveryRecord
 	recoveryError         error
 
@@ -215,6 +217,10 @@ func (p *fakePlatform) SetStatus(_ context.Context, _ Thread, s Status) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.statuses = append(p.statuses, s)
+	if p.statusFailures > 0 {
+		p.statusFailures--
+		return errors.New("status unavailable")
+	}
 	return nil
 }
 

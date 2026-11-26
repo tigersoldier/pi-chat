@@ -25,7 +25,7 @@ func progressBlocks(blockID, title string, tasks []bot.TaskProgress) []block {
 	if len(tasks) == 1 {
 		task := tasks[0]
 		return []block{{
-			"type":    "task",
+			"type":    "task_card",
 			"task_id": task.ID,
 			"title":   task.Title,
 			"status":  string(task.Status),

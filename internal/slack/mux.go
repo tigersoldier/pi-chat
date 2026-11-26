@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
 	"github.com/tigersoldier/pi-gateway/protocol"
@@ -246,6 +247,46 @@ func (m *MultiPlatform) SetSuggestedPrompts(ctx context.Context, channel, title 
 		return nil
 	}
 	return reporter.SetSuggestedPrompts(ctx, channel, title, suggestions)
+}
+
+// StatusRefreshInterval reports how often the core must renew a processing
+// status. The surfaces share one Slack status lease, so the shortest positive
+// interval any of them advertises is the safe one; 0 disables renewal.
+func (m *MultiPlatform) StatusRefreshInterval() time.Duration {
+	platforms := make([]bot.Platform, 0, len(m.routes)+1)
+	if m.def != nil {
+		platforms = append(platforms, m.def)
+	}
+	for _, platform := range m.routes {
+		platforms = append(platforms, platform)
+	}
+	var interval time.Duration
+	for _, platform := range platforms {
+		lease, ok := platform.(bot.StatusRefreshReporter)
+		if !ok {
+			continue
+		}
+		next := lease.StatusRefreshInterval()
+		if next > 0 && (interval == 0 || next < interval) {
+			interval = next
+		}
+	}
+	return interval
+}
+
+// RecoverInterruptedProgress routes recovery to the surface that owns the
+// channel. A surface that cannot recover returns an error rather than a silent
+// success: the core keeps the persisted handle so a later restart can retry.
+func (m *MultiPlatform) RecoverInterruptedProgress(ctx context.Context, t bot.Thread, ts string) error {
+	platform, err := m.forChannel(t.Channel)
+	if err != nil {
+		return err
+	}
+	reporter, ok := platform.(bot.ProgressRecoveryReporter)
+	if !ok {
+		return fmt.Errorf("slack: surface for channel %s cannot recover an interrupted reply", t.Channel)
+	}
+	return reporter.RecoverInterruptedProgress(ctx, t, ts)
 }
 
 // forChannel resolves the surface that owns one channel.

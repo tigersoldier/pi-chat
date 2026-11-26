@@ -2184,6 +2184,79 @@ func TestFlushTicksRenderersThatAskForIt(t *testing.T) {
 	}
 }
 
+// tickHandleRenderer changes its message handle when the core ticks it, the way
+// the Slack renderer rotates a stream without producing text or a task update.
+type tickHandleRenderer struct {
+	recordingRenderer
+	handleMu sync.Mutex
+	ts       string
+}
+
+func (r *tickHandleRenderer) Progress() string {
+	r.handleMu.Lock()
+	defer r.handleMu.Unlock()
+	return r.ts
+}
+
+func (r *tickHandleRenderer) Tick(context.Context) error {
+	r.handleMu.Lock()
+	r.ts = "1700000001.000001"
+	r.handleMu.Unlock()
+	return nil
+}
+
+// deltaHandleRenderer changes its handle while rendering text, the way a stream
+// may rotate just before a delta is appended.
+type deltaHandleRenderer struct {
+	recordingRenderer
+	handleMu sync.Mutex
+	ts       string
+}
+
+func (r *deltaHandleRenderer) Progress() string {
+	r.handleMu.Lock()
+	defer r.handleMu.Unlock()
+	return r.ts
+}
+
+func (r *deltaHandleRenderer) Delta(ctx context.Context, text string) error {
+	r.handleMu.Lock()
+	r.ts = "1700000002.000001"
+	r.handleMu.Unlock()
+	return r.recordingRenderer.Delta(ctx, text)
+}
+
+func TestFlushPersistsAHandleChangedByATick(t *testing.T) {
+	b, _, st := newTestBot(t)
+	b.cfg.Render.FlushMS = 5
+	th := seedStopThread(t, b, st)
+	r := &tickHandleRenderer{}
+	turn := newTurnState()
+
+	stop := th.flush(context.Background(), turn, r)
+	defer stop()
+	waitFor(t, "the rotated handle", func() bool {
+		row, ok, err := st.Thread(context.Background(), th.key)
+		return err == nil && ok && row.ProgressTS == "1700000001.000001"
+	})
+}
+
+func TestFlushPersistsAHandleChangedWhileRenderingText(t *testing.T) {
+	b, _, st := newTestBot(t)
+	b.cfg.Render.FlushMS = 5
+	th := seedStopThread(t, b, st)
+	r := &deltaHandleRenderer{}
+	turn := newTurnState()
+
+	stop := th.flush(context.Background(), turn, r)
+	defer stop()
+	turn.append("hello")
+	waitFor(t, "the rotated handle", func() bool {
+		row, ok, err := st.Thread(context.Background(), th.key)
+		return err == nil && ok && row.ProgressTS == "1700000002.000001"
+	})
+}
+
 func TestFlushRendersPendingText(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Render.FlushMS = 5

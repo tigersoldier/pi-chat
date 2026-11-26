@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tigersoldier/pi-chat/internal/bot"
 	"github.com/tigersoldier/pi-gateway/protocol"
@@ -57,6 +58,9 @@ type capablePlatform struct {
 	completed  []bot.Message
 	failed     []bot.Message
 	imageReads []string
+
+	refreshInterval time.Duration
+	recoveries      []string
 }
 
 func (c *capablePlatform) AcknowledgeRequest(_ context.Context, _ bot.Message, allowed bool) error {
@@ -95,6 +99,13 @@ func (c *capablePlatform) SetStatus(_ context.Context, _ bot.Thread, s bot.Statu
 
 func (c *capablePlatform) SetSuggestedPrompts(_ context.Context, _, title string, _ []bot.Suggestion) error {
 	c.prompts = append(c.prompts, title)
+	return nil
+}
+
+func (c *capablePlatform) StatusRefreshInterval() time.Duration { return c.refreshInterval }
+
+func (c *capablePlatform) RecoverInterruptedProgress(_ context.Context, t bot.Thread, ts string) error {
+	c.recoveries = append(c.recoveries, t.Channel+":"+ts)
 	return nil
 }
 
@@ -310,5 +321,39 @@ func TestMuxIgnoresEmptyRoutes(t *testing.T) {
 	}
 	if len(app.turns) != 1 {
 		t.Errorf("app turns = %+v, want the C9 message", app.turns)
+	}
+}
+
+// TestMuxForwardsStatusRenewalAndRecovery: both capabilities live on the
+// surfaces, so a mux that does not forward them makes the core's renewal and
+// restart recovery silently disappear in the real daemon.
+func TestMuxForwardsStatusRenewalAndRecovery(t *testing.T) {
+	ctx := context.Background()
+	app := &capablePlatform{refreshInterval: 45 * time.Minute}
+	dm := &capablePlatform{refreshInterval: 30 * time.Minute}
+	mux := NewMultiPlatform(discardLogger(), app, map[string]bot.Platform{"D1": dm})
+
+	if got := mux.StatusRefreshInterval(); got != 30*time.Minute {
+		t.Fatalf("StatusRefreshInterval = %v, want the shortest surface interval", got)
+	}
+	if err := mux.RecoverInterruptedProgress(ctx, bot.Thread{Channel: "D1", ThreadTS: "1.1"}, "9.9"); err != nil {
+		t.Fatalf("recover through the self-DM route: %v", err)
+	}
+	if len(dm.recoveries) != 1 || dm.recoveries[0] != "D1:9.9" {
+		t.Fatalf("self-DM recoveries = %v, want the routed handle", dm.recoveries)
+	}
+	if err := mux.RecoverInterruptedProgress(ctx, bot.Thread{Channel: "C9", ThreadTS: "2.2"}, "9.8"); err != nil {
+		t.Fatalf("recover through the default surface: %v", err)
+	}
+	if len(app.recoveries) != 1 || app.recoveries[0] != "C9:9.8" {
+		t.Fatalf("app recoveries = %v, want the routed handle", app.recoveries)
+	}
+
+	plain := NewMultiPlatform(discardLogger(), &fakePlatform{}, nil)
+	if got := plain.StatusRefreshInterval(); got != 0 {
+		t.Fatalf("StatusRefreshInterval without a capable surface = %v, want 0", got)
+	}
+	if err := plain.RecoverInterruptedProgress(ctx, bot.Thread{Channel: "C9"}, "1.1"); err == nil {
+		t.Fatal("recovery through a surface without the capability must fail, not clear the handle silently")
 	}
 }

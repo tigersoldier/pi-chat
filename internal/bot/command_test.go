@@ -654,6 +654,7 @@ func TestPiArgsAddsApproveWhenApprovalsAreAutomatic(t *testing.T) {
 	// The live config already passes --approve by hand; the setting must not add
 	// a second one, and the injected prompt must follow it.
 	b, _, _ := newTestBotWith(t, func(cfg *config.Config) {
+		cfg.Behavior.Approvals = "auto"
 		cfg.Gateway.PiArgs = []string{"--approve"}
 		cfg.Behavior.InjectedPrompt = "work in {projectsRoot} as {slug}"
 	})

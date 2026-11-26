@@ -1066,24 +1066,28 @@ func TestTaskUpdatesPromoteStreamToPlanAndKeepFinalAnswer(t *testing.T) {
 	}
 
 	calls := stub.recorded()
-	want := []string{"chat.startStream", "chat.appendStream", "chat.stopStream", "chat.update", "agents.sessions.setStatus", "chat.postMessage"}
+	want := []string{"chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream", "chat.update", "agents.sessions.setStatus", "chat.postMessage"}
 	if got := stub.methods(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v, want %v", got, want)
 	}
-	var initial, text []streamPayloadChunk
+	var initial, text, closed []streamPayloadChunk
 	jsonParam(t, calls[0].params, "chunks", &initial)
 	jsonParam(t, calls[1].params, "chunks", &text)
+	jsonParam(t, calls[2].params, "chunks", &closed)
 	if len(initial) != 1 || initial[0].Type != "task_update" || initial[0].ID != progress.ID || initial[0].Status != string(bot.TaskInProgress) {
 		t.Fatalf("initial task chunks = %+v", initial)
 	}
 	if len(text) != 1 || text[0].Type != "markdown_text" || text[0].Text != "hello" {
 		t.Fatalf("text chunks = %+v", text)
 	}
+	if len(closed) != 1 || closed[0].ID != progress.ID || closed[0].Status != string(bot.TaskComplete) || closed[0].Title != promotionContinuationTitle {
+		t.Fatalf("closed task chunks = %+v, want the old card completed before the stop", closed)
+	}
 	if got := calls[0].params["task_display_mode"]; got != "timeline" {
 		t.Fatalf("task_display_mode = %v, want timeline", got)
 	}
-	if calls[2].params["session_status"] != "processing" {
-		t.Fatalf("stopStream session_status = %v, want processing", calls[2].params["session_status"])
+	if calls[3].params["session_status"] != "processing" {
+		t.Fatalf("stopStream session_status = %v, want processing", calls[3].params["session_status"])
 	}
 	var blocks []struct {
 		Type    string `json:"type"`
@@ -1095,14 +1099,14 @@ func TestTaskUpdatesPromoteStreamToPlanAndKeepFinalAnswer(t *testing.T) {
 			Status string `json:"status"`
 		} `json:"tasks"`
 	}
-	jsonParam(t, calls[3].params, "blocks", &blocks)
+	jsonParam(t, calls[4].params, "blocks", &blocks)
 	if len(blocks) != 1 || blocks[0].Type != "plan" || blocks[0].BlockID != "pi-progress-1" || blocks[0].Title != "Work in progress" {
 		t.Fatalf("plan block = %+v", blocks)
 	}
 	if len(blocks[0].Tasks) != 2 || blocks[0].Tasks[0].ID != progress.ID || blocks[0].Tasks[0].Status != string(bot.TaskComplete) || blocks[0].Tasks[1].ID != other.ID || blocks[0].Tasks[1].Status != string(bot.TaskInProgress) {
 		t.Fatalf("plan tasks = %+v", blocks[0].Tasks)
 	}
-	if got := calls[5].params["markdown_text"]; got != "hello" {
+	if got := calls[6].params["markdown_text"]; got != "hello" {
 		t.Fatalf("final answer = %v, want separately posted markdown", got)
 	}
 }
@@ -1147,8 +1151,8 @@ func TestProgressReportUpdatesAreCoalescedAndThrottled(t *testing.T) {
 	var firstBlocks, secondBlocks []struct {
 		BlockID string `json:"block_id"`
 	}
-	jsonParam(t, calls[2].params, "blocks", &firstBlocks)
-	jsonParam(t, calls[4].params, "blocks", &secondBlocks)
+	jsonParam(t, calls[3].params, "blocks", &firstBlocks)
+	jsonParam(t, calls[5].params, "blocks", &secondBlocks)
 	if len(firstBlocks) != 1 || len(secondBlocks) != 1 || firstBlocks[0].BlockID == secondBlocks[0].BlockID {
 		t.Fatalf("plan block IDs = %+v then %+v, want a fresh block_id each update", firstBlocks, secondBlocks)
 	}
@@ -1173,9 +1177,75 @@ func TestProgressReportUpdatesAreCoalescedAndThrottled(t *testing.T) {
 			Status string `json:"status"`
 		} `json:"tasks"`
 	}
-	jsonParam(t, calls[5].params, "blocks", &terminal)
+	jsonParam(t, calls[6].params, "blocks", &terminal)
 	if len(terminal) != 1 || len(terminal[0].Tasks) != 2 || terminal[0].Tasks[0].Status != string(bot.TaskError) {
 		t.Fatalf("terminal plan = %+v, want the error status in the forced update", terminal)
+	}
+}
+
+func TestTickFlushesAReportHeldByTheUpdateInterval(t *testing.T) {
+	stub := &stubSlack{}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	first := bot.TaskProgress{ID: "step-1", Title: "Read the configuration", Status: bot.TaskInProgress}
+	second := bot.TaskProgress{ID: "step-2", Title: "Run the checks", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{first}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{second}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countMethod(stub.methods(), "chat.update"); got != 1 {
+		t.Fatalf("chat.update count after promotion = %d, want 1", got)
+	}
+
+	first.Status = bot.TaskComplete
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{first}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countMethod(stub.methods(), "chat.update"); got != 1 {
+		t.Fatalf("chat.update count inside the interval = %d, want the change held", got)
+	}
+
+	r.mu.Lock()
+	r.lastProgressReportUpdate = time.Now().Add(-progressReportUpdateInterval)
+	r.mu.Unlock()
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := countMethod(stub.methods(), "chat.update"); got != 2 {
+		t.Fatalf("chat.update count after Tick = %d, want the held change flushed", got)
+	}
+}
+
+func TestPromotionClosesOpenCardsBeforeAFailedReportUpdate(t *testing.T) {
+	stub := &stubSlack{failed: map[string]string{"chat.update": "invalid_blocks"}}
+	r := newTestRenderer(t, stub, "stream")
+	ctx := context.Background()
+	first := bot.TaskProgress{ID: "step-1", Title: "Read the configuration", Status: bot.TaskInProgress}
+	second := bot.TaskProgress{ID: "step-2", Title: "Run the checks", Status: bot.TaskInProgress}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{first}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.UpdateTasks(ctx, []bot.TaskProgress{second}); err == nil {
+		t.Fatal("want the failed report update to be reported")
+	}
+
+	var closes []streamPayloadChunk
+	for _, call := range stub.recorded() {
+		if call.method != "chat.appendStream" {
+			continue
+		}
+		var chunks []streamPayloadChunk
+		jsonParam(t, call.params, "chunks", &chunks)
+		for _, chunk := range chunks {
+			if chunk.Status == string(bot.TaskComplete) && chunk.Title == promotionContinuationTitle {
+				closes = append(closes, chunk)
+			}
+		}
+	}
+	if len(closes) != 1 || closes[0].ID != first.ID {
+		t.Fatalf("closed cards before the failed update = %+v, want the open card completed", closes)
 	}
 }
 
@@ -1277,7 +1347,7 @@ func TestClosedSingleTaskStreamBecomesTaskCard(t *testing.T) {
 		Status string `json:"status"`
 	}
 	jsonParam(t, calls[2].params, "blocks", &blocks)
-	if len(blocks) != 1 || blocks[0].Type != "task" || blocks[0].TaskID != botProgressSummaryID || blocks[0].Status != string(bot.TaskComplete) {
+	if len(blocks) != 1 || blocks[0].Type != "task_card" || blocks[0].TaskID != botProgressSummaryID || blocks[0].Status != string(bot.TaskComplete) {
 		t.Fatalf("single task card = %+v", blocks)
 	}
 }

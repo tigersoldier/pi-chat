@@ -2330,6 +2330,9 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 			if err := r.Delta(renderCtx, delta); err != nil {
 				th.log.Warn("cannot update the reply", "error", err)
 			}
+			// A renderer may rotate its native stream while rendering text. The
+			// handle is part of the durable restart target, so persist a change.
+			th.noteProgress(renderCtx, r)
 		}
 
 		ticker := time.NewTicker(time.Duration(th.b.cfg.Render.FlushMS) * time.Millisecond)
@@ -2360,6 +2363,9 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 						th.log.Warn("cannot refresh the reply while the turn runs",
 							"thread", th.key, "error", err)
 					}
+					// Rotation happens on this cadence, without any text or task
+					// update to trigger the other noteProgress calls.
+					th.noteProgress(loopCtx, r)
 				}
 				render(false)
 			}

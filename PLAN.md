@@ -5,7 +5,7 @@ Reference file for resuming work after a context reset. Design and rationale liv
 the current position. **Update the status block and checkboxes as work lands.**
 
 Last updated: 2026-10-26 · feature worktree `/home/pi/code/worktrees/pi-chat/slack-progress-report`
-(branch `feat/slack-progress-report`, based on `origin/main` at `d282008`; module
+(branch `feat/slack-progress-report`, based on `origin/main` at `0b4b0b7`; module
 `github.com/tigersoldier/pi-chat`). M0–M4.7 and the M5 control commands are implemented;
 this worktree implements the M8 progress-report path. Live Slack acceptance remains pending.
 
@@ -262,9 +262,9 @@ worth fixing before M5 builds `/delete` on top of this base.
 - **Slack payload fixtures are invented, not recorded.** The shapes match the docs and the
   interactions seen so far, but a captured `app_mention`/`block_actions` sample would lock
   them to Slack rather than to our reading of it.
-- **`progress_ts` is written and never read.** Re-attaching to a half-written reply needs a
-  policy decision (a restarted process cannot resume a stream it never held), so the
-  column waits for phase 3; DESIGN §7 says so.
+- **`progress_ts` is read only at startup.** Recovery marks the persisted in-flight reply
+  interrupted before ingress; a restarted process cannot resume a stream it never held.
+  The handle is cleared only after the platform accepts that update (DESIGN §7).
 - **The transport acks before `seen` is written.** Socket Mode demands an ack within three
   seconds, so the claim cannot precede it; a crash in that window loses a message Slack
   will not redeliver. DESIGN §7 records the trade-off.
@@ -641,7 +641,7 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 
 | Thing | Value |
 | --- | --- |
-| Repo | Feature worktree `/home/pi/code/worktrees/pi-chat/slack-progress-report`, branch `feat/slack-progress-report` (based on `origin/main` at `d282008`); origin is `git@github.com:tigersoldier/pi-chat.git` |
+| Repo | Feature worktree `/home/pi/code/worktrees/pi-chat/slack-progress-report`, branch `feat/slack-progress-report` (based on `origin/main` at `0b4b0b7`); origin is `git@github.com:tigersoldier/pi-chat.git` |
 | Module | `github.com/tigersoldier/pi-chat`, Go 1.26.4 |
 | Design | `DESIGN.md` (14 sections + decision log §15) |
 | `pi` binary | `~/.local/bin/pi` |

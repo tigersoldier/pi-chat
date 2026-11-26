@@ -42,6 +42,11 @@ const (
 	// the live cards continue in the replacement stream.
 	rotationContinuationTitle = "Continued in a new message"
 
+	// promotionContinuationTitle does the same for a card whose stream is being
+	// replaced by a plan report in the same message. The report update follows
+	// immediately; this title is what remains if that update fails.
+	promotionContinuationTitle = "Progress moved to a plan"
+
 	replyTooLongNotice = "Slack rejected this reply as too long. Please ask for a shorter version."
 )
 
@@ -745,15 +750,22 @@ func (r *renderer) rotationDue(now time.Time) bool {
 	return !now.Before(r.streamStartedAt.Add(streamRotateAfter))
 }
 
-// Tick implements bot.TurnTicker. The core calls it on the render cadence; the
-// work is due only once per stream lifetime, so most calls are a clock check.
+// Tick implements bot.TurnTicker. The core calls it on the render cadence. It
+// rotates a native stream before its platform closes it, and flushes a report
+// held back by the update interval so a throttled change cannot leave the plan
+// showing an old state until the next tool event.
 func (r *renderer) Tick(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.rotationDue(time.Now()) {
-		return nil
+	if r.rotationDue(time.Now()) {
+		if err := r.rotate(ctx); err != nil {
+			return err
+		}
 	}
-	return r.rotate(ctx)
+	if r.progressReport && r.progressReportDirty {
+		return r.updateProgressReportLocked(ctx, false)
+	}
+	return nil
 }
 
 // rotate closes the current stream and opens a new one in the same thread.
@@ -772,7 +784,7 @@ func (r *renderer) rotate(ctx context.Context) error {
 	previous := r.ts
 	expired := false
 	if r.streamMayBeActive() {
-		r.closeOldTasks(ctx)
+		r.closeOldTasks(ctx, rotationContinuationTitle)
 		err := r.api.StopStream(ctx, r.channel, previous, "processing")
 		switch {
 		case err == nil:
@@ -882,6 +894,10 @@ func (r *renderer) promoteProgressReportLocked(ctx context.Context) error {
 		r.ts = ts
 	} else {
 		if r.streamMayBeActive() {
+			// Slack marks open cards as errors when their stream stops. The plan
+			// update below normally replaces them immediately; close them first so
+			// a failed update does not leave an error behind.
+			r.closeOldTasks(ctx, promotionContinuationTitle)
 			if err := r.stopStreamWithStatus(ctx, "processing"); err != nil {
 				return fmt.Errorf("stop the reply stream before promoting progress: %w", err)
 			}
@@ -904,16 +920,17 @@ func (r *renderer) promoteProgressReportLocked(ctx context.Context) error {
 }
 
 // closeOldTasks marks the current segment's open task cards complete before
-// its stream is stopped. The task cache is deliberately left unchanged: the
-// replacement stream replays the live in-progress cards from taskChunks().
-func (r *renderer) closeOldTasks(ctx context.Context) {
+// its stream is stopped, using title to say where the work continues. The task
+// cache is deliberately left unchanged: a replacement stream replays the live
+// in-progress cards from taskChunks().
+func (r *renderer) closeOldTasks(ctx context.Context, title string) {
 	updates := make([]streamPayloadChunk, 0, len(r.taskOrder))
 	for _, chunk := range r.taskChunks() {
 		if chunk.Status != string(bot.TaskInProgress) {
 			continue
 		}
 		chunk.Status = string(bot.TaskComplete)
-		chunk.Title = rotationContinuationTitle
+		chunk.Title = title
 		chunk.Details = ""
 		updates = append(updates, chunk)
 	}
@@ -922,13 +939,13 @@ func (r *renderer) closeOldTasks(ctx context.Context) {
 	}
 	if err := r.api.AppendStream(ctx, r.channel, r.ts, updates); err != nil {
 		if r.log != nil {
-			r.log.Warn("cannot mark the previous stream's tasks as continued",
+			r.log.Warn("cannot close the previous stream's task cards",
 				"message_ts", r.ts, "task_update_chunks", len(updates), "error", err)
 		}
 		return
 	}
 	if r.log != nil {
-		r.log.Debug("marked the previous stream's tasks as continued",
+		r.log.Debug("closed the previous stream's task cards",
 			"message_ts", r.ts, "task_update_chunks", len(updates))
 	}
 }

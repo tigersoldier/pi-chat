@@ -680,10 +680,11 @@ Constraints and behaviours:
       task card. Keep at most 40 observed steps plus one aggregate row, expose safe
       titles/status only, and coalesce `chat.update` to Slack's three-second cadence with a
       fresh `block_id` per plan update. Post the final answer separately so the report remains
-      visible. Renew `processing`/`suspended` status before Slack's one-hour lease expires,
-      preserving the stop control. On startup, use the persisted message handle to mark an
-      unfinished report interrupted before ingress; a process cannot resume a stream it did
-      not hold.
+      visible. Renew `processing`/`suspended` status before Slack's one-hour lease expires —
+      a failed renewal is retried within minutes, not a full interval — preserving the stop
+      control. On startup, use the persisted message handle to mark an unfinished report
+      interrupted before ingress; the self-DM surface replaces its patched placeholder, and a
+      process cannot resume a stream it did not hold.
     - **Feedback and approvals:** Interactive approval is the default for consequential
       write/execute actions, and automatic approval is explicit opt-in, following Slack's
       [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
@@ -811,11 +812,13 @@ Rules:
   request. A failure to *write* the claim blocks the turn: running the prompt once, late,
   beats running it twice.
 - **`progress_ts` is persisted only while a reply is in flight.** A successful terminal
-  render clears the matching handle. Before ingress starts, recovery stops any leftover
-  stream, replaces its blocks with a generic interruption notice, restores the session to
-  `active`, and clears the handle only after Slack accepts the update. This does not resume
-  a stream the new process never held; subsequent Pi output may start a new reply. Only the
-  message timestamp is stored, never progress titles, tool arguments or output.
+  render clears the matching handle. Before ingress starts, recovery routes to the surface
+  that owns the thread and marks the leftover reply interrupted — stopping the stream and
+  replacing its blocks on the app surface, or replacing the patched placeholder on the
+  self-DM — restores the session to `active`, and clears the handle only after Slack accepts
+  the update. This does not resume a stream the new process never held; subsequent Pi
+  output may start a new reply. Only the message timestamp is stored, never progress titles,
+  tool arguments or output.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
 - **The current schema writes `threads`, `seen`, session-tool bindings, and pending UI routes.** A
   new tool-enabled session commits its thread row and binding in one transaction before
@@ -1152,10 +1155,13 @@ it routes `StartTurn`, `Post` and `OpenThread` by channel id, with the app as th
 and the configured self-DM channel as the one exception. Routing by channel rather than
 by process is what keeps one store, one gateway pool and one warm-session cap, and it
 works only because a thread's channel is part of its key. The optional capabilities
-(§4 observation, §6 status and suggestions) are claimed by the mux on behalf of the
-surfaces: it delegates where the surface implements the interface and reports the empty
-answer — no conversation, no status, no prompts — where it does not, which is exactly
-what the core sees from a platform that never implemented it.
+(§4 observation, §6 status and suggestions, status-lease renewal, and interrupted-reply
+recovery) are claimed by the mux on behalf of the surfaces: it delegates where the surface
+implements the interface and reports the empty answer — no conversation, no status, no
+prompts, no renewal — where it does not, which is exactly what the core sees from a
+platform that never implemented it. Recovery routes by channel and fails rather than
+claiming success when the owning surface cannot recover a reply, so the core keeps the
+persisted handle for a later restart.
 
 The app surface is optional in a soft sense (a missing token file turns it off with a
 warning) because it is the pre-existing default and an upgrade must not break it. The

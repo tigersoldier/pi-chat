@@ -362,7 +362,7 @@ func (b *Bot) recoverProgress(ctx context.Context) {
 		return
 	}
 	for _, row := range rows {
-		if row.ProgressTS == "" || row.Surface == SurfaceSelfDM {
+		if row.ProgressTS == "" {
 			continue
 		}
 		thread := Thread{
@@ -768,6 +768,13 @@ func (b *Bot) setStatus(ctx context.Context, th *thread, s Status) {
 	}
 }
 
+// statusRefreshRetry bounds how long a failed lease renewal waits before it
+// tries again. It is far shorter than the renewal interval: Slack drops a
+// `processing` session to `active` one hour after the last successful write, so
+// waiting a whole interval after a failure would leave the turn without its
+// loading indicator and stop control.
+var statusRefreshRetry = 5 * time.Minute
+
 // startStatusKeepalive renews the thread's current status for platforms whose
 // processing/suspended indicator expires. Its refresh path is serialized with
 // ordinary transitions so it cannot resurrect an old state after turn cleanup.
@@ -784,14 +791,20 @@ func (b *Bot) startStatusKeepalive(ctx context.Context, th *thread) func() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 		for {
 			select {
 			case <-refreshCtx.Done():
 				return
-			case <-ticker.C:
-				b.refreshStatus(refreshCtx, th)
+			case <-timer.C:
+				if err := b.refreshStatus(refreshCtx, th); err != nil {
+					b.log.Debug("cannot refresh the session status; retrying shortly",
+						"thread", th.key, "status", th.status, "retry_in", statusRefreshRetry, "error", err)
+					timer.Reset(statusRefreshRetry)
+					continue
+				}
+				timer.Reset(interval)
 			}
 		}
 	}()
@@ -801,22 +814,19 @@ func (b *Bot) startStatusKeepalive(ctx context.Context, th *thread) func() {
 	}
 }
 
-func (b *Bot) refreshStatus(ctx context.Context, th *thread) {
+func (b *Bot) refreshStatus(ctx context.Context, th *thread) error {
 	reporter, ok := b.plat.(StatusReporter)
 	if !ok {
-		return
+		return nil
 	}
 	th.statusMu.Lock()
 	defer th.statusMu.Unlock()
 	if th.status != StatusBusy && th.status != StatusWaiting {
-		return
+		return nil
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, renderTerminalTimeout)
 	defer cancel()
-	if err := reporter.SetStatus(refreshCtx, th.t, th.status); err != nil {
-		b.log.Debug("cannot refresh the session status", "thread", th.key,
-			"status", th.status, "error", err)
-	}
+	return reporter.SetStatus(refreshCtx, th.t, th.status)
 }
 
 // stopTurn handles the platform's own stop control: Slack's agent stop button,
