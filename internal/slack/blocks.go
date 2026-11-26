@@ -16,6 +16,38 @@ type block map[string]any
 // bot.resumeLimit), not Slack's 25-element Actions-block limit.
 const noticeButtonLimit = 5
 
+// progressBlocks renders one task as a task card and multiple steps as a plan.
+// The caller supplies a fresh blockID for each plan update, as Slack requires.
+func progressBlocks(blockID, title string, tasks []bot.TaskProgress) []block {
+	if len(tasks) == 0 {
+		return nil
+	}
+	if len(tasks) == 1 {
+		task := tasks[0]
+		return []block{{
+			"type":    "task_card",
+			"task_id": task.ID,
+			"title":   task.Title,
+			"status":  string(task.Status),
+		}}
+	}
+
+	rows := make([]block, 0, len(tasks))
+	for _, task := range tasks {
+		rows = append(rows, block{
+			"task_id": task.ID,
+			"title":   task.Title,
+			"status":  string(task.Status),
+		})
+	}
+	return []block{{
+		"type":     "plan",
+		"block_id": blockID,
+		"title":    title,
+		"tasks":    rows,
+	}}
+}
+
 // blocksFor renders a notice's buttons, or nothing when it has none: an empty
 // actions block is rejected, and a notice usually is text alone.
 func blocksFor(buttons []bot.Button) []block {

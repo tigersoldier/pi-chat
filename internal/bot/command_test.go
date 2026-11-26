@@ -654,12 +654,13 @@ func TestPiArgsAddsApproveWhenApprovalsAreAutomatic(t *testing.T) {
 	// The live config already passes --approve by hand; the setting must not add
 	// a second one, and the injected prompt must follow it.
 	b, _, _ := newTestBotWith(t, func(cfg *config.Config) {
+		cfg.Behavior.Approvals = "auto"
 		cfg.Gateway.PiArgs = []string{"--approve"}
 		cfg.Behavior.InjectedPrompt = "work in {projectsRoot} as {slug}"
 	})
 
 	project := workspaceProject(t, b, "fix the tests")
-	args := b.piArgs(project)
+	args := b.piArgs(project, SurfaceApp)
 	approvals := 0
 	for _, arg := range args {
 		if arg == "--approve" {
@@ -681,7 +682,7 @@ func TestPiArgsAddsChatToolsExtensionOnlyWhenEnabled(t *testing.T) {
 		cfg.ChatTools.ExtensionPath = path
 		cfg.Gateway.PiArgs = []string{"--extension", path}
 	})
-	args := b.piArgs(workspaceProject(t, b, "read the chat"))
+	args := b.piArgs(workspaceProject(t, b, "read the chat"), SurfaceApp)
 	if got := countFlag(args, "--extension"); got != 1 {
 		t.Errorf("chat-tools extension appears %d times in %v, want once", got, args)
 	}
@@ -691,7 +692,7 @@ func TestPiArgsAddsChatToolsExtensionOnlyWhenEnabled(t *testing.T) {
 
 	b.cfg.ChatTools.Enabled = false
 	b.cfg.Gateway.PiArgs = nil
-	args = b.piArgs(workspaceProject(t, b, "read without tools"))
+	args = b.piArgs(workspaceProject(t, b, "read without tools"), SurfaceApp)
 	if slices.Contains(args, "--extension") {
 		t.Errorf("disabled chat tools added an extension: %v", args)
 	}
@@ -704,7 +705,7 @@ func TestPiArgsWithoutApprovals(t *testing.T) {
 	b.cfg.Behavior.InjectedPrompt = ""
 
 	project := workspaceProject(t, b, "fix the tests")
-	args := b.piArgs(project)
+	args := b.piArgs(project, SurfaceApp)
 	if slices.Contains(args, "--approve") {
 		t.Errorf("approvals are interactive, so --approve should not be there: %v", args)
 	}
@@ -719,6 +720,21 @@ func TestPiArgsWithoutApprovals(t *testing.T) {
 	}
 	if len(args) != 2 {
 		t.Errorf("piArgs = %v, want just the instruction", args)
+	}
+}
+
+func TestSelfDMSessionsApproveAutomatically(t *testing.T) {
+	// The self-DM surface cannot render a blocking dialog, so an interactive
+	// default there would deadlock the turn; it keeps --approve until a
+	// text-approval protocol exists.
+	b, _, _ := newTestBot(t)
+	b.cfg.Behavior.Approvals = "interactive"
+	b.cfg.Gateway.PiArgs = nil
+	b.cfg.Behavior.InjectedPrompt = ""
+
+	args := b.piArgs(workspaceProject(t, b, "fix the tests"), SurfaceSelfDM)
+	if !slices.Contains(args, "--approve") {
+		t.Errorf("a self-DM session should approve automatically: %v", args)
 	}
 }
 

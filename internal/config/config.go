@@ -277,8 +277,11 @@ func Defaults() *Config {
 			AdmissionWaitSeconds:   DefaultAdmissionSeconds,
 			Eviction:               "evict-then-queue",
 		},
-		Render:   Render{Mode: "stream", FlushMS: DefaultFlushMS},
-		Behavior: Behavior{Approvals: "auto"},
+		Render: Render{Mode: "stream", FlushMS: DefaultFlushMS},
+		// Consequential tool actions wait for a human unless the owner opts out:
+		// interactive approvals are the default, and "auto" (which passes
+		// --approve to pi) is explicit configuration (DESIGN.md §6).
+		Behavior: Behavior{Approvals: "interactive"},
 		Log:      Log{Level: "info", Format: "text"},
 	}
 }

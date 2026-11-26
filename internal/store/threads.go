@@ -41,7 +41,7 @@ type ThreadRow struct {
 	LastSeq uint64
 	LeafID  string
 
-	ProgressTS string // the reply being streamed or patched, for restart recovery
+	ProgressTS string // in-flight Slack reply/report handle, cleared after terminal delivery
 
 	// ObservedTS is the observation watermark (DESIGN.md §4): the newest message
 	// of the thread's conversation that a prompt has already carried. The next
@@ -192,6 +192,20 @@ func (s *Store) SetProgressTS(ctx context.Context, key, ts string) error {
 		`UPDATE threads SET progress_ts = ? WHERE thread_key = ?`, ts, key)
 	if err != nil {
 		return fmt.Errorf("store: save the reply handle of %s: %w", key, err)
+	}
+	return nil
+}
+
+// ClearProgressTS clears only the handle the caller finished. If another turn
+// has already written a newer handle, its recovery target is left untouched.
+func (s *Store) ClearProgressTS(ctx context.Context, key, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE threads SET progress_ts = '' WHERE thread_key = ? AND progress_ts = ?`, key, expected)
+	if err != nil {
+		return fmt.Errorf("store: clear the reply handle of %s: %w", key, err)
 	}
 	return nil
 }

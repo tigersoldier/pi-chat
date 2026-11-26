@@ -397,6 +397,29 @@ func TestPostPostsWhatAnInteractionWouldHaveAnswered(t *testing.T) {
 	}
 }
 
+// TestRecoverInterruptedProgressReplacesThePlaceholder: the self-DM patches one
+// message rather than streaming, so recovery is a text replacement on the
+// persisted handle.
+func TestRecoverInterruptedProgressReplacesThePlaceholder(t *testing.T) {
+	s, _, stub, _ := surfaceFor(t, map[string]func(url.Values) string{
+		"chat.update": func(url.Values) string { return `{"ok":true}` },
+	})
+	thread := bot.Thread{Workspace: "T1", Channel: "D1", ThreadTS: "1.1", Surface: bot.SurfaceSelfDM}
+	if err := s.plat.RecoverInterruptedProgress(context.Background(), thread, "9.9"); err != nil {
+		t.Fatalf("RecoverInterruptedProgress: %v", err)
+	}
+	if n := stub.count("chat.update"); n != 1 {
+		t.Fatalf("chat.update called %d times, want one replacement", n)
+	}
+	params := stub.params("chat.update", 0)
+	if got := params.Get("ts"); got != "9.9" {
+		t.Errorf("chat.update target = %q, want the persisted handle", got)
+	}
+	if got := params.Get("text"); !strings.Contains(got, "restarted") {
+		t.Errorf("recovery text = %q, want an interruption notice", got)
+	}
+}
+
 // TestRendererPatchesTheSameMessage is the self-DM's rendering contract: one
 // placeholder message per turn, replaced in place as the answer grows, and
 // recorded so the poller knows whose it is.

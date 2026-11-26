@@ -399,6 +399,16 @@ func (p *Platform) update(ctx context.Context, channel, ts, text string) error {
 	return p.api.UpdateMessage(ctx, channel, ts, text)
 }
 
+// RecoverInterruptedProgress replaces a reply a previous process left in
+// flight. This surface patches one message instead of streaming, so there is no
+// stream to stop; the persisted handle is enough to overwrite the placeholder.
+func (p *Platform) RecoverInterruptedProgress(ctx context.Context, t bot.Thread, ts string) error {
+	if err := p.update(ctx, t.Channel, ts, "pi-chat restarted while this reply was in progress."); err != nil {
+		return fmt.Errorf("mark the interrupted self-DM reply: %w", err)
+	}
+	return nil
+}
+
 // remember stores one open offer, replacing whatever the same thread had open:
 // a second picker in a thread makes the first one's numbers ambiguous.
 func (p *Platform) remember(key string, c *choice) {

@@ -521,25 +521,25 @@ it is ready.
   - `markdown_text` chunks for assistant text; final-only `chat.postMessage` replies and
     repair `chat.update` calls use their `markdown_text` field too, so every path preserves
     the same standard-Markdown syntax instead of switching to `mrkdwn`,
-  - `task_update` chunks represent one logical progress task for the whole reply. The
-    task gets a unique ID for this stream, starts as `in_progress` on the first tool call,
-    updates its title as later tools start, and becomes `complete` when the agent settles
-    (or `error` if the turn is aborted or exits abnormally). Its final title reports the
-    number of returned tool calls and elapsed time from the first observed agent/turn start
-    (falling back to the first tool start); errored calls count as executed actions. The
-    expandable `details` lists up to six unique safe action titles (at most 600 characters)
-    and is sent once, when the task completes; active updates change only the title, avoiding
-    repeated cumulative detail snapshots in the stream. Tool completion does not create or
-    recycle task IDs, so the timeline stays at one card;
-    individual completed steps are never shown as separate cards. An assistant message
-    consisting only of one or more `[[slack-progress: ...]]` markers (ignoring whitespace)
-    supplies FIFO custom titles for upcoming tool starts (max 80 characters each, with at
-    most 64 titles buffered); at most six safe titles are retained for details. Overflow or
-    an absent/invalid marker falls back to a generic tool-name title. Only a message that
-    consists of markers is removed from the reply and contributes titles; a marker quoted
-    inside prose stays visible and is not treated as progress. Oversized or credential-like
-    marker content is rejected when it is the whole message. Thinking, raw arguments, and
-    output are not sent to Slack.
+  - `task_update` chunks represent the reply's progress. A single tool keeps one rolling
+    summary card: it starts as `in_progress` on the first tool call, updates its title as
+    later tools start, and becomes `complete` when the agent settles (or `error` if the turn
+    is aborted or exits abnormally). Once a second distinct tool step is observed, the same
+    reply is promoted to a plan report with one row per observed step (at most 40 rows plus
+    one aggregate row), each row carrying only a safe title and status. The summary keeps
+    reporting the number of returned tool calls and elapsed time from the first observed
+    agent/turn start (falling back to the first tool start); errored calls count as executed
+    actions. The expandable `details` of the summary lists up to six unique safe action
+    titles (at most 600 characters) and is sent once, when the task completes. Tool
+    completion does not recycle IDs, so the timeline stays one card until promotion. An
+    assistant message consisting only of one or more `[[slack-progress: ...]]` markers
+    (ignoring whitespace) supplies FIFO custom titles for upcoming tool starts (max 80
+    characters each, with at most 64 titles buffered); at most six safe titles are retained
+    for details. Overflow or an absent/invalid marker falls back to a generic tool-name
+    title. Only a message that consists of markers is removed from the reply and contributes
+    titles; a marker quoted inside prose stays visible and is not treated as progress.
+    Oversized or credential-like marker content is rejected when it is the whole message.
+    Thinking, raw arguments, and output are not sent to Slack.
 - **A premature stop after a progress marker continues the turn.** Some models emit a
   well-formed marker and then end the response without the tool call it announced. A clean
   settlement whose entire authoritative message is a progress marker is treated as that
@@ -672,15 +672,24 @@ Constraints and behaviours:
       for explicit search requests, passes `action_token`, constrains content types, and
       returns source links. Decide permission and retention rules before enabling search;
       treat retrieved content as untrusted input.
-    - **Progress:** Use timeline task cards for simple actions and a plan for multi-step
-      work. Long turns already rotate their stream before Slack's [10-minute stream
-      limit](https://docs.slack.dev/reference/methods/chat.startStream#timeout) (see above)
-      and keep the session `processing`; the separate 12,000-character budget still falls
-      back to a bounded final patch at settlement. A plan message with rate-limited
-      `chat.update` remains an option for multi-step work.
-    - **Feedback and approvals:** Add answer-level feedback controls such as
-      `feedback_buttons`. Default consequential write/execute actions to human confirmation;
-      make automatic approval explicit opt-in, following Slack's [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
+    - **Progress (chosen):** Keep the timeline stream for simple work, and rotate it before
+      Slack's [10-minute stream limit](https://docs.slack.dev/reference/methods/chat.startStream#timeout)
+      so a long turn keeps its task timeline and stop control. When a second distinct tool
+      step is observed, stop the stream with `session_status: processing` and promote the same
+      message to a plan; if Slack has already closed a single-task stream, replace it with a
+      task card. Keep at most 40 observed steps plus one aggregate row, expose safe
+      titles/status only, and coalesce `chat.update` to Slack's three-second cadence with a
+      fresh `block_id` per plan update. Post the final answer separately so the report remains
+      visible. Renew `processing`/`suspended` status before Slack's one-hour lease expires —
+      a failed renewal is retried within minutes, not a full interval — preserving the stop
+      control. On startup, use the persisted message handle to mark an unfinished report
+      interrupted before ingress; the self-DM surface replaces its patched placeholder, and a
+      process cannot resume a stream it did not hold.
+    - **Feedback and approvals:** Interactive approval is the default for consequential
+      write/execute actions, and automatic approval is explicit opt-in, following Slack's
+      [agent design guidance](https://docs.slack.dev/concepts/agent-design/#confirmation-control).
+      Answer-level feedback controls such as `feedback_buttons` remain to be added, with
+      submissions acknowledged without retaining response content by default.
     - **Data retention:** Before expanding context, decide whether Slack-derived content may
       enter persisted Pi histories or local sidecars. Prefer minimal retention; any opt-in
       storage needs clear retention and deletion behavior, consistent with Slack's
@@ -726,9 +735,14 @@ Constraints and behaviours:
     debug (a `warning`/`error` `notify` goes to the journal at warn); treating them as
     "unanswerable UI input" produced a false alarm on every single turn, since
     `pi-lens-lsp` emits `setStatus` continuously.
-- `approvals = "auto"` passes `--approve` and pi resolves dialogs itself. That does
-  **not** silence the frame type: sessions emit `setStatus`/`setWidget` regardless, so
-  the classification above is always required.
+- **Approvals are interactive by default.** `approvals = "interactive"` is the default: a
+  blocking write/execute dialog is routed to the turn's author in Slack. Setting
+  `approvals = "auto"` is an explicit opt-in that passes `--approve` and lets pi resolve
+  dialogs itself. The self-DM surface cannot render a blocking dialog, so its sessions keep
+  `--approve` under either setting until that surface gains a text-approval protocol;
+  otherwise the turn would wait forever for an answer nobody can give. Neither setting
+  silences the frame type: sessions emit `setStatus`/`setWidget` regardless, so the
+  classification above is always required.
 - **Strip ANSI escapes** (and control characters) from every string a pi extension
   supplies before it reaches Slack — observed `setStatus.statusText` carries raw SGR
   sequences (`\x1b[38;5;241m…`), and Block Kit renders them literally.
@@ -752,7 +766,7 @@ threads(thread_key PK,            -- app: workspace:channel:thread_ts; self_dm: 
         session_name, session_path, session_id, cwd, project_dir,
         state,                    -- warm | cold | deleted
         last_seq, leaf_id,        -- replay cursor (persist on settle and periodically)
-        progress_ts,              -- Slack message being streamed/patched
+        progress_ts,              -- in-flight Slack reply/report handle
         observed_ts,              -- newest message a prompt has already carried
         created_at, last_active)
 
@@ -797,11 +811,14 @@ Rules:
   `event_id`s. Claiming by event id spent two turns, and posted two answers, on one
   request. A failure to *write* the claim blocks the turn: running the prompt once, late,
   beats running it twice.
-- **`progress_ts` is persisted** (with the reply's timestamp) so that a later phase
-  can recognize the message a restart left half-written. Nothing reads it back yet:
-  a restarted process cannot resume a stream it was not holding, so the next turn
-  writes a new message. The column is there so the recovery path is a change of
-  policy rather than a migration.
+- **`progress_ts` is persisted only while a reply is in flight.** A successful terminal
+  render clears the matching handle. Before ingress starts, recovery routes to the surface
+  that owns the thread and marks the leftover reply interrupted — stopping the stream and
+  replacing its blocks on the app surface, or replacing the patched placeholder on the
+  self-DM — restores the session to `active`, and clears the handle only after Slack accepts
+  the update. This does not resume a stream the new process never held; subsequent Pi
+  output may start a new reply. Only the message timestamp is stored, never progress titles,
+  tool arguments or output.
 - **`deleted` is a state, not a delete**, so the thread key stays reserved.
 - **The current schema writes `threads`, `seen`, session-tool bindings, and pending UI routes.** A
   new tool-enabled session commits its thread row and binding in one transaction before
@@ -1007,7 +1024,7 @@ mode     = "stream"                # stream | patch
 flush_ms = 1000
 
 [behavior]
-approvals = "auto"                 # auto adds --approve to pi_args | interactive
+approvals = "interactive"          # interactive (default) | auto adds --approve to pi_args
 # injected_prompt = """…"""        # {reposRoot} {projectsRoot} {date} {slug}; empty = none
 
 [log]
@@ -1138,10 +1155,13 @@ it routes `StartTurn`, `Post` and `OpenThread` by channel id, with the app as th
 and the configured self-DM channel as the one exception. Routing by channel rather than
 by process is what keeps one store, one gateway pool and one warm-session cap, and it
 works only because a thread's channel is part of its key. The optional capabilities
-(§4 observation, §6 status and suggestions) are claimed by the mux on behalf of the
-surfaces: it delegates where the surface implements the interface and reports the empty
-answer — no conversation, no status, no prompts — where it does not, which is exactly
-what the core sees from a platform that never implemented it.
+(§4 observation, §6 status and suggestions, status-lease renewal, and interrupted-reply
+recovery) are claimed by the mux on behalf of the surfaces: it delegates where the surface
+implements the interface and reports the empty answer — no conversation, no status, no
+prompts, no renewal — where it does not, which is exactly what the core sees from a
+platform that never implemented it. Recovery routes by channel and fails rather than
+claiming success when the owning surface cannot recover a reply, so the core keeps the
+persisted handle for a later restart.
 
 The app surface is optional in a soft sense (a missing token file turns it off with a
 warning) because it is the pre-existing default and an upgrade must not break it. The
@@ -1221,3 +1241,4 @@ drive the adapter without a workspace.
 | 15 | Two optional surfaces in one daemon, routed by channel; the app surface is disabled by a missing token, the self-DM is opt-in and strict about configuration | One store, one warm cap, one place to reason about senders; the seam already routes by thread, and the channel is part of a thread's key. Missing app tokens are a switch rather than a fault; a self-DM that cannot start is disabled with an error log while the app can still serve, and is fatal only when it is the only surface — a stale cookie must not take the app down or flap under systemd. |
 | 16 | The self-DM is polled, not websocketed, and its interactivity is numbered replies | Polling needs no undocumented client endpoints; the surface has no notification (Slack never marks your own message unread) and no response URL, so text is the honest interface. The costs — an account-wide credential and Slack's documented detection of non-official clients — are why the surface is off by default and documented rather than recommended. |
 | 17 | Self-DM credentials come in two modes, with a per-person OAuth broker as the team shape | The session mode needs no app and stays the single-machine default; the user-token mode is scoped, revocable and one-per-person, which is what lets one app serve many people. The broker is a separate tiny binary because it is the only part that must be reachable from the internet; each daemon still polls its own token, because Socket Mode's fan-out cannot be partitioned per authorization. |
+| 18 | Use timeline progress for simple work and promote observed multi-step work to a bounded plan | Short turns stay lightweight; plans reflect only observed tool events, safe titles and statuses—not guessed plans, arguments, output or private reasoning. The final answer remains separate, while processing status and stop remain continuous. |

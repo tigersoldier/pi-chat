@@ -35,8 +35,11 @@ const (
 	maxToolNameBytes          = 256
 	maxProgressDetailTitles   = 6
 	maxProgressDetailsRunes   = 600
+	maxProgressReportTasks    = 40
+	maxPendingTaskUpdates     = (maxProgressReportTasks + 2) * 2
 	maxTurnErrorRunes         = 400
 	turnProgressTaskID        = "turn-progress"
+	progressOverflowTaskID    = "tool-step-overflow"
 
 	// A model can end its response right after a progress marker, before the
 	// tool call that marker announced. "Continue" resumes it, but retry only a
@@ -465,7 +468,7 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		if err := r.Finish(ctx, final); err != nil {
 			return publicError("the answer was produced, but the chat message could not be updated", err)
 		}
-		th.noteProgress(ctx, r)
+		th.clearProgress(ctx, r)
 		th.touch()
 		th.b.completeRequest(ctx, m)
 		return nil
@@ -510,7 +513,11 @@ func (th *thread) renderObservedTurn(st *turnState, client *gwclient.Client) {
 	}
 	th.touch()
 	th.b.setStatus(ctx, th, StatusBusy)
-	defer th.b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
+	stopStatusRefresh := th.b.startStatusKeepalive(ctx, th)
+	defer func() {
+		stopStatusRefresh()
+		th.b.setStatus(context.WithoutCancel(ctx), th, StatusIdle)
+	}()
 
 	if client == nil {
 		client = th.live()
@@ -667,6 +674,7 @@ waitForCompletion:
 
 	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 	defer cancel()
+	delivered := false
 	if waitErr != nil {
 		th.log.Warn("asynchronous turn failed", "thread", th.key, "error", waitErr)
 		if err := r.Fail(terminalCtx, waitErr); err != nil {
@@ -674,6 +682,8 @@ waitForCompletion:
 			fallbackCtx, fallbackCancel := context.WithTimeout(context.WithoutCancel(ctx), renderTerminalTimeout)
 			th.b.reply(fallbackCtx, Notice{Thread: &th.t, Text: ":warning: pi-chat: " + PublicMessage(waitErr)})
 			fallbackCancel()
+		} else {
+			delivered = true
 		}
 	} else {
 		final := st.text()
@@ -684,8 +694,15 @@ waitForCompletion:
 			th.log.Error("cannot finish the asynchronous reply", "error", err)
 			if failErr := r.Fail(terminalCtx, publicError("the answer was produced, but the chat message could not be updated", err)); failErr != nil {
 				th.log.Error("cannot report the asynchronous reply failure", "error", failErr)
+			} else {
+				delivered = true
 			}
+		} else {
+			delivered = true
 		}
+	}
+	if delivered {
+		th.clearProgress(terminalCtx, r)
 	}
 	if waitErr == nil && client != nil && !st.sessionDeleted() {
 		th.saveCursorAfterActivity(ctx, client)
@@ -795,12 +812,15 @@ type turnState struct {
 	pending               strings.Builder // text not yet rendered
 	pendingTasks          []TaskProgress  // task updates not yet rendered
 	activeTasks           map[string]TaskProgress
+	progressStartsSent    map[string]bool
+	progressTaskOrder     []string
+	toolTaskByCallID      map[string]string
 	runningTool           string // safe title of the open tool call, if any
 	runningToolCall       string // the call runningTool belongs to
 	seenToolCalls         boundedIDSet
 	seenToolEnds          boundedIDSet
 	lastEventSeq          uint64
-	progressStartedSent   bool
+	progressPlanStarted   bool
 	terminal              bool
 	eventDone             bool // terminal event observed, independent of renderer release
 	settled               bool
@@ -885,12 +905,12 @@ func (s *turnState) rearmForContinuation() {
 
 	s.pending.Reset()
 	s.pendingTasks = nil
-	s.activeTasks = make(map[string]TaskProgress)
+	// activeTasks and the plan rows span the user turn: a continuation keeps the
+	// progress already published, and its tool events add to the same report.
 	s.runningTool = ""
 	s.runningToolCall = ""
 	s.seenToolCalls.Clear()
 	s.seenToolEnds.Clear()
-	s.progressStartedSent = false
 	s.terminal = false
 	s.eventDone = false
 	s.settled = false
@@ -955,11 +975,30 @@ func (s *turnState) hasSeenEvent(seq uint64) bool {
 	return seq <= s.lastEventSeq
 }
 
+// resetProgressTrackingLocked drops progress derived from events before a
+// snapshot. The replay sequence has moved, so only newly observed tool steps
+// are safe to count or publish. Callers hold s.mu.
+func (s *turnState) resetProgressTrackingLocked() {
+	s.pendingTasks = nil
+	clear(s.activeTasks)
+	s.progressStartsSent = nil
+	s.progressTaskOrder = nil
+	s.toolTaskByCallID = nil
+	s.seenToolCalls.Clear()
+	s.seenToolEnds.Clear()
+	s.progressPlanStarted = false
+	s.progressActionTitles = nil
+	s.progressActionCount = 0
+	s.progressCompletedActionCount = 0
+	s.pendingProgress = nil
+}
+
 func (s *turnState) feed(ev gwclient.Event, log *slog.Logger) bool {
 	if ev.Type == "gw_snapshot" {
 		if snapshot, err := ev.Snapshot(); err == nil {
 			s.mu.Lock()
 			s.lastEventSeq = snapshot.HeadSeq
+			s.resetProgressTrackingLocked()
 			s.mu.Unlock()
 		}
 		return true
@@ -1145,6 +1184,26 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	}
 	s.runningTool, s.runningToolCall = title, callID
 	s.rememberProgressTitleLocked(title)
+
+	stepID := ""
+	step := TaskProgress{Title: title, Status: TaskInProgress}
+	if s.progressActionCount <= maxProgressReportTasks {
+		stepID = fmt.Sprintf("tool-step-%d", s.progressActionCount)
+		step.ID = stepID
+		s.progressTaskOrder = append(s.progressTaskOrder, stepID)
+	} else {
+		stepID = progressOverflowTaskID
+		step.ID = stepID
+		step.Title = fmt.Sprintf("Additional actions (%d)", s.progressActionCount-maxProgressReportTasks)
+	}
+	s.activeTasks[stepID] = step
+	if s.toolTaskByCallID == nil {
+		s.toolTaskByCallID = make(map[string]string)
+	}
+	if len(s.toolTaskByCallID) < maxSeenToolCallIDs {
+		s.toolTaskByCallID[callID] = stepID
+	}
+
 	update := TaskProgress{
 		ID:     turnProgressTaskID,
 		Title:  title,
@@ -1152,6 +1211,30 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 	}
 	s.activeTasks[turnProgressTaskID] = update
 	s.queueProgressUpdateLocked(update)
+
+	if !s.progressPlanStarted && s.progressActionCount >= 2 {
+		s.progressPlanStarted = true
+		// A single tool uses the compact rolling task. Once distinct work steps
+		// exist, publish their observed states so the renderer can promote it to
+		// a bounded plan report. Replay each row's start before its latest state
+		// so a quickly completed first step is not lost during promotion.
+		for _, id := range s.progressTaskOrder {
+			current := s.activeTasks[id]
+			started := current
+			started.Status = TaskInProgress
+			s.queueProgressUpdateLocked(started)
+			if current.Status != TaskInProgress || current.Title != started.Title {
+				s.queueProgressUpdateLocked(current)
+			}
+		}
+		if overflow, ok := s.activeTasks[progressOverflowTaskID]; ok {
+			started := overflow
+			started.Status = TaskInProgress
+			s.queueProgressUpdateLocked(started)
+		}
+	} else if s.progressPlanStarted {
+		s.queueProgressUpdateLocked(step)
+	}
 	s.mu.Unlock()
 	s.signalTaskUpdate()
 }
@@ -1161,6 +1244,7 @@ func (s *turnState) recordToolTask(ev gwclient.Event) {
 func (s *turnState) recordToolCompletion(ev gwclient.Event) {
 	var tool struct {
 		ToolCallID string `json:"toolCallId"`
+		IsError    bool   `json:"isError"`
 	}
 	if err := ev.Unmarshal(&tool); err != nil {
 		return
@@ -1174,13 +1258,32 @@ func (s *turnState) recordToolCompletion(ev gwclient.Event) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.terminal {
+	if s.terminal || !s.seenToolEnds.Add(callID) {
+		s.mu.Unlock()
 		return
 	}
 	s.clearRunningToolLocked(callID)
-	if s.seenToolEnds.Add(callID) {
-		s.progressCompletedActionCount++
+	s.progressCompletedActionCount++
+	stepID := s.toolTaskByCallID[callID]
+	delete(s.toolTaskByCallID, callID)
+	updated := false
+	if stepID != "" {
+		if step, ok := s.activeTasks[stepID]; ok {
+			if tool.IsError {
+				step.Status = TaskError
+			} else {
+				step.Status = TaskComplete
+			}
+			s.activeTasks[stepID] = step
+			if s.progressPlanStarted {
+				s.queueProgressUpdateLocked(step)
+				updated = true
+			}
+		}
+	}
+	s.mu.Unlock()
+	if updated {
+		s.signalTaskUpdate()
 	}
 }
 
@@ -1243,38 +1346,62 @@ func (s *turnState) rememberProgressTitleLocked(title string) {
 	}
 }
 
-// queueProgressUpdateLocked preserves the first unsent in-progress update and
-// coalesces later title changes, while retaining a terminal update after it.
-// Callers hold s.mu; the queue is bounded to two items.
+// queueProgressUpdateLocked keeps the first unsent start and the latest state
+// for each task, so a fast step can still show both its start and completion.
+// Once a start has reached the renderer, later updates replace one another.
+// Callers hold s.mu; the queue is bounded by the number of report rows.
 func (s *turnState) queueProgressUpdateLocked(update TaskProgress) {
+	first, latest := -1, -1
+	for i, pending := range s.pendingTasks {
+		if pending.ID == update.ID {
+			if first < 0 {
+				first = i
+			}
+			latest = i
+		}
+	}
+	if s.progressStartsSent[update.ID] {
+		if latest >= 0 {
+			s.pendingTasks[latest] = update
+		} else if len(s.pendingTasks) < maxPendingTaskUpdates {
+			s.pendingTasks = append(s.pendingTasks, update)
+		}
+		return
+	}
+
 	if update.Status == TaskInProgress {
-		if !s.progressStartedSent && len(s.pendingTasks) > 0 && s.pendingTasks[0].Status == TaskInProgress {
-			if len(s.pendingTasks) == 1 {
-				if s.pendingTasks[0].Title != update.Title {
-					s.pendingTasks = append(s.pendingTasks, update)
-				}
-			} else {
-				s.pendingTasks[1] = update
+		if first < 0 {
+			if len(s.pendingTasks) < maxPendingTaskUpdates {
+				s.pendingTasks = append(s.pendingTasks, update)
 			}
 			return
 		}
-		s.pendingTasks = []TaskProgress{update}
+		if first == latest {
+			if s.pendingTasks[first] != update && len(s.pendingTasks) < maxPendingTaskUpdates {
+				s.pendingTasks = append(s.pendingTasks, update)
+			}
+			return
+		}
+		s.pendingTasks[latest] = update
 		return
 	}
 
-	if !s.progressStartedSent && len(s.pendingTasks) > 0 && s.pendingTasks[0].Status == TaskInProgress {
-		if len(s.pendingTasks) == 1 {
-			s.pendingTasks = append(s.pendingTasks, update)
+	if latest >= 0 {
+		if s.pendingTasks[latest].Status == TaskInProgress {
+			if len(s.pendingTasks) < maxPendingTaskUpdates {
+				s.pendingTasks = append(s.pendingTasks, update)
+			}
 		} else {
-			s.pendingTasks[1] = update
+			s.pendingTasks[latest] = update
 		}
 		return
 	}
-	s.pendingTasks = []TaskProgress{update}
+	if len(s.pendingTasks) < maxPendingTaskUpdates {
+		s.pendingTasks = append(s.pendingTasks, update)
+	}
 }
 
-// finishProgressTask closes the single logical progress task for this reply.
-// Tool activity only changes its title; it is complete or failed with the turn.
+// finishProgressTask closes the turn's summary and any published tool steps.
 func (s *turnState) finishProgressTask(status TaskProgressStatus) {
 	s.finishProgressTaskAt(status, time.Now())
 }
@@ -1326,6 +1453,31 @@ func (s *turnState) finalizeProgressLocked() bool {
 		}
 		delete(s.activeTasks, turnProgressTaskID)
 		s.queueProgressUpdateLocked(update)
+	}
+	if s.progressPlanStarted {
+		for _, id := range s.progressTaskOrder {
+			step, ok := s.activeTasks[id]
+			if !ok {
+				continue
+			}
+			if step.Status == TaskInProgress {
+				step.Status = status
+			}
+			s.activeTasks[id] = step
+			s.queueProgressUpdateLocked(step)
+			delete(s.activeTasks, id)
+		}
+		if step, ok := s.activeTasks[progressOverflowTaskID]; ok {
+			if step.Status == TaskInProgress {
+				step.Status = status
+			}
+			s.queueProgressUpdateLocked(step)
+			delete(s.activeTasks, progressOverflowTaskID)
+		}
+	} else {
+		for id := range s.activeTasks {
+			delete(s.activeTasks, id)
+		}
 	}
 	return exists
 }
@@ -1714,9 +1866,12 @@ func (s *turnState) takeTaskUpdates() []TaskProgress {
 		return nil
 	}
 	updates := append([]TaskProgress(nil), s.pendingTasks...)
+	if s.progressStartsSent == nil {
+		s.progressStartsSent = make(map[string]bool)
+	}
 	for _, update := range updates {
 		if update.Status == TaskInProgress {
-			s.progressStartedSent = true
+			s.progressStartsSent[update.ID] = true
 		}
 	}
 	s.pendingTasks = nil
@@ -2175,6 +2330,9 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 			if err := r.Delta(renderCtx, delta); err != nil {
 				th.log.Warn("cannot update the reply", "error", err)
 			}
+			// A renderer may rotate its native stream while rendering text. The
+			// handle is part of the durable restart target, so persist a change.
+			th.noteProgress(renderCtx, r)
 		}
 
 		ticker := time.NewTicker(time.Duration(th.b.cfg.Render.FlushMS) * time.Millisecond)
@@ -2205,6 +2363,9 @@ func (th *thread) flush(ctx context.Context, st *turnState, r Renderer) func() {
 						th.log.Warn("cannot refresh the reply while the turn runs",
 							"thread", th.key, "error", err)
 					}
+					// Rotation happens on this cadence, without any text or task
+					// update to trigger the other noteProgress calls.
+					th.noteProgress(loopCtx, r)
 				}
 				render(false)
 			}

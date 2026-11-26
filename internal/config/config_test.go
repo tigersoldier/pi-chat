@@ -55,6 +55,9 @@ func TestLoadAppliesDefaultsForMissingKeys(t *testing.T) {
 	if cfg.Render.Mode != "stream" {
 		t.Errorf("render.mode = %q, want \"stream\"", cfg.Render.Mode)
 	}
+	if cfg.Behavior.Approvals != "interactive" {
+		t.Errorf("approvals = %q, want interactive by default", cfg.Behavior.Approvals)
+	}
 	if len(cfg.Gateway.PiArgs) != 0 {
 		// --approve comes from the approvals policy, not from this list.
 		t.Errorf("pi_args = %v, want empty by default", cfg.Gateway.PiArgs)

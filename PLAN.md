@@ -4,10 +4,10 @@ Reference file for resuming work after a context reset. Design and rationale liv
 [`DESIGN.md`](./DESIGN.md); this file is the operational plan, the environment facts, and
 the current position. **Update the status block and checkboxes as work lands.**
 
-Last updated: 2026-10-14 · feature worktree `/home/pi/chat/2026-10-14-create-a-clean-pi-chat-worktree-then`
-(branch `feat/phase-2-approvals`, based on `main`; module `github.com/tigersoldier/pi-chat`).
-M0–M4.7 and the M5 control commands are implemented; this worktree adds interactive
-approvals. Live Slack and chat-tools validation remain pending.
+Last updated: 2026-10-26 · feature worktree `/home/pi/code/worktrees/pi-chat/slack-progress-report`
+(branch `feat/slack-progress-report`, based on `origin/main` at `0b4b0b7`; module
+`github.com/tigersoldier/pi-chat`). M0–M4.7 and the M5 control commands are implemented;
+this worktree implements the M8 progress-report path. Live Slack acceptance remains pending.
 
 ---
 
@@ -15,13 +15,15 @@ approvals. Live Slack and chat-tools validation remain pending.
 
 | Item | State |
 |---|---|
-| Design | Core Slack-first design settled; M7/M8 Slack Agent experience options and policy decisions remain |
+| Design | Core Slack-first design settled; M8's hybrid progress-report policy is selected; M7 context/title policy remains open |
 | M0 — gateway running | **Done and verified** (see M0 below) |
 | M1 — Slack app | **Done for phase 0, verified live** (see M1 below): Socket Mode socket opens, bot token authenticates, phase-0 scopes granted. The remaining history, files and reactions scopes still need one reinstall |
 | M2 — repo prep | **Done** (see M2 below). Module is `github.com/tigersoldier/pi-chat`; no Google Chat artifact and no GCP dependency remains |
 | M3 — phase-0 vertical slice | **Done and verified end-to-end** on 2026-09-27: a mention in a Slack thread streamed a real pi answer back into it (see M3 below) |
 | M4 — phase-1 MVP | **Done and verified live** on 2026-09-28: commands, allowlist refusals, SQLite thread state, provisioned project directories, cold/resume, startup GC (see M4 below) |
 | M5 — phase 2 | **In progress.** `/abort`, `/model`, `/stop`, interactive approvals, and `closed` status on delete are implemented; warm-session eviction/queueing, title updates, and stream fallback hardening remain |
+| M7 — context-aware agent sessions | **Planned.** Context, retention, and Slack-title ownership decisions remain |
+| M8 — long-task progress | **In progress.** Timeline-to-plan promotion, bounded task rows, throttled updates, processing-status renewal, interrupted-report recovery, and interactive approval by default are implemented and pass full Go/race tests plus `go vet`; feedback controls and live acceptance remain |
 | Chat tools v1 | **Implemented, Go/race-tested, and loaded by the installed Pi RPC runtime; live Slack validation pending.** Opt-in extension, private UDS broker, durable session bindings, bounded read-only Slack tools |
 | Code | `internal/config`, `internal/store` (SQLite), `internal/workspace` (provisioning + git cleanup), `internal/bot` (core), `internal/slack` (adapter), `internal/chattools` (broker/extension), `cmd/pi-chatd`; tests in each package |
 | `pi-chatd` | Existing systemd user service is recorded as enabled at boot; this feature worktree has not been installed or live-tested |
@@ -30,11 +32,12 @@ approvals. Live Slack and chat-tools validation remain pending.
 | Upstream rebind fix | **Not filed.** Owner is the user |
 
 **Current position: M0–M4.7 are complete. Chat-tools v1 is implemented and unit-tested;
-live Slack and restart verification remain pending. M5 has non-forcing `/abort`, `/model`,
-`/stop`, and interactive approval dialogs. This worktree persists approval routing metadata
-and handles buttons/modals through `RespondUI`; remaining work includes warm-session eviction
-and queueing, title updates, and streaming fallback hardening. `/delete` and its `closed`
-status are implemented.**
+live Slack acceptance remains pending. M5 has non-forcing `/abort`, `/model`, `/stop`, and
+interactive approval dialogs. This worktree adds M8's bounded hybrid progress reports,
+status renewal, and restart interruption handling, and makes interactive approval the default;
+full Go/race tests and `go vet` pass, while live Slack verification and feedback controls
+remain. M5 still needs warm-session eviction/queueing,
+title updates, and streaming fallback hardening. `/delete` and its `closed` status are implemented.**
 
 ---
 
@@ -259,9 +262,9 @@ worth fixing before M5 builds `/delete` on top of this base.
 - **Slack payload fixtures are invented, not recorded.** The shapes match the docs and the
   interactions seen so far, but a captured `app_mention`/`block_actions` sample would lock
   them to Slack rather than to our reading of it.
-- **`progress_ts` is written and never read.** Re-attaching to a half-written reply needs a
-  policy decision (a restarted process cannot resume a stream it never held), so the
-  column waits for phase 3; DESIGN §7 says so.
+- **`progress_ts` is read only at startup.** Recovery marks the persisted in-flight reply
+  interrupted before ingress; a restarted process cannot resume a stream it never held.
+  The handle is cleared only after the platform accepts that update (DESIGN §7).
 - **The transport acks before `seen` is written.** Socket Mode demands an ack within three
   seconds, so the claim cannot precede it; a crash in that window loses a message Slack
   will not redeliver. DESIGN §7 records the trade-off.
@@ -602,20 +605,26 @@ user renames, and tests cover event parsing, search boundaries and source render
       completed as *Continued in a new message* so it does not render as an error. The
       12,000-character budget still defers to a bounded final patch at settlement;
       stop/cancel behavior is unchanged.
-- [ ] Use timeline task cards for short work and plan mode for multi-step work; expose only
-      safe task details and approved source metadata, and throttle `chat.update` to Slack's
-      documented cadence.
+- [x] Promote observed multi-step work to a plan (or a task card when Slack already closed
+      the stream), publishing at most 40 observed steps plus one aggregate row. Only safe
+      titles/status are exposed (never tool arguments, output, or private reasoning);
+      `chat.update` is coalesced to Slack's three-second cadence with a fresh `block_id` per
+      plan update, and the final answer is posted separately so the report stays visible.
+      Status `processing`/`suspended` is renewed before Slack's one-hour lease expires, and a
+      persisted in-flight message is marked interrupted before ingress after a restart.
 - [ ] Add answer-level feedback controls and handle submissions without retaining response
       content by default.
-- [ ] Make interactive approval the default for consequential tool actions; retain automatic
-      approval only as an explicit opt-in.
+- [x] Make interactive approval the default for consequential tool actions, and keep
+      automatic approval as an explicit opt-in: `behavior.approvals` now defaults to
+      `"interactive"`, so `--approve` is added only when the owner sets `"auto"`.
 - [x] Bound the wait for a thread's turn by `concurrency.admission_wait_seconds` and answer
       the queued request when it runs out (how long the turn has run, the open tool call, and
       `@pi /abort`): a turn whose tool call never returns used to hold the thread's slot and
       swallow every later message silently.
 
-**Exit:** long turns retain truthful status/progress, stop remains reliable across transitions,
-and feedback/approval flows have focused tests.
+**Exit:** the progress lifecycle and approval default are implemented and unit-tested;
+feedback controls and live Slack acceptance still need to land before the full milestone is
+complete.
 
 ### Parallel — upstream fix (user, in the pi-gateway repo)
 
@@ -632,7 +641,7 @@ Not required for M3, but required before `@pi /delete` and eviction (M5) are saf
 
 | Thing | Value |
 | --- | --- |
-| Repo | Feature worktree `/home/pi/chat/2026-10-14-create-a-clean-pi-chat-worktree-then`, branch `feat/phase-2-approvals` (based on `main`); origin is `git@github.com:tigersoldier/pi-chat.git` |
+| Repo | Feature worktree `/home/pi/code/worktrees/pi-chat/slack-progress-report`, branch `feat/slack-progress-report` (based on `origin/main` at `0b4b0b7`); origin is `git@github.com:tigersoldier/pi-chat.git` |
 | Module | `github.com/tigersoldier/pi-chat`, Go 1.26.4 |
 | Design | `DESIGN.md` (14 sections + decision log §15) |
 | `pi` binary | `~/.local/bin/pi` |
@@ -698,9 +707,9 @@ Slack payloads. Cheaper and less brittle than mocking `gwclient`.
 1. Local validation passes: `go test ./...`, `go test -race ./...`, and `go vet ./...`.
    This worktree implements `/abort`, `/model [provider/model]`, and a non-forcing `/stop`.
 2. Continue M5 with warm-session eviction/queueing and streaming fallback hardening. M7
-   plans session-title and context work; M8 plans long-task progress, feedback, and approval
-   defaults. Interactive approvals are implemented,
-   but need live Slack acceptance; they require no additional `views.open` scope.
+   still needs its session-title/context policy. M8's progress-report path and interactive
+   approval default are implemented; feedback controls and live Slack acceptance remain.
+   Interactive approvals need live acceptance; they require no additional `views.open` scope.
 3. In the deployment environment, enable `[chat_tools]`, install/build the pinned
    pi-gateway revision, and verify bounded Slack reads, missing scopes, cancellation, cold
    resume, daemon restarts, retired-session resume, and deletion/revocation. Live acceptance

@@ -31,7 +31,7 @@ func TestInstructionIsInstalledInTheSystemPromptOfSessionsWeCreate(t *testing.T)
 	})
 	project := workspaceProject(t, b, "fix the failing test")
 
-	args := b.piArgs(project)
+	args := b.piArgs(project, SurfaceApp)
 	if n := countFlag(args, "--append-system-prompt"); n != 1 {
 		t.Fatalf("--append-system-prompt appears %d times in %v, want once", n, args)
 	}
@@ -45,8 +45,8 @@ func TestInstructionIsInstalledInTheSystemPromptOfSessionsWeCreate(t *testing.T)
 	if args[0] != "--model" || args[1] != "fast" {
 		t.Errorf("the other arguments changed: %v", args)
 	}
-	if !slices.Contains(args, "--approve") {
-		t.Errorf("approvals should still be automatic by default: %v", args)
+	if slices.Contains(args, "--approve") {
+		t.Errorf("interactive approvals are the default, so --approve should not be there: %v", args)
 	}
 }
 

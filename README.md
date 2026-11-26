@@ -24,8 +24,9 @@ The Slack app manifest enables Agent Sessions, including status and a stop butto
 workspace allows the agent experience. Opt-in read-only chat-tools v1 is implemented and
 unit-tested, but has not yet been verified against a live Slack workspace. Phase 2 is
 underway: `/abort`, `/model`, `/stop`, and interactive approvals are implemented. Blocking
-`confirm`/`select` dialogs use buttons; `input`/`editor` dialogs use Slack modals. The flows are
-unit-tested; live Slack acceptance is pending. Warm-session eviction/queueing and streaming
+`confirm`/`select` dialogs use buttons; `input`/`editor` dialogs use Slack modals.
+Interactive approval is the default; `behavior.approvals = "auto"` is the explicit opt-in for
+pi resolving dialogs itself. The flows are unit-tested; live Slack acceptance is pending. Warm-session eviction/queueing and streaming
 fallback hardening remain. Slack's current `views.open` reference requires no additional
 OAuth scope, so modals do not require a manifest permission change. Details: `PLAN.md`.
 

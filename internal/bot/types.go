@@ -268,8 +268,14 @@ type ProgressReporter interface {
 	Progress() string
 }
 
-// TaskProgress is a user-facing update to the turn's rolling progress item.
-// Successful completion may replace its current title with a bounded summary;
+// ProgressRecoveryReporter can turn a persisted in-flight reply handle into a
+// visible interrupted marker after a process restart.
+type ProgressRecoveryReporter interface {
+	RecoverInterruptedProgress(ctx context.Context, t Thread, ts string) error
+}
+
+// TaskProgress is a user-facing update to a turn summary or observed task row.
+// Successful completion may replace the summary title with bounded metrics;
 // Details contains only bounded, safe action titles, never tool arguments or output.
 type TaskProgress struct {
 	ID      string
@@ -328,6 +334,12 @@ const (
 // and not again (the adapter remembers its own refusal).
 type StatusReporter interface {
 	SetStatus(ctx context.Context, t Thread, s Status) error
+}
+
+// StatusRefreshReporter advertises a status lease duration. The core renews the
+// thread's current busy/waiting state before that duration elapses.
+type StatusRefreshReporter interface {
+	StatusRefreshInterval() time.Duration
 }
 
 // RequestAcknowledger acknowledges an addressed message before the core starts
