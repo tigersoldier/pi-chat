@@ -42,13 +42,14 @@ const (
 	progressOverflowTaskID    = "tool-step-overflow"
 
 	// A model can end its response right after a progress marker, before the
-	// tool call that marker announced. "Continue" resumes it. Retry only a few
-	// times in a row without tool work so a stuck model cannot loop, but allow
-	// a larger overall budget so a long tool-running turn can recover from
-	// isolated stops instead of failing after a handful.
-	maxConsecutiveProgressMarkerRetries = 2
+	// tool call that marker announced. The continuation prompt explicitly waives
+	// the marker, because asking for a bare continuation teaches the model to
+	// answer with another marker. Retry a few times in a row without tool work so
+	// a stuck model cannot loop, but allow a larger overall budget so a long
+	// tool-running turn can recover from isolated stops.
+	maxConsecutiveProgressMarkerRetries = 3
 	maxProgressMarkerContinuations      = 20
-	progressMarkerContinuationText      = "Continue."
+	progressMarkerContinuationText      = "Your previous response ended after emitting a progress marker without calling a tool. Do not emit a progress marker in this response — invoke the tool directly now, or provide your final answer."
 )
 
 // boundedIDSet deduplicates a rolling window of IDs without retaining
