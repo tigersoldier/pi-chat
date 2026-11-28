@@ -675,8 +675,149 @@ func TestRunTurnStopsRetryingAfterProgressMarkerLimit(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if want := maxProgressMarkerRetries + 1; prompts != want {
+	if want := maxConsecutiveProgressMarkerRetries + 1; prompts != want {
 		t.Fatalf("prompts = %d, want %d bounded attempts", prompts, want)
+	}
+}
+
+func TestRunTurnContinuesAfterProgressMarkerStopsWithToolWorkBetweenThem(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	var mu sync.Mutex
+	prompts := 0
+	marker := "[[slack-progress: Checking service logs]]"
+	const answer = "Finished after several tool calls."
+	stops := maxConsecutiveProgressMarkerRetries + 1
+	client := startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, prompt int, _ string) string {
+		mu.Lock()
+		prompts++
+		mu.Unlock()
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		if prompt <= stops {
+			callID := fmt.Sprintf("call-%d", prompt)
+			_ = enc.Encode(map[string]any{
+				"type": "tool_execution_start", "toolCallId": callID, "toolName": "bash",
+			})
+			_ = enc.Encode(map[string]any{
+				"type": "tool_execution_end", "toolCallId": callID, "toolName": "bash",
+			})
+			_ = enc.Encode(map[string]any{
+				"type": "message_update",
+				"assistantMessageEvent": map[string]any{
+					"type": "text_delta", "contentIndex": 0, "delta": marker,
+				},
+			})
+			_ = enc.Encode(map[string]any{
+				"type": "message_end",
+				"message": map[string]any{
+					"role": "assistant", "content": []any{}, "stopReason": "stop",
+				},
+			})
+			_ = enc.Encode(map[string]any{"type": "agent_settled"})
+			return marker
+		}
+		_ = enc.Encode(map[string]any{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": answer,
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role": "assistant", "content": []any{}, "stopReason": "stop",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return answer
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	renderer := &recordingRenderer{}
+	if err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, renderer); err != nil {
+		t.Fatalf("runTurn = %v, want the answer after non-consecutive stops", err)
+	}
+	if got := renderer.finalAnswers(); len(got) != 1 || got[0] != answer {
+		t.Fatalf("final answers = %q, want the answer after non-consecutive stops", got)
+	}
+	if completed := platform.completedRequests(); len(completed) != 1 {
+		t.Fatalf("completed requests = %+v, want one completed user turn", completed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := stops + 1; prompts != want {
+		t.Fatalf("prompts = %d, want %d attempts", prompts, want)
+	}
+}
+
+func TestRunTurnStopsAfterTotalProgressMarkerContinuationLimit(t *testing.T) {
+	b, platform, st := newTestBot(t)
+	th := testThread(t, b, st)
+	var mu sync.Mutex
+	prompts := 0
+	marker := "[[slack-progress: Checking service logs]]"
+	client := startTurnGatewayWithLastText(t, th, func(enc *json.Encoder, prompt int, _ string) string {
+		mu.Lock()
+		prompts++
+		mu.Unlock()
+		callID := fmt.Sprintf("call-%d", prompt)
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{
+			"type": "tool_execution_start", "toolCallId": callID, "toolName": "bash",
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "tool_execution_end", "toolCallId": callID, "toolName": "bash",
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]any{
+				"type": "text_delta", "contentIndex": 0, "delta": marker,
+			},
+		})
+		_ = enc.Encode(map[string]any{
+			"type": "message_end",
+			"message": map[string]any{
+				"role": "assistant", "content": []any{}, "stopReason": "stop",
+			},
+		})
+		_ = enc.Encode(map[string]any{"type": "agent_settled"})
+		return marker
+	})
+	th.client = client
+	th.update(func(r *store.ThreadRow) { r.SessionPath = "/test-session.jsonl" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	err := th.runTurn(ctx, Message{TS: "1.2", Text: "hello"}, &recordingRenderer{})
+	if err == nil || !strings.Contains(err.Error(), "produced no answer") {
+		t.Fatalf("runTurn = %v, want the no-answer error after the total continuation limit", err)
+	}
+	if completed := platform.completedRequests(); len(completed) != 0 {
+		t.Errorf("completed requests = %+v, want none when the continuation limit is exhausted", completed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := maxProgressMarkerContinuations + 1; prompts != want {
+		t.Fatalf("prompts = %d, want %d bounded attempts", prompts, want)
+	}
+}
+
+func TestContinuationRearmResetsToolWorkButSettlementKeepsIt(t *testing.T) {
+	st := newTurnState()
+	st.feed(toolEvent(t, "tool_execution_start", "call-1", "bash", false), discardLogger())
+	if !st.sawToolExecution() {
+		t.Fatal("a tool start did not record tool work")
+	}
+	st.markDone()
+	if !st.sawToolExecution() {
+		t.Fatal("markDone cleared the tool-work signal needed to budget continuations")
+	}
+	st.rearmForContinuation()
+	if st.sawToolExecution() {
+		t.Fatal("rearm kept tool work from the previous response")
 	}
 }
 
