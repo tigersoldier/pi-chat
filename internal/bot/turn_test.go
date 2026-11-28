@@ -633,6 +633,11 @@ func TestRunTurnContinuesAfterProgressMarkerOnlyStop(t *testing.T) {
 	if len(prompts) != 2 || prompts[1] != progressMarkerContinuationText {
 		t.Fatalf("prompts = %q, want the user prompt and one continuation", prompts)
 	}
+	for _, want := range []string{"Do not emit a progress marker", "invoke the tool directly"} {
+		if !strings.Contains(prompts[1], want) {
+			t.Fatalf("continuation prompt = %q, want it to contain %q", prompts[1], want)
+		}
+	}
 }
 
 func TestRunTurnStopsRetryingAfterProgressMarkerLimit(t *testing.T) {

@@ -549,13 +549,15 @@ it is ready.
   well-formed marker and then end the response without the tool call it announced. A clean
   settlement whose entire authoritative message is a progress marker is treated as that
   premature stop: the turn logs it, waits for the gateway's own settled frame, and sends a
-  brief `Continue.` prompt into the same session while keeping the reply stream and task
-  card open. The consecutive budget allows two retries without tool work; executing a tool
-  resets it, so isolated stops in a long multi-step turn do not accumulate. A separate
-  overall budget allows at most 20 continuations per user turn. When either limit is
-  exhausted the normal `the agent produced no answer` failure is reported. A user stop,
-  hard session failure, read error or other terminal outcome still fails the turn instead
-  of continuing it.
+  continuation prompt that explicitly waives the marker — telling the model not to emit one
+  and to invoke the tool directly — while keeping the reply stream and task card open. This
+  is deliberate: a bare continuation teaches the model that a marker is a complete answer.
+  The consecutive budget allows three retries without tool work; executing a tool resets
+  it, so isolated stops in a long multi-step turn do not accumulate. A separate overall
+  budget allows at most 20 continuations per user turn. When either limit is exhausted the
+  normal `the agent produced no answer` failure is reported. A user stop, hard session
+  failure, read error or other terminal outcome still fails the turn instead of continuing
+  it.
 - **Failure reporting** is classified from the turn's terminal outcome, not from one
   provider-specific event: the last assistant `stopReason`/`errorMessage`, a failed retry or
   compaction, an extension error, a session crash/stop/deletion, a gateway error, or a failed
