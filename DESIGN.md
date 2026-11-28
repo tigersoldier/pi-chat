@@ -550,8 +550,10 @@ it is ready.
   settlement whose entire authoritative message is a progress marker is treated as that
   premature stop: the turn logs it, waits for the gateway's own settled frame, and sends a
   brief `Continue.` prompt into the same session while keeping the reply stream and task
-  card open. Automatic continuation is bounded to two retries per user turn; when the limit
-  is exhausted the normal `the agent produced no answer` failure is reported. A user stop,
+  card open. The consecutive budget allows two retries without tool work; executing a tool
+  resets it, so isolated stops in a long multi-step turn do not accumulate. A separate
+  overall budget allows at most 20 continuations per user turn. When either limit is
+  exhausted the normal `the agent produced no answer` failure is reported. A user stop,
   hard session failure, read error or other terminal outcome still fails the turn instead
   of continuing it.
 - **Failure reporting** is classified from the turn's terminal outcome, not from one

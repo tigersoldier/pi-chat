@@ -42,10 +42,13 @@ const (
 	progressOverflowTaskID    = "tool-step-overflow"
 
 	// A model can end its response right after a progress marker, before the
-	// tool call that marker announced. "Continue" resumes it, but retry only a
-	// few times so a model stuck in that pattern cannot loop indefinitely.
-	maxProgressMarkerRetries       = 2
-	progressMarkerContinuationText = "Continue."
+	// tool call that marker announced. "Continue" resumes it. Retry only a few
+	// times in a row without tool work so a stuck model cannot loop, but allow
+	// a larger overall budget so a long tool-running turn can recover from
+	// isolated stops instead of failing after a handful.
+	maxConsecutiveProgressMarkerRetries = 2
+	maxProgressMarkerContinuations      = 20
+	progressMarkerContinuationText      = "Continue."
 )
 
 // boundedIDSet deduplicates a rolling window of IDs without retaining
@@ -327,6 +330,8 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 	if instruction != "" {
 		prompt = instruction + "\n\n" + prompt
 	}
+	consecutiveRetries := 0
+	totalRetries := 0
 	for attempt := 0; ; attempt++ {
 		if attempt == 0 {
 			if _, err := client.Prompt(ctx, trimPrompt(prompt), prepared.images...); err != nil {
@@ -410,51 +415,67 @@ func (th *thread) runTurn(ctx context.Context, m Message, r Renderer) error {
 		}
 		// Some models end a response right after a progress marker and before
 		// the tool call it announced. That is a premature stop, not an answer:
-		// resume the same user turn with a brief continuation.
+		// resume the same user turn with a brief continuation. Tool work resets
+		// the consecutive budget; the total budget still bounds a stuck model.
 		if final == "" && readErr == nil && onlyProgressMarkers(rawFinal) &&
-			attempt < maxProgressMarkerRetries && st.canContinueAfterProgressMarker() {
-			th.log.Warn("the agent stopped after a progress marker without a tool call; continuing",
-				"thread", th.key, "session", sessionPath, "retry", attempt+1,
-				"max_retries", maxProgressMarkerRetries)
-			// agent_settled closes the local done signal, but the gateway's own
-			// settled frame may still be in flight. AwaitSettled covers the gateway
-			// latch; GetState is a round-trip barrier that guarantees the read loop
-			// has fed every earlier frame into this reservation before it is reused.
-			settleCtx, cancelSettle := context.WithTimeout(ctx, gatewayTimeout)
-			settleErr := client.AwaitSettled(settleCtx)
-			if settleErr == nil {
-				_, settleErr = client.GetState(settleCtx)
+			st.canContinueAfterProgressMarker() {
+			if st.sawToolExecution() {
+				consecutiveRetries = 0
 			}
-			cancelSettle()
-			if settleErr != nil {
-				if errors.Is(settleErr, context.DeadlineExceeded) {
-					// Without a confirmed settlement the continuation could race the
-					// previous turn's frame. Keep the original failure rather than hang.
-					th.log.Warn("the gateway did not confirm the previous response settled; not continuing",
-						"thread", th.key, "session", sessionPath, "error", settleErr)
-					return errors.New("the agent produced no answer")
+			if consecutiveRetries < maxConsecutiveProgressMarkerRetries &&
+				totalRetries < maxProgressMarkerContinuations {
+				consecutiveRetries++
+				totalRetries++
+				th.log.Warn("the agent stopped after a progress marker without a tool call; continuing",
+					"thread", th.key, "session", sessionPath,
+					"retry", consecutiveRetries, "max_retries", maxConsecutiveProgressMarkerRetries,
+					"continuation", totalRetries, "max_continuations", maxProgressMarkerContinuations)
+				// agent_settled closes the local done signal, but the gateway's own
+				// settled frame may still be in flight. AwaitSettled covers the gateway
+				// latch; GetState is a round-trip barrier that guarantees the read loop
+				// has fed every earlier frame into this reservation before it is reused.
+				settleCtx, cancelSettle := context.WithTimeout(ctx, gatewayTimeout)
+				settleErr := client.AwaitSettled(settleCtx)
+				if settleErr == nil {
+					_, settleErr = client.GetState(settleCtx)
 				}
-				if st.sessionDeleted() {
-					th.forgetSessionForPath(ctx, sessionPath)
-					return publicError("this session was deleted outside pi-chat; the next message starts a new one", settleErr)
+				cancelSettle()
+				if settleErr != nil {
+					if errors.Is(settleErr, context.DeadlineExceeded) {
+						// Without a confirmed settlement the continuation could race the
+						// previous turn's frame. Keep the original failure rather than hang.
+						th.log.Warn("the gateway did not confirm the previous response settled; not continuing",
+							"thread", th.key, "session", sessionPath, "error", settleErr)
+						return errors.New("the agent produced no answer")
+					}
+					if st.sessionDeleted() {
+						th.forgetSessionForPath(ctx, sessionPath)
+						return publicError("this session was deleted outside pi-chat; the next message starts a new one", settleErr)
+					}
+					if isGone(settleErr) {
+						th.forgetSessionForPath(ctx, sessionPath)
+						return publicError("this session was deleted outside pi-chat; the next message starts a new one", settleErr)
+					}
+					if failure := st.abortFailure(); failure != nil {
+						return failure
+					}
+					if errors.Is(settleErr, context.Canceled) {
+						return publicError("the turn was canceled", settleErr)
+					}
+					return publicError("the gateway connection was lost while the agent was working", settleErr)
 				}
-				if isGone(settleErr) {
-					th.forgetSessionForPath(ctx, sessionPath)
-					return publicError("this session was deleted outside pi-chat; the next message starts a new one", settleErr)
-				}
-				if failure := st.abortFailure(); failure != nil {
-					return failure
-				}
-				if errors.Is(settleErr, context.Canceled) {
-					return publicError("the turn was canceled", settleErr)
-				}
-				return publicError("the gateway connection was lost while the agent was working", settleErr)
+				before = rawFinal
+				stopFlush()
+				st.rearmForContinuation()
+				stopFlush = th.flush(ctx, st, r)
+				continue
 			}
-			before = rawFinal
-			stopFlush()
-			st.rearmForContinuation()
-			stopFlush = th.flush(ctx, st, r)
-			continue
+			th.log.Warn("the progress-marker continuation budget is exhausted; not continuing",
+				"thread", th.key, "session", sessionPath,
+				"consecutive_retries", consecutiveRetries,
+				"max_consecutive_retries", maxConsecutiveProgressMarkerRetries,
+				"continuations", totalRetries,
+				"max_continuations", maxProgressMarkerContinuations)
 		}
 		if failure := st.turnFailure(final != ""); failure != nil {
 			return failure
@@ -826,6 +847,7 @@ type turnState struct {
 	runningToolCall        string // the call runningTool belongs to
 	seenToolCalls          boundedIDSet
 	seenToolEnds           boundedIDSet
+	executedTool           bool // a tool ran in this response; survives markDone, reset by rearm
 	lastEventSeq           uint64
 	progressPlanStarted    bool
 	terminal               bool
@@ -923,6 +945,7 @@ func (s *turnState) rearmForContinuation() {
 	s.runningToolCall = ""
 	s.seenToolCalls.Clear()
 	s.seenToolEnds.Clear()
+	s.executedTool = false
 	s.terminal = false
 	s.eventDone = false
 	s.settled = false
@@ -950,6 +973,16 @@ func (s *turnState) rearmForContinuation() {
 	s.firstTextCh = make(chan struct{})
 	s.taskCh = make(chan struct{}, 1)
 	s.abortResolvedCh = make(chan struct{}, 1)
+}
+
+// sawToolExecution reports whether the response that just settled executed a
+// tool call. markDone clears the per-call ID sets, so the continuation budget
+// needs a flag that survives settlement and is reset when rearmForContinuation
+// prepares the next response.
+func (s *turnState) sawToolExecution() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.executedTool
 }
 
 // canContinueAfterProgressMarker reports whether a settlement that produced no
@@ -1188,6 +1221,7 @@ func (s *turnState) recordToolTask(ev gwclient.Event, log *slog.Logger) {
 		s.mu.Unlock()
 		return
 	}
+	s.executedTool = true
 	title := safeToolTitle(name)
 	usedMarker := len(s.pendingProgress) > 0
 	if usedMarker {
@@ -1306,6 +1340,7 @@ func (s *turnState) recordToolCompletion(ev gwclient.Event) {
 		s.mu.Unlock()
 		return
 	}
+	s.executedTool = true
 	s.clearRunningToolLocked(callID)
 	s.progressCompletedActionCount++
 	stepID := s.toolTaskByCallID[callID]
